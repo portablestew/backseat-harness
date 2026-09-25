@@ -1,0 +1,17 @@
+{
+  "steps": {
+    "route": {
+      "title": "Add GET /hello route returning {\"message\": \"hello\"}",
+      "status": "pending"
+    },
+    "test": {
+      "title": "Add a test exercising GET /hello via the app test harness",
+      "status": "pending"
+    },
+    "suite-green": {
+      "title": "Full test suite passes",
+      "status": "pending"
+    }
+  },
+  "remarks": []
+}

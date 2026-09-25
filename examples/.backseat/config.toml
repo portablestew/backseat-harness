@@ -1,0 +1,47 @@
+# backseat-harness workspace config. All values are optional; code defaults
+# apply for anything omitted. A task dir may override sparingly (future).
+
+[harness]
+# Managed-agent CLI to drive. v0.1 supports "opencode".
+provider = "opencode"
+
+# Flags passed straight through to every managed turn. This is where you grant
+# the CLI its non-interactive permissions -- the harness picks no default,
+# because a turn that stops for an approval prompt just burns the timeout, and
+# the safe-vs-usable tradeoff is yours to make.
+#
+# For opencode, "--auto" approves anything not explicitly denied. opencode marks
+# it dangerous, and it is: prefer denying what matters in an agent definition
+# (.opencode/agent/*.md) and pairing that with --agent below.
+# extra_args = ["--auto"]
+extra_args = []
+
+# Hard ceiling per managed turn. A turn should bail rather than hang, so pair
+# this with the permission flags above. Default: 3600 (1h).
+turn_timeout_s = 3600
+
+# Preemptive compaction trigger. When the managed session passes this many bytes
+# (~250-300k tokens at 1MB), the next turn starts a fresh generation seeded with
+# a chat-fork of the prior one. Default: 1_000_000.
+#
+# Size is reported by chat-mother-forker. For opencode that is summed SQLite row
+# bytes rather than a file size, so it is the right scale for a threshold but not
+# comparable against a file-backed CLI's numbers.
+compact_threshold_bytes = 1000000
+
+# Loop budget guards.
+max_iterations = 50
+max_wall_clock_s = 86400
+max_generations = 20
+
+[system_agent]
+# The adversarial reviewer. Same CLI tool, read-only profile. Often a stronger
+# model than the managed agent; kept decoupled and configurable.
+provider = "opencode"
+# model = "anthropic/claude-opus-4"  # optional, provider/model form for opencode
+# agent = "read-only-reviewer"       # optional, maps to --agent
+# extra_args = []                    # optional, as above
+
+# Verification commands the reviewer may run for adversarial checks beyond the
+# transcript (tests, type-check). Run in the workspace root.
+verify_commands = []

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# Virtual envs / tooling
+.venv/
+venv/
+.pyddock/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+# (uv.lock is intentionally committed)
+
+# Local tooling config (per-developer, not project artifacts)
+.kiro/
+.opencode/
+.pyddock/
+
+# OS / editor
+.DS_Store
+Thumbs.db
