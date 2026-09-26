@@ -53,6 +53,19 @@ class TurnResult:
     stderr: str = ""
 
 
+@dataclass(frozen=True)
+class OperatorLaunch:
+    """How to launch the system agent under a harness-managed operator profile.
+
+    ``env`` is merged over the parent environment for the operator process only;
+    ``extra_args`` are appended to its command line. Both empty means the
+    provider has no profile support and the operator runs with CLI defaults.
+    """
+
+    env: dict[str, str]
+    extra_args: tuple[str, ...]
+
+
 class Provider(ABC):
     """Adapter contract. Adapters never mint session ids; they capture them."""
 
@@ -86,3 +99,24 @@ class Provider(ABC):
         its reply. Adapters that emit a structured event stream should
         reassemble the text parts rather than hand back raw events.
         """
+
+    def prepare_operator(
+        self, profile_dir: Path, persona: str, verify_commands: list[str]
+    ) -> OperatorLaunch:
+        """Write (or overwrite) a read-only operator profile and say how to use it.
+
+        ``profile_dir`` is harness-owned scratch space under ``.backseat/``.
+        The default is a no-op: a provider without profile support runs the
+        operator with CLI defaults, which are NOT read-only.
+        """
+        return OperatorLaunch(env={}, extra_args=())
+
+    def interactive_command(self, native_session_id: str | None) -> list[str]:
+        """Return argv that opens the managed session in the CLI's interactive UI.
+
+        Used for human takeover: the harness runs this attached to the real
+        terminal and waits for the human to quit. ``native_session_id`` is None
+        when no session exists yet (e.g. paused during planning); the CLI should
+        then open a fresh interactive session in the workspace.
+        """
+        raise ProviderError(f"{self.name} does not support interactive takeover")

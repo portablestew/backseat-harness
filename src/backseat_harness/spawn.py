@@ -11,10 +11,24 @@ command-line limit (see providers.base).
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 
-from backseat_harness.providers.base import Provider, SpawnSpec, TurnResult
+from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, TurnResult
+
+
+def resolve_argv(cmd: list[str]) -> list[str]:
+    """Resolve the executable in ``cmd`` against PATH (honoring PATHEXT).
+
+    Needed on Windows: CLIs installed through npm are ``.cmd`` shims, and
+    ``subprocess`` without a shell only finds ``.exe`` files. Prompts never go in
+    argv (see providers.base), so running a shim this way stays quoting-safe.
+    """
+    found = shutil.which(cmd[0])
+    if found is None:
+        raise ProviderError(f"{cmd[0]!r} not found on PATH; is the CLI installed?")
+    return [found, *cmd[1:]]
 
 
 def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
@@ -25,7 +39,7 @@ def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
     actually finish instead of blocking on an approval prompt; the watchdog is
     the backstop.
     """
-    cmd = provider.build_command(spec)
+    cmd = resolve_argv(provider.build_command(spec))
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -34,6 +48,10 @@ def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
             input=spec.prompt,
             capture_output=True,
             text=True,
+            # Explicit, so Windows doesn't fall back to the ANSI code page for
+            # prompts and transcripts that routinely contain non-ASCII text.
+            encoding="utf-8",
+            errors="replace",
             timeout=spec.timeout_s,
         )
         duration = time.monotonic() - start
@@ -61,6 +79,18 @@ def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
             stdout=stdout,
             stderr=stderr,
         )
+
+
+def run_interactive(provider: Provider, native_session_id: str | None, cwd) -> int:
+    """Hand the terminal to the CLI's interactive UI and block until it exits.
+
+    Unlike ``run_turn``, this inherits the parent's stdin/stdout/stderr so the
+    human drives a real TUI, and there is no timeout: the human quits when the
+    conversation is unambiguous, and the harness resumes on exit. Returns the
+    process exit code.
+    """
+    cmd = resolve_argv(provider.interactive_command(native_session_id))
+    return subprocess.run(cmd, cwd=str(cwd)).returncode
 
 
 def _as_text(data: object) -> str:

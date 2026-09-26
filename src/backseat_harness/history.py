@@ -85,6 +85,26 @@ def fork_session(search: str, history_provider: str) -> str:
     return text
 
 
+def load_full_transcript(search: str, history_provider: str) -> str:
+    """Render the newest session matching ``search`` as a *complete* transcript.
+
+    The untruncated twin of ``fork_session``: no turn cap and no middle drop, so
+    the expensive tool-call payloads survive. That is what session capture needs
+    -- the operator inspects real tool results rather than an elided fork. The
+    string is still annotated (turn headers, ``TOOL_CALL``/``TOOL_RESULT``
+    labels) by chat-mother-forker, so it reads as a conversation.
+
+    Returns "" when nothing matched, so callers can treat "no session yet" and
+    "empty session" alike -- mirroring ``fork_session`` and sparing them the
+    ``LookupError`` the underlying ``load_chat`` raises.
+    """
+    load_chat = _load("load_chat")
+    try:
+        return load_chat(search, providers=_scoped(history_provider))
+    except LookupError:
+        return ""
+
+
 def _id_from_key(key: str) -> str:
     """Strip the "provider:" prefix off a ChatRef key."""
     _, _, conversation_id = key.partition(":")
@@ -109,13 +129,13 @@ def _load(attr: str):
         import chat_mother_forker
     except ImportError as exc:  # pragma: no cover - dependency-optional path
         raise HistoryError(
-            "reading managed chat history requires chat-mother-forker>=0.2.0; "
-            "install it to enable compaction and system-agent review"
+            "reading managed chat history requires chat-mother-forker>=0.2.1; "
+            "install it to enable compaction, session capture, and system-agent review"
         ) from exc
     try:
         return getattr(chat_mother_forker, attr)
     except AttributeError as exc:  # pragma: no cover - version mismatch
         raise HistoryError(
             f"chat-mother-forker is installed but does not export {attr!r}; "
-            "backseat-harness needs >=0.2.0"
+            "backseat-harness needs >=0.2.1"
         ) from exc

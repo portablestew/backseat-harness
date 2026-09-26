@@ -32,7 +32,7 @@ DEFAULT_MAX_GENERATIONS = 20
 
 @dataclass(frozen=True)
 class SystemAgentConfig:
-    """Profile for the ephemeral, read-only adversarial reviewer.
+    """Profile for the ephemeral, read-only operator agent.
 
     Same underlying CLI tool as the managed agent, different agent definition:
     read-only tools plus optional verification commands. Often a stronger model
@@ -43,7 +43,7 @@ class SystemAgentConfig:
     model: str | None = None
     agent: str | None = None  # maps to --agent / profile name where supported
     verify_commands: list[str] = field(default_factory=list)
-    # Extra CLI flags for the reviewer's invocation (see Config.extra_args).
+    # Extra CLI flags for the operator's invocation (see Config.extra_args).
     extra_args: tuple[str, ...] = ()
 
 
@@ -112,6 +112,27 @@ class TaskPaths:
     @property
     def ledger(self) -> Path:
         return self.root / "ledger.jsonl"
+
+    @property
+    def docs(self) -> Path:
+        """Handoff docs written by the managed agent (research, plan, reviews).
+
+        The one place under ``.backseat`` the managed agent is asked to write.
+        The harness creates it but never writes inside it.
+        """
+        return self.root / "docs"
+
+    @property
+    def transcript(self) -> Path:
+        """Full session transcript the harness overwrites after each managed turn.
+
+        The complete, untruncated (marker-redacted) record of the managed
+        session, for operator and human review -- including tool-call results,
+        which the compaction fork elides. One file, rewritten each turn;
+        compaction forks a new session per generation, so this tracks the
+        current generation's work.
+        """
+        return self.root / "transcript.md"
 
     @property
     def state(self) -> Path:

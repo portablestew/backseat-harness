@@ -62,3 +62,70 @@ def test_review_reasks_once_on_bad_output():
     v = review(inputs, invoke)
     assert len(calls) == 2
     assert v.kind is VerdictKind.CONTINUE
+
+
+def test_parse_ignores_trailing_prose_with_braces():
+    # A greedy {.*} match would swallow the trailing braces and fail to parse.
+    text = 'Checked {the diff}.\n{"verdict":"continue","next_prompt":"x"}\nSee {notes}.'
+    v = parse_verdict(text)
+    assert v is not None and v.next_prompt == "x"
+
+
+def test_parse_takes_last_verdict_object():
+    text = '{"verdict":"continue","next_prompt":"draft"}\n{"verdict":"done"}'
+    assert parse_verdict(text).kind is VerdictKind.DONE
+
+
+def test_plan_prompt_for_empty_checklist_asks_for_titled_steps():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="",
+        outcome=None, iteration=0, task_dir=".backseat/tasks/demo",
+    )
+    prompt = build_prompt(inputs)
+    assert "Your task: plan" in prompt
+    assert "new task" in prompt
+    assert "`title`" in prompt
+    assert ".backseat/tasks/demo" in prompt
+    assert "(no managed session yet)" in prompt
+
+
+def test_plan_prompt_with_existing_checklist_replans():
+    cl = Checklist(steps={"a": {"title": "A", "status": "active"}})
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=cl, managed_fork="fork",
+        outcome=None, iteration=3,
+    )
+    prompt = build_prompt(inputs)
+    assert "Re-assess" in prompt
+    assert "before managed turn 4" in prompt
+
+
+def test_verify_commands_listed_when_configured():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1, verify_commands=["pytest -q"],
+    )
+    assert "`pytest -q`" in build_prompt(inputs)
+
+
+def test_persona_ships_with_package():
+    from backseat_harness.system_agent import load_persona
+
+    persona = load_persona()
+    assert "vibecoding" in persona
+    assert "one small" in persona
+
+
+def test_prompt_lists_handoff_docs():
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.system_agent import ReviewInputs, build_prompt
+
+    base = dict(
+        meta_prompt="goal", checklist=Checklist(), managed_fork="", outcome=None,
+        iteration=0, task_dir=".backseat/tasks/t",
+    )
+    empty = build_prompt(ReviewInputs(**base))
+    assert "`.backseat/tasks/t/docs`" in empty
+    assert "(none yet)" in empty
+    listed = build_prompt(ReviewInputs(**base, docs=[".backseat/tasks/t/docs/1-research.md"]))
+    assert "- `.backseat/tasks/t/docs/1-research.md`" in listed

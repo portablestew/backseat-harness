@@ -20,8 +20,12 @@ venv/
 
 # Local tooling config (per-developer, not project artifacts)
 .kiro/
+.kilo/
 .opencode/
 .pyddock/
+
+# Throwaway live-run scratch workspace (disposable, not a project artifact)
+test_workspace/
 
 # OS / editor
 .DS_Store

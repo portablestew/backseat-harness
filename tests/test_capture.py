@@ -1,0 +1,122 @@
+"""Full-session transcript capture: redaction and the loop wiring."""
+
+from conftest import FakeProvider
+
+from backseat_harness import capture
+from backseat_harness.loop import run_task
+from backseat_harness.marker import REDACTED_ROOT
+from backseat_harness.models import TaskStatus
+from backseat_harness.providers.base import TurnResult
+
+# --- capture: load + redact -------------------------------------------------
+
+
+def test_capture_redacts_root_uuid(stub_history):
+    uuid = "11111111-2222-3333-4444-555555555555"
+    stub_history["transcript"] = (
+        f"## USER\n<meta>START SESSION {uuid} #1</meta>\ngo\n\n"
+        f"## ASSISTANT\ndone, ref {uuid}"
+    )
+    text = capture.capture(uuid, "fake_history", uuid)
+    assert uuid not in text
+    assert REDACTED_ROOT in text
+    assert "done, ref" in text
+
+
+def test_capture_returns_none_when_no_transcript(stub_history):
+    stub_history["transcript"] = ""
+    assert capture.capture("root", "fake_history", "root") is None
+
+
+def test_capture_returns_none_when_whitespace_only(stub_history):
+    stub_history["transcript"] = "   \n  "
+    assert capture.capture("root", "fake_history", "root") is None
+
+
+# --- loop wiring ------------------------------------------------------------
+
+
+def _runner_ok(provider, spec):
+    return TurnResult(
+        exit_code=0, timed_out=False, duration_s=0.1,
+        native_session_id="sess-1", stdout="", stderr="",
+    )
+
+
+def test_loop_writes_transcript_and_names_it_for_operator(config, task, stub_history):
+    slug, paths = task
+    stub_history["transcript"] = (
+        "## USER\ngo\n\n"
+        "## ASSISTANT\nTOOL_RESULT\n> FULL UNTRUNCATED OUTPUT\n\ndid it"
+    )
+    prompts: list[str] = []
+
+    def system_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"done"}'
+
+    result = run_task(slug, config, FakeProvider(), _runner_ok, system_invoker, first_prompt="go")
+    assert result.status is TaskStatus.DONE
+
+    # A single transcript file exists and holds the untruncated payload.
+    assert paths.transcript.exists()
+    assert paths.transcript.name == "transcript.md"
+    assert "FULL UNTRUNCATED OUTPUT" in paths.transcript.read_text(encoding="utf-8")
+
+    # The review prompt points the operator at that file.
+    assert "transcript.md`" in prompts[-1]
+
+
+def test_loop_overwrites_single_transcript_across_turns(config, task, stub_history):
+    """One file, rewritten each turn -- not one file per iteration."""
+    slug, paths = task
+    stub_history["transcript"] = "## USER\ngo\n\n## ASSISTANT\nturn output"
+
+    verdicts = iter([
+        '{"verdict":"continue","next_prompt":"again"}',
+        '{"verdict":"done"}',
+    ])
+
+    result = run_task(
+        slug, config, FakeProvider(), _runner_ok, lambda p: next(verdicts), first_prompt="go"
+    )
+    assert result.status is TaskStatus.DONE
+    assert result.iterations == 2
+    # Exactly one transcript artifact, at the task root -- no per-turn files.
+    assert paths.transcript.exists()
+    assert not (paths.root / "turns").exists()
+
+
+def test_loop_survives_capture_failure(config, task, stub_history, monkeypatch):
+    """Capture is best-effort: a history error must not fail the run."""
+    slug, paths = task
+
+    def boom(search, provider):
+        raise RuntimeError("history unavailable")
+
+    # Only the capture load blows up; _record_native's find_session is stubbed
+    # by the stub_history fixture and stays intact.
+    monkeypatch.setattr("backseat_harness.capture.history.load_full_transcript", boom)
+
+    result = run_task(
+        slug, config, FakeProvider(), _runner_ok,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert result.status is TaskStatus.DONE
+    assert not paths.transcript.exists()
+
+
+def test_plan_phase_writes_no_transcript(config, task, stub_history):
+    """The plan phase has no managed turn, so no capture and no transcript line."""
+    slug, paths = task
+    stub_history["transcript"] = "## USER\ngo\n\n## ASSISTANT\nx"
+    prompts: list[str] = []
+
+    def system_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"ask_human","notes":"which framework?"}'
+
+    result = run_task(slug, config, FakeProvider(), _runner_ok, system_invoker)
+    assert result.status is TaskStatus.PAUSED
+    assert not paths.transcript.exists()
+    assert "Full session transcript" not in prompts[0]

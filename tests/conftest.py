@@ -58,10 +58,13 @@ def stub_history(monkeypatch):
     """
     from backseat_harness import history
 
-    state = {"fork": "", "session": None}
+    state = {"fork": "", "session": None, "transcript": ""}
 
     monkeypatch.setattr(history, "fork_session", lambda search, provider: state["fork"])
     monkeypatch.setattr(history, "find_session", lambda search, provider: state["session"])
+    monkeypatch.setattr(
+        history, "load_full_transcript", lambda search, provider: state["transcript"]
+    )
     return state
 
 

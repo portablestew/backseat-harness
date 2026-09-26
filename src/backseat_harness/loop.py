@@ -1,15 +1,19 @@
-"""The core loop: prep -> spawn -> wait -> assess -> repeat.
+"""The core loop: plan -> (spawn -> wait -> review)* -> terminal state.
 
 ``run_task`` is the library entry point a future orchestrator imports. The CLI
 (cli.py) is a thin wrapper over it. The loop is the only writer to the task's
 ``.backseat`` files; every persisted mutation (checklist merge, binding update,
 state, ledger) happens here after the system agent's verdict is parsed.
 
-Note: the managed-agent spawn and system-agent invocation are injected so this
-module has no hard dependency on a live CLI. cli.py wires the real runners;
-tests wire fakes. The wiring functions are intentionally left as thin seams
-(``managed_runner`` / ``system_invoker``) rather than being hardcoded, keeping
-the loop deterministic and testable.
+When a run starts with no prompt for the managed agent -- a brand-new task, or a
+resumed one -- the system agent goes first in a **plan** phase: it plans (or
+re-plans) the checklist and writes the first prompt, exactly as a human operator
+would before touching the keyboard. Every managed turn after that is followed
+by a **review**.
+
+The managed-agent spawn and system-agent invocation are injected so this module
+has no hard dependency on a live CLI. cli.py wires the real runners; tests wire
+fakes.
 """
 
 from __future__ import annotations
@@ -18,12 +22,13 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 
+from backseat_harness import capture as capture_mod
 from backseat_harness import checklist as checklist_mod
 from backseat_harness import compact as compact_mod
-from backseat_harness import history, storage
+from backseat_harness import history, progress, storage
 from backseat_harness import marker as marker_mod
 from backseat_harness import system_agent as sa
-from backseat_harness.config import Config
+from backseat_harness.config import Config, TaskPaths
 from backseat_harness.models import (
     Binding,
     LedgerEntry,
@@ -54,17 +59,49 @@ def run_task(
 ) -> TaskResult:
     """Drive a single task lane to a terminal state.
 
-    ``first_prompt`` seeds iteration 1 when there is no prior verdict; on resume
-    the loop derives the next prompt from the system agent instead.
+    ``first_prompt`` is an optional override for the first managed turn. Without
+    it, the system agent plans first and writes that prompt itself.
     """
     paths = config.task_paths(slug)
     state = storage.load_state(paths, slug)
+    state.status = TaskStatus.ACTIVE
     binding = storage.load_binding(paths) or _new_binding(config.provider)
     meta = storage.read_meta(paths)
+    task_dir = paths.root.relative_to(config.workspace_root).as_posix()
+    paths.docs.mkdir(parents=True, exist_ok=True)
+
+    def call_system_agent(outcome: TurnOutcome | None, transcript_file: str | None) -> Verdict:
+        verdict = sa.review(
+            sa.ReviewInputs(
+                meta_prompt=meta,
+                checklist=checklist_mod.load_checklist(paths.checklist),
+                managed_fork=_operator_fork(binding, provider),
+                outcome=outcome,
+                iteration=state.iteration,
+                task_dir=task_dir,
+                verify_commands=list(config.system_agent.verify_commands),
+                docs=_list_docs(paths, config.workspace_root),
+                transcript_file=transcript_file,
+            ),
+            system_invoker,
+        )
+        return verdict or Verdict(kind=VerdictKind.PROBLEM, notes="unparseable verdict")
 
     started = time.monotonic()
     pending_prompt = first_prompt
     last_verdict: VerdictKind | None = None
+
+    # --- Plan phase: no prompt queued, so the system agent drives first. ---
+    if pending_prompt is None:
+        progress.iteration_start(state.iteration, state.generation, "plan")
+        verdict = call_system_agent(None, None)
+        _persist(paths, state, binding, verdict, None, phase="plan")
+        _report(verdict)
+        last_verdict = verdict.kind
+        terminal = _terminal(paths, state, verdict)
+        if terminal is not None:
+            return terminal
+        pending_prompt = verdict.next_prompt
 
     while True:
         # --- Budget guards (cheap, forward-only). ---
@@ -78,6 +115,7 @@ def run_task(
             )
 
         state.iteration += 1
+        progress.iteration_start(state.iteration, state.generation, "review")
 
         # --- Compaction decision (before spawn). ---
         gen = binding.current
@@ -120,54 +158,121 @@ def run_task(
             transcript_bytes=binding.current.transcript_bytes if binding.current else 0,
         )
 
-        # --- Assess: fresh system agent reviews the turn. ---
-        current_checklist = checklist_mod.load_checklist(paths.checklist)
-        fork_text = (
-            compact_mod.render_fork(binding.root_uuid, provider.history_provider)
-            if binding.current
-            else ""
-        )
-        verdict = sa.review(
-            sa.ReviewInputs(
-                meta_prompt=meta,
-                checklist=current_checklist,
-                managed_fork=fork_text,
-                outcome=outcome,
-                iteration=state.iteration,
-            ),
-            system_invoker,
-        )
+        # --- Capture the full session transcript for review. ---
+        transcript_file = _capture_transcript(paths, binding, provider, config.workspace_root)
 
-        if verdict is None:
-            verdict = Verdict(kind=VerdictKind.PROBLEM, notes="unparseable verdict")
-
-        # --- Persist (harness is the only writer). Order matters for crash-safety:
-        #     checklist merge -> binding -> state -> ledger (ledger last = committed).
-        merged = checklist_mod.merge_update(current_checklist, verdict.checklist_update)
-        checklist_mod.save_checklist(paths.checklist, merged)
-        storage.save_binding(paths, binding)
-        storage.save_state(paths, state)
-        storage.append_ledger(
-            paths,
-            LedgerEntry(
-                iteration=state.iteration,
-                generation=state.generation,
-                verdict=verdict.kind,
-                exit_code=result.exit_code,
-                timed_out=result.timed_out,
-                duration_s=result.duration_s,
-                notes=verdict.notes,
-            ),
-        )
+        # --- Review: a fresh system agent assesses the turn. ---
+        verdict = call_system_agent(outcome, transcript_file)
+        _persist(paths, state, binding, verdict, result, phase="review")
+        _report(verdict)
         last_verdict = verdict.kind
 
         # --- Decide next action. ---
-        if verdict.kind is VerdictKind.DONE or checklist_mod.all_done(merged):
-            return _finish(paths, state, TaskStatus.DONE, last_verdict, verdict.notes)
-        if verdict.kind is VerdictKind.ASK_HUMAN:
-            return _finish(paths, state, TaskStatus.PAUSED, last_verdict, verdict.notes)
+        terminal = _terminal(paths, state, verdict)
+        if terminal is not None:
+            return terminal
         # continue or problem: repeat with the next prompt (problem repeats naturally).
         pending_prompt = verdict.next_prompt or pending_prompt
+
+
+def _list_docs(paths: TaskPaths, workspace_root) -> list[str]:
+    """Workspace-relative paths of every file under the task's docs dir, sorted."""
+    if not paths.docs.is_dir():
+        return []
+    return sorted(
+        p.relative_to(workspace_root).as_posix()
+        for p in paths.docs.rglob("*")
+        if p.is_file()
+    )
+
+
+def _capture_transcript(
+    paths: TaskPaths,
+    binding: Binding,
+    provider: Provider,
+    workspace_root,
+) -> str | None:
+    """Overwrite ``transcript.md`` with the session so far; return its rel path.
+
+    Best-effort observability: capture reads the managed session through
+    chat-mother-forker, which can be unavailable or empty (e.g. the very first
+    turn before anything is stored). Any failure is swallowed and returns None
+    so an inspection artifact never takes down the run itself.
+    """
+    try:
+        text = capture_mod.capture(
+            binding.root_uuid, provider.history_provider, binding.root_uuid
+        )
+    except Exception:  # noqa: BLE001 - capture is non-critical; never fail the loop
+        return None
+    if not text:
+        return None
+    path = paths.transcript
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path.relative_to(workspace_root).as_posix()
+
+
+def _operator_fork(binding: Binding, provider: Provider) -> str:
+    """Render the managed session for the system agent, marker redacted.
+
+    Redaction keeps the operator's own stored session from matching the task's
+    marker search (see marker.redact).
+    """
+    if binding.current is None:
+        return ""
+    fork = compact_mod.render_fork(binding.root_uuid, provider.history_provider)
+    return marker_mod.redact(fork, binding.root_uuid)
+
+
+def _persist(
+    paths: TaskPaths,
+    state: TaskState,
+    binding: Binding,
+    verdict: Verdict,
+    result: TurnResult | None,
+    phase: str,
+) -> None:
+    """Apply a verdict to disk. The harness is the only writer.
+
+    Order matters for crash-safety: checklist merge -> binding -> state ->
+    ledger (ledger last = committed).
+    """
+    current = checklist_mod.load_checklist(paths.checklist)
+    merged = checklist_mod.merge_update(current, verdict.checklist_update)
+    checklist_mod.save_checklist(paths.checklist, merged)
+    storage.save_binding(paths, binding)
+    storage.save_state(paths, state)
+    storage.append_ledger(
+        paths,
+        LedgerEntry(
+            iteration=state.iteration,
+            generation=state.generation,
+            verdict=verdict.kind,
+            exit_code=result.exit_code if result else 0,
+            timed_out=result.timed_out if result else False,
+            duration_s=result.duration_s if result else 0.0,
+            notes=verdict.notes,
+            next_prompt=verdict.next_prompt,
+            phase=phase,
+        ),
+    )
+
+
+def _report(verdict: Verdict) -> None:
+    """Echo the operator's note and queued prompt to stderr for a live watcher."""
+    progress.operator_note(verdict.notes)
+    progress.next_prompt(verdict.next_prompt)
+
+
+def _terminal(paths: TaskPaths, state: TaskState, verdict: Verdict) -> TaskResult | None:
+    """Return the terminal result a verdict implies, or None to keep going."""
+    merged = checklist_mod.load_checklist(paths.checklist)
+    if verdict.kind is VerdictKind.DONE or checklist_mod.all_done(merged):
+        return _finish(paths, state, TaskStatus.DONE, verdict.kind, verdict.notes)
+    if verdict.kind is VerdictKind.ASK_HUMAN:
+        return _finish(paths, state, TaskStatus.PAUSED, verdict.kind, verdict.notes)
+    return None
 
 
 def _new_binding(provider: str) -> Binding:

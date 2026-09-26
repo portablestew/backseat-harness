@@ -14,10 +14,10 @@ deliberately unused: the harness does its own compaction-by-fork through
 chat-mother-forker, seeding a *new* session so the ``#n`` generation chain stays
 explicit and searchable.
 
-Permissions: opencode blocks on approval prompts by default, and ``--auto``
-(auto-approve anything not explicitly denied) is flagged dangerous by opencode
-itself. The harness will not pick that for you -- the workspace owner supplies
-permission flags via config, and the turn timeout is the backstop.
+Permissions: the managed agent runs as opencode's default agent with whatever
+flags the workspace owner supplies via config (``--auto`` is never assumed). The
+system agent runs as a harness-written ``backseat-operator`` agent that denies
+everything except reads, search, and read-only git (see ``prepare_operator``).
 
 Sessions live in SQLite (``opencode.db``), so there is no transcript file to
 stat; sizing goes through chat-mother-forker's ``opencode`` provider.
@@ -27,11 +27,68 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
-from backseat_harness.providers.base import Provider, SpawnSpec
+from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
 
 # opencode session ids are prefixed, which makes a last-ditch text scan safe.
 _SESSION_RE = re.compile(r"\bses_[A-Za-z0-9]+\b")
+
+#: Name of the harness-managed operator agent (the markdown file's stem).
+OPERATOR_AGENT = "backseat-operator"
+
+# Read-only git inspection the operator may run itself. Everything else is the
+# managed agent's job. ``--output`` is denied after the allows (last match wins)
+# because ``git diff --output=<file>`` writes to disk.
+_OPERATOR_GIT = ("git status*", "git diff*", "git log*", "git show*")
+
+
+def operator_permissions(verify_commands: list[str]) -> dict:
+    """Permission map for the operator: deny by default, allow read-only tools.
+
+    Nothing is left at ``ask``: a non-interactive run has nobody to answer, so an
+    ``ask`` would stall the operator until the turn timeout.
+    """
+    bash: dict[str, str] = {"*": "deny"}
+    bash.update({pattern: "allow" for pattern in _OPERATOR_GIT})
+    bash.update({cmd: "allow" for cmd in verify_commands})
+    bash["*--output*"] = "deny"
+    return {
+        "*": "deny",
+        "read": {
+            "*": "allow",
+            "*.env": "deny",
+            "*.env.*": "deny",
+            "*.env.example": "allow",
+            # Holds the task's root UUID. If the operator read it, its own
+            # stored session would match the marker search (see marker.redact).
+            "*binding.json": "deny",
+        },
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "bash": bash,
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "question": "deny",
+    }
+
+
+def render_operator_agent(persona: str, verify_commands: list[str]) -> str:
+    """Render the operator as an opencode markdown agent.
+
+    Frontmatter values are JSON, which is valid YAML flow syntax, so no YAML
+    library is needed and quoting is always correct.
+    """
+    front = {
+        "description": "backseat-harness operator: read-only user of the managed agent",
+        "mode": "primary",
+        "permission": operator_permissions(verify_commands),
+    }
+    lines = ["---"]
+    lines += [f"{key}: {json.dumps(value)}" for key, value in front.items()]
+    lines += ["---", "", persona.strip(), ""]
+    return "\n".join(lines)
 
 
 class OpencodeProvider(Provider):
@@ -91,6 +148,38 @@ class OpencodeProvider(Provider):
             # so verdict parsing still has a chance (and errors stay visible).
             return stdout
         return "\n".join(parts[k] for k in order)
+
+    def prepare_operator(
+        self, profile_dir: Path, persona: str, verify_commands: list[str]
+    ) -> OperatorLaunch:
+        """Write ``<profile_dir>/agents/backseat-operator.md`` and point opencode at it.
+
+        ``OPENCODE_CONFIG_DIR`` is an extra config directory that opencode loads
+        after the global config and project ``.opencode`` dirs, so this adds the
+        agent without touching the user's own opencode config. It is set on the
+        operator process only; the managed agent never sees this profile.
+        """
+        agents = profile_dir / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / f"{OPERATOR_AGENT}.md").write_text(
+            render_operator_agent(persona, verify_commands), encoding="utf-8"
+        )
+        return OperatorLaunch(
+            env={"OPENCODE_CONFIG_DIR": str(profile_dir)},
+            extra_args=("--agent", OPERATOR_AGENT),
+        )
+
+    def interactive_command(self, native_session_id: str | None) -> list[str]:
+        """Open the managed session in opencode's TUI.
+
+        The bare ``opencode`` command starts the TUI; ``--session <id>`` drops
+        the human straight into the managed session so they can advance it, then
+        quit to hand control back. With no id yet, a fresh TUI session opens.
+        """
+        cmd = ["opencode"]
+        if native_session_id:
+            cmd += ["--session", native_session_id]
+        return cmd
 
 
 def _iter_events(stdout: str):

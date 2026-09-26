@@ -48,6 +48,27 @@ def test_ledger_append_only(config):
     assert entries[1].verdict is VerdictKind.DONE
 
 
+def test_ledger_records_next_prompt(config):
+    paths = config.task_paths("t1")
+    storage.append_ledger(
+        paths,
+        LedgerEntry(
+            iteration=1, generation=1, verdict=VerdictKind.CONTINUE,
+            exit_code=0, timed_out=False, duration_s=1.0,
+            notes="planned", next_prompt="research the router",
+        ),
+    )
+    (entry,) = list(storage.read_ledger(paths))
+    assert entry.next_prompt == "research the router"
+    # Terminal entries carry no prompt; the field round-trips as None.
+    assert LedgerEntry.from_dict(
+        LedgerEntry(
+            iteration=2, generation=1, verdict=VerdictKind.DONE,
+            exit_code=0, timed_out=False, duration_s=0.0,
+        ).to_dict()
+    ).next_prompt is None
+
+
 def test_load_missing_returns_defaults(config):
     paths = config.task_paths("missing")
     assert storage.load_binding(paths) is None

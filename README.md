@@ -1,6 +1,6 @@
 # backseat-harness
 
-Simple, single-task agent loops. Buckle up.
+Simple, single-task agent loops. _Buckle up, you're not at the wheel anymore._
 
 backseat-harness drives an off-the-shelf CLI coding agent (opencode today,
 Claude Code / kiro-cli later) one small step at a time toward a goal you write
@@ -8,11 +8,9 @@ once. After each managed turn, a **fresh, adversarial system agent** reviews the
 whole session — code, tests, transcript — against a durable checklist and
 decides the single next prompt.
 
-The name has a double meaning: the system agent is the backseat driver that
-never touches the wheel, and a harness is the seatbelt that keeps an autonomous
-run safe. Because the managed session is a plain CLI session underneath, a human
-can `--continue` it at any time. Low-friction takeover; the autonomous loop is
-never a black box.
+Because the managed loop is a plain CLI session underneath, a human can
+`takeover` at any time. Low-friction takeover; the autonomous loop is never
+a black box.
 
 ## How it works
 
@@ -21,6 +19,7 @@ your meta-prompt (goal)
    │
    ▼
 ┌─────────────────────────── loop (one task lane) ───────────────────────────┐
+│  (no prompt queued) system agent plans the checklist + writes prompt #1      │
 │  prep next prompt                                                            │
 │    → (if transcript > ~1MB) start a new generation seeded with a chat-fork   │
 │  spawn managed agent, non-interactive, one shot                              │
@@ -76,20 +75,37 @@ Requires Python 3.10+ and the managed agent's own CLI — for v0.1 that is
 [`opencode`](https://opencode.ai) — installed and authenticated on your PATH.
 backseat-harness never stores provider keys; it uses the CLI's ambient auth.
 
-One thing to decide before your first run: opencode blocks on permission
-prompts, and a blocked turn just burns the timeout. Grant it whatever it needs
-via `extra_args` in your config (opencode's own `--auto` approves everything not
-explicitly denied, which it flags as dangerous for good reason). The harness
-won't pick a permission posture for you.
+Permissions: the managed agent runs as opencode's default agent with no extra
+flags. Anything it would have to *ask* about can't be answered in a
+non-interactive run, so grant more via `extra_args` if your task needs it
+(opencode's `--auto` approves everything not explicitly denied, which it flags
+as dangerous for good reason). The harness never assumes `--auto`.
+
+The system agent runs under a harness-written `backseat-operator` opencode agent
+(`.backseat/agents/opencode/agents/backseat-operator.md`, rewritten at every
+`run`). Its system prompt is the operator persona
+(`src/backseat_harness/operator_persona.md`), and its permissions deny
+everything except reads, search, read-only git, and any configured
+`verify_commands`. It's loaded through `OPENCODE_CONFIG_DIR` on the operator
+process only, so your own opencode config is untouched. Set
+`[system_agent].agent` to use your own agent instead.
 
 ## Use as a CLI
 
 ```bash
-# scaffold a task lane under .backseat/tasks/<slug>/
-backseat-harness init hello-endpoint -m "Add a GET /hello endpoint returning JSON."
+# start a task from nothing: creates .backseat/tasks/<slug>/, then the system
+# agent plans the checklist and writes the first managed prompt
+backseat-harness run hello-endpoint -m "Add a GET /hello endpoint returning JSON."
 
-# drive it
+# resume later (the system agent re-assesses and picks the next step)
+backseat-harness run hello-endpoint
+
+# optional: scaffold without running, or force the first managed prompt
+backseat-harness init hello-endpoint -m "..."
 backseat-harness run hello-endpoint -p "Start by locating the router."
+
+# answer an ask_human pause by driving the session yourself, then auto-resume
+backseat-harness takeover hello-endpoint
 
 # check progress (add --format json for machine-readable output)
 backseat-harness status hello-endpoint
@@ -115,7 +131,7 @@ result = run_task(
     provider=provider,
     managed_runner=run_turn,          # or inject your own
     system_invoker=my_system_invoker, # str prompt -> str final message
-    first_prompt="Start by locating the router.",
+    first_prompt=None,                # None: the system agent plans first
 )
 print(result.status, result.iterations)
 ```
@@ -125,16 +141,34 @@ deterministic and testable without a live CLI.
 
 ## Human takeover
 
-The managed session is an ordinary CLI session. To step in, resume it by its
-native id (shown in `status`):
+When the operator hits something only you can settle — an ambiguous goal, a
+product call, a credential — it returns the `ask_human` verdict and the loop
+pauses (`status` shows `paused`, with the question as the reason). Answer it by
+taking the wheel:
 
 ```bash
-opencode --session <native_session_id>      # TUI, same session
+backseat-harness takeover hello-endpoint
+```
+
+This opens the managed session in the CLI's own interactive UI (for opencode,
+the TUI at the current generation's session), attached to your terminal. Drive
+the conversation as far as you need to remove the ambiguity, then quit. The
+harness is blocked on that process; when it exits, the operator re-plans from
+the session you just advanced and the loop continues. Because your input lands
+as the managed agent's own conversation history, the operator sees it as
+context on the next turn — no separate answer channel needed.
+
+`--no-resume` hands off without running the loop afterward, for when you just
+want to poke at the session. And the session is an ordinary CLI session, so you
+can always resume it by hand instead:
+
+```bash
+opencode --session <native_session_id>      # native id is shown in `status`
 ```
 
 The `<meta>… #n</meta>` marker at the top tells you which generation you landed
-in. Note that each compaction opens a *new* session, so `status` shows the
-current generation's id, not the whole chain — `binding.json` has the rest.
+in. Each compaction opens a *new* session, so `status` shows the current
+generation's id, not the whole chain — `binding.json` has the rest.
 
 ## Scope
 

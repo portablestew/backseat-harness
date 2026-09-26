@@ -46,3 +46,21 @@ def test_opencode_history_provider_name_is_valid():
 )
 def test_id_from_key(key, expected):
     assert history._id_from_key(key) == expected
+
+
+def test_load_full_transcript_no_match_is_empty():
+    """load_chat raises LookupError on no match; the seam maps that to "".
+
+    The loop treats "no session yet" and "empty session" the same, so the
+    LookupError must never surface as a crash mid-capture.
+    """
+    assert history.load_full_transcript("ses_not-a-real-session-xyz", "opencode") == ""
+
+
+def test_load_full_transcript_returns_load_chat_string(monkeypatch):
+    """The seam passes load_chat's rendered transcript straight through."""
+    monkeypatch.setattr(history, "_scoped", lambda provider: ["provider"])
+    monkeypatch.setattr(
+        history, "_load", lambda attr: (lambda search, providers=None: "## USER\nrendered")
+    )
+    assert history.load_full_transcript("root", "opencode") == "## USER\nrendered"

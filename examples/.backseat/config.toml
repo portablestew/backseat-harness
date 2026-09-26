@@ -35,13 +35,16 @@ max_wall_clock_s = 86400
 max_generations = 20
 
 [system_agent]
-# The adversarial reviewer. Same CLI tool, read-only profile. Often a stronger
+# The operator agent. Same CLI tool, read-only profile. Often a stronger
 # model than the managed agent; kept decoupled and configurable.
 provider = "opencode"
 # model = "anthropic/claude-opus-4"  # optional, provider/model form for opencode
-# agent = "read-only-reviewer"       # optional, maps to --agent
+# By default the harness writes and uses its own read-only "backseat-operator"
+# agent (.backseat/agents/opencode/). Name another agent here to use yours.
+# agent = "my-operator"
 # extra_args = []                    # optional, as above
 
-# Verification commands the reviewer may run for adversarial checks beyond the
-# transcript (tests, type-check). Run in the workspace root.
+# Exact commands the operator may run itself (allow-listed in its bash
+# permissions), e.g. a fast test run. Everything else it delegates to the
+# managed agent.
 verify_commands = []

@@ -11,7 +11,8 @@ sections are ignored, not rejected.
 ```
 .backseat/
   config.toml                # harness defaults, provider prefs, budgets
-  agents/                    # (optional) system-agent profile assets
+  agents/<provider>/         # harness-written operator profile, rewritten each run
+                             #   (opencode: agents/backseat-operator.md)
   tasks/
     <task-slug>/             # one lane = one meta-prompt goal
       meta.md                # the meta-prompt (free text)
@@ -19,6 +20,8 @@ sections are ignored, not rejected.
       binding.json           # root_uuid -> generation chain (recoverable cache)
       ledger.jsonl           # append-only, one line per completed iteration
       state.json             # mutable status/iteration/generation
+      transcript.md          # full managed session, redacted, rewritten each turn
+      docs/                  # managed-agent handoff docs (research, plan, reviews)
 ```
 
 A task slug must be filesystem-safe. Lanes are independent: separate session
@@ -38,16 +41,22 @@ max_wall_clock_s = 86400
 max_generations = 20
 
 [system_agent]
-provider = "opencode"          # reviewer CLI (may differ / be stronger)
+provider = "opencode"          # operator CLI (may differ / be stronger)
 model = "..."                  # optional
-agent = "..."                  # optional, maps to --agent / profile
+agent = "..."                  # optional: your own agent instead of backseat-operator
 extra_args = []                # optional, as above
-verify_commands = []           # optional adversarial checks (tests, typecheck)
+verify_commands = []           # optional: exact commands the operator may run itself
 ```
 
+The whole file is optional; code defaults apply to anything omitted.
+
 `extra_args` has no default on purpose. A managed turn runs non-interactively, so
-it needs enough permission to finish without stopping at an approval prompt — but
-which permissions those are is the workspace owner's call, not the harness's.
+anything its CLI would *ask* about goes unanswered — but which permissions to
+grant is the workspace owner's call, not the harness's.
+
+Unless `agent` is set, every `run` writes the operator profile under
+`agents/<provider>/`: the persona as system prompt, and deny-by-default
+permissions allowing reads, search, read-only git, and `verify_commands`.
 
 ## checklist.json
 
@@ -113,7 +122,7 @@ row bytes for opencode, file bytes for a JSONL-backed CLI — so compare it agai
 {
   "v": 1,
   "slug": "hello-endpoint",
-  "status": "active",        // active | paused | done | failed
+  "status": "active",        // active | paused (ask_human) | done | failed
   "iteration": 7,
   "generation": 2,
   "updated_at": 1750003600.0
@@ -122,13 +131,39 @@ row bytes for opencode, file bytes for a JSONL-backed CLI — so compare it agai
 
 ## ledger.jsonl
 
-Append-only, one JSON object per completed iteration. It is written **last** in
-each iteration (after checklist + binding + state), so its final line marks the
-last fully-committed iteration — the anchor for crash recovery.
+Append-only, one JSON object per system-agent decision. It is written **last**
+(after checklist + binding + state), so its final line marks the last
+fully-committed step — the anchor for crash recovery. `phase` is `"plan"` for a
+decision made with no managed turn (a new or resumed run; `iteration` is the
+number of turns so far) and `"review"` after a managed turn. `next_prompt` is
+the exact prompt the operator queued for the next turn (`null` when the
+verdict queues none).
 
 ```json
-{"at": 1750003600.0, "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next"}
+{"at": 1750003600.0, "phase": "review", "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next", "next_prompt": "Add a test for GET /hello ..."}
 ```
+
+## transcript.md
+
+The full managed session, rendered by chat-mother-forker's `load_chat` and
+written **by the harness** after each managed turn. Unlike the compaction fork
+(middle-truncated) and unlike `docs/` (managed-agent written), this is the
+complete, untruncated record — tool-call results included — so the operator can
+inspect what actually happened rather than an elided summary. One file,
+overwritten each turn; compaction forks a fresh session per generation, so it
+tracks the current generation's work. The task's root UUID is redacted (the
+generation ordinal stays), so if the operator quotes the file its own stored
+session can't hijack the task's marker search. Best-effort: if history is
+unavailable, capture is skipped and the run continues.
+
+## docs/
+
+Handoff docs written by the managed agent at the operator's request: research
+notes, the plan, independent-review findings, captured evidence (e.g. full test
+output). The harness creates the directory and lists its files in every
+operator prompt, but never writes inside it. It is the only place under
+`.backseat/` the managed agent is asked to write; that is a prompt-level
+convention, not an enforced permission.
 
 ## Verdict envelope (system agent -> harness, on stdout)
 
@@ -144,3 +179,10 @@ applies it. Tolerates prose around a single JSON object.
   "notes": "one line for the ledger"
 }
 ```
+
+`ask_human` pauses the lane (`status` = `paused`, `notes` = the question). The
+human answers with `backseat-harness takeover <slug>`, which opens the managed
+session in the provider's interactive UI, waits for them to advance it, then
+re-plans from the advanced session on exit. There is no stored answer channel:
+the human's input becomes the managed agent's own conversation history, which
+the operator reads on the next turn.

@@ -210,11 +210,18 @@ class LedgerEntry:
     timed_out: bool
     duration_s: float
     notes: str = ""
+    #: The exact prompt the operator sent the managed agent for the next turn
+    #: (None for terminal verdicts that queue no prompt). Recording it makes the
+    #: ledger a full audit trail of the conversation the operator drove.
+    next_prompt: str | None = None
     at: float = field(default_factory=time.time)
+    #: "review" (after a managed turn) or "plan" (system agent only, no turn).
+    phase: str = "review"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "at": self.at,
+            "phase": self.phase,
             "iteration": self.iteration,
             "generation": self.generation,
             "verdict": self.verdict.value,
@@ -222,6 +229,7 @@ class LedgerEntry:
             "timed_out": self.timed_out,
             "duration_s": self.duration_s,
             "notes": self.notes,
+            "next_prompt": self.next_prompt,
         }
 
     @classmethod
@@ -234,7 +242,9 @@ class LedgerEntry:
             timed_out=bool(data.get("timed_out", False)),
             duration_s=float(data.get("duration_s", 0.0)),
             notes=data.get("notes", "") or "",
+            next_prompt=data.get("next_prompt"),
             at=float(data.get("at", time.time())),
+            phase=data.get("phase", "review") or "review",
         )
 
 

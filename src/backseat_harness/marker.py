@@ -27,6 +27,21 @@ def prepend_marker(root_uuid: str, generation: int, prompt: str) -> str:
     return f"{format_marker(root_uuid, generation)}\n\n{prompt}"
 
 
+REDACTED_ROOT = "<task-root>"
+
+
+def redact(text: str, root_uuid: str) -> str:
+    """Remove the task's root UUID from ``text``.
+
+    Used on the managed-session fork before it goes into a system-agent prompt.
+    The operator's own session is stored by the same CLI, so an unredacted fork
+    would make every review a second session matching the marker search -- and
+    the newest match would win, pointing sizing and compaction at the operator
+    instead of the managed agent. The generation ordinal stays visible.
+    """
+    return text.replace(root_uuid, REDACTED_ROOT)
+
+
 def parse_marker(text: str) -> tuple[str, int] | None:
     """Extract ``(root_uuid, generation)`` from text, or None if absent."""
     m = _MARKER_RE.search(text)

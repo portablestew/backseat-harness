@@ -12,9 +12,10 @@ dynamic = ["version"]
 dependencies = [
     # Chat history access: search/fork/checkpoint of managed sessions.
     # Compaction-by-fork and system-agent review both depend on it, so it is core.
-    # 0.2.0 is the first release with the public library API (fork_chat / find_chats /
-    # ChatRef.size_bytes) that backseat_harness.history is built on.
-    "chat-mother-forker>=0.2.0",
+    # 0.2.0 first shipped the public library API (fork_chat / find_chats /
+    # ChatRef.size_bytes); 0.2.1 adds the public load_chat that turn capture uses
+    # for a full, untruncated transcript.
+    "chat-mother-forker>=0.2.1",
 ]
 
 [project.scripts]

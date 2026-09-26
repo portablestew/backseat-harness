@@ -27,3 +27,15 @@ def test_prepend_puts_marker_first():
     text = prepend_marker(root, 2, "prompt body")
     assert text.startswith("<meta>START SESSION")
     assert text.rstrip().endswith("prompt body")
+
+
+def test_redact_removes_root_uuid_but_keeps_generation():
+    from backseat_harness.marker import REDACTED_ROOT, redact
+
+    root = new_root_uuid()
+    text = prepend_marker(root, 2, f"see {root} again")
+    out = redact(text, root)
+    assert root not in out
+    assert f"<meta>START SESSION {REDACTED_ROOT} #2</meta>" in out
+    # A redacted marker no longer parses, so it can't be mistaken for identity.
+    assert parse_marker(out) is None
