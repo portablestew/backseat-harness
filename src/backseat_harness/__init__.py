@@ -1,7 +1,7 @@
 """backseat-harness: drive an off-the-shelf CLI agent one small step at a time.
 
 A meta-harness that spawns a managed CLI agent (Claude Code, opencode, kiro-cli),
-lets it take a single turn, then hands a fresh adversarial *system agent* the
+lets it take a single turn, then hands a fresh adversarial *operator* the
 transcript plus a durable checklist to review progress and decide the next prompt.
 
 __version__ is the single source of truth for the package version. pyproject.toml

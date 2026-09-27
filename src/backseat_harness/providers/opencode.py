@@ -7,7 +7,7 @@ emits one JSON event per line on stdout. Two things we need are in there:
   captured rather than minted. Identity is still marker-first; this is just the
   fast path, with a marker search through history as the fallback.
 - ``text`` events whose ``part.text`` carries assistant output, which is how the
-  system agent's verdict JSON gets recovered without parsing TUI decoration.
+  operator's verdict JSON gets recovered without parsing TUI decoration.
 
 Resuming is ``--session <id>`` (opencode has no ``--resume``). ``--fork`` is
 deliberately unused: the harness does its own compaction-by-fork through
@@ -16,7 +16,7 @@ explicit and searchable.
 
 Permissions: the managed agent runs as opencode's default agent with whatever
 flags the workspace owner supplies via config (``--auto`` is never assumed). The
-system agent runs as a harness-written ``backseat-operator`` agent that denies
+operator runs as a harness-written ``backseat-operator`` agent that denies
 everything except reads, search, and read-only git (see ``prepare_operator``).
 
 Sessions live in SQLite (``opencode.db``), so there is no transcript file to

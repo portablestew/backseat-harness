@@ -1,9 +1,14 @@
-"""The ``<meta>`` session marker: portable, provider-independent identity.
+"""The ``<meta>`` session markers: portable, provider-independent identity.
 
-Every generation's first user message begins with a marker so the session chain
-is reconstructible by search even if the binding cache is lost. A stable root
-UUID identifies the whole task chain; ``#n`` is the generation ordinal that
-increments on compaction.
+Every managed generation's first user message begins with a marker so the
+session chain is reconstructible by search even if the binding cache is lost. A
+stable root UUID identifies the whole task chain; ``#n`` is the generation
+ordinal that increments on compaction.
+
+Operator sessions carry their own, UUID-free tag: ``<meta>OPERATOR SESSION
+<slug> <phase></meta>``. It marks a stored session as an operator's so session
+search can filter them out, without ever matching the task's root-UUID marker
+search (see ``redact`` for why that matters).
 """
 
 from __future__ import annotations
@@ -12,6 +17,10 @@ import re
 import uuid
 
 _MARKER_RE = re.compile(r"<meta>START SESSION\s+([0-9a-fA-F-]{36})\s+#(\d+)</meta>")
+
+# Operator session tag: the constant prefix is the identity signal; the slug and
+# phase that may follow are human context only. Never contains a root UUID.
+OPERATOR_SESSION_RE = re.compile(r"<meta>OPERATOR SESSION[^<]*</meta>")
 
 
 def new_root_uuid() -> str:
@@ -27,13 +36,28 @@ def prepend_marker(root_uuid: str, generation: int, prompt: str) -> str:
     return f"{format_marker(root_uuid, generation)}\n\n{prompt}"
 
 
+def format_operator_marker(slug: str = "", phase: str = "") -> str:
+    """Return the operator session tag: ``<meta>OPERATOR SESSION [slug] [phase]</meta>``.
+
+    UUID-free by contract: the operator's own stored session must never match
+    the task's root-UUID marker search, while still being recognizable as an
+    operator's for session filtering.
+    """
+    parts = ["<meta>OPERATOR SESSION"]
+    if slug:
+        parts.append(slug)
+    if phase:
+        parts.append(phase)
+    return " ".join(parts) + "</meta>"
+
+
 REDACTED_ROOT = "<task-root>"
 
 
 def redact(text: str, root_uuid: str) -> str:
     """Remove the task's root UUID from ``text``.
 
-    Used on the managed-session fork before it goes into a system-agent prompt.
+    Used on the managed-session fork before it goes into an operator prompt.
     The operator's own session is stored by the same CLI, so an unredacted fork
     would make every review a second session matching the marker search -- and
     the newest match would win, pointing sizing and compaction at the operator

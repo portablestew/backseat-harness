@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from backseat_harness.config import Config
-from backseat_harness.providers.base import Provider, SpawnSpec
+from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
 
 
 class FakeProvider(Provider):
@@ -35,6 +35,12 @@ class FakeProvider(Provider):
 
     def extract_text(self, stdout: str) -> str:
         return stdout
+
+    def prepare_operator(self, profile_dir, persona, verify_commands):
+        return OperatorLaunch(env={}, extra_args=())
+
+    def interactive_command(self, native_session_id):
+        return ["fake"]
 
 
 @pytest.fixture

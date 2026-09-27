@@ -1,7 +1,7 @@
 """Managed-turn subprocess lifecycle: launch, watchdog timeout, result assembly.
 
 Turn end is process exit (the design's contract). Any nonzero exit or timeout is
-recorded uniformly and surfaced to the system agent only as an optional hint;
+recorded uniformly and surfaced to the operator only as an optional hint;
 the harness does not branch its control flow on exit codes.
 
 The prompt is written to the child's stdin rather than passed in argv, because a

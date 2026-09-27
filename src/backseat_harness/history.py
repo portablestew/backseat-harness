@@ -2,7 +2,7 @@
 
 Everything the harness knows about a managed session's *stored* form comes
 through this module: its byte size (the compaction trigger) and a rendered fork
-of it (the compaction preamble and the system agent's review context).
+of it (the compaction preamble and the operator's review context).
 
 Centralizing it here is what lets the harness stay ignorant of provider storage
 internals. opencode keeps transcripts in SQLite; Claude Code keeps JSONL files.
@@ -130,7 +130,7 @@ def _load(attr: str):
     except ImportError as exc:  # pragma: no cover - dependency-optional path
         raise HistoryError(
             "reading managed chat history requires chat-mother-forker>=0.2.1; "
-            "install it to enable compaction, session capture, and system-agent review"
+            "install it to enable compaction, session capture, and operator review"
         ) from exc
     try:
         return getattr(chat_mother_forker, attr)

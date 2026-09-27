@@ -3,15 +3,15 @@
 ``run_task`` is the library entry point a future orchestrator imports. The CLI
 (cli.py) is a thin wrapper over it. The loop is the only writer to the task's
 ``.backseat`` files; every persisted mutation (checklist merge, binding update,
-state, ledger) happens here after the system agent's verdict is parsed.
+state, ledger) happens here after the operator's verdict is parsed.
 
 When a run starts with no prompt for the managed agent -- a brand-new task, or a
-resumed one -- the system agent goes first in a **plan** phase: it plans (or
+resumed one -- the operator goes first in a **plan** phase: it plans (or
 re-plans) the checklist and writes the first prompt, exactly as a human operator
 would before touching the keyboard. Every managed turn after that is followed
 by a **review**.
 
-The managed-agent spawn and system-agent invocation are injected so this module
+The managed-agent spawn and operator invocation are injected so this module
 has no hard dependency on a live CLI. cli.py wires the real runners; tests wire
 fakes.
 """
@@ -27,7 +27,7 @@ from backseat_harness import checklist as checklist_mod
 from backseat_harness import compact as compact_mod
 from backseat_harness import history, progress, storage
 from backseat_harness import marker as marker_mod
-from backseat_harness import system_agent as sa
+from backseat_harness import operator as op
 from backseat_harness.config import Config, TaskPaths
 from backseat_harness.models import (
     Binding,
@@ -45,8 +45,8 @@ from backseat_harness.providers.base import SpawnSpec, TurnResult
 
 # Runs one managed turn and returns its outcome. Injected (real subprocess/fake).
 ManagedRunner = Callable[[Provider, SpawnSpec], TurnResult]
-# Invokes the system agent with an assembled prompt and returns its final text.
-SystemInvoker = Callable[[str], str]
+# Invokes the operator with an assembled prompt and returns its final text.
+OperatorInvoker = Callable[[str], str]
 
 
 def run_task(
@@ -54,47 +54,54 @@ def run_task(
     config: Config,
     provider: Provider,
     managed_runner: ManagedRunner,
-    system_invoker: SystemInvoker,
+    operator_invoker: OperatorInvoker,
     first_prompt: str | None = None,
 ) -> TaskResult:
     """Drive a single task lane to a terminal state.
 
     ``first_prompt`` is an optional override for the first managed turn. Without
-    it, the system agent plans first and writes that prompt itself.
+    it, the operator plans first and writes that prompt itself.
     """
     paths = config.task_paths(slug)
     state = storage.load_state(paths, slug)
-    state.status = TaskStatus.ACTIVE
+    state.status = TaskStatus.CONTINUE
+    state.reason = ""
     binding = storage.load_binding(paths) or _new_binding(config.provider)
     meta = storage.read_meta(paths)
     task_dir = paths.root.relative_to(config.workspace_root).as_posix()
     paths.docs.mkdir(parents=True, exist_ok=True)
+    managed_extra = config.extra_args + (
+        ("--model", config.model) if config.model else ()
+    ) + (
+        ("--agent", config.agent) if config.agent else ()
+    )
 
-    def call_system_agent(outcome: TurnOutcome | None, transcript_file: str | None) -> Verdict:
-        verdict = sa.review(
-            sa.ReviewInputs(
+    def call_operator(outcome: TurnOutcome | None, transcript_file: str | None) -> Verdict:
+        verdict = op.review(
+            op.ReviewInputs(
                 meta_prompt=meta,
                 checklist=checklist_mod.load_checklist(paths.checklist),
                 managed_fork=_operator_fork(binding, provider),
                 outcome=outcome,
                 iteration=state.iteration,
                 task_dir=task_dir,
-                verify_commands=list(config.system_agent.verify_commands),
+                verify_commands=list(config.operator.verify_commands),
                 docs=_list_docs(paths, config.workspace_root),
                 transcript_file=transcript_file,
             ),
-            system_invoker,
+            operator_invoker,
         )
         return verdict or Verdict(kind=VerdictKind.PROBLEM, notes="unparseable verdict")
 
     started = time.monotonic()
     pending_prompt = first_prompt
+    pending_reset = False
     last_verdict: VerdictKind | None = None
 
-    # --- Plan phase: no prompt queued, so the system agent drives first. ---
+    # --- Plan phase: no prompt queued, so the operator drives first. ---
     if pending_prompt is None:
         progress.iteration_start(state.iteration, state.generation, "plan")
-        verdict = call_system_agent(None, None)
+        verdict = call_operator(None, None)
         _persist(paths, state, binding, verdict, None, phase="plan")
         _report(verdict)
         last_verdict = verdict.kind
@@ -102,28 +109,38 @@ def run_task(
         if terminal is not None:
             return terminal
         pending_prompt = verdict.next_prompt
+        pending_reset = verdict.reset_context
 
     while True:
         # --- Budget guards (cheap, forward-only). ---
         if state.iteration >= config.max_iterations:
-            return _finish(paths, state, TaskStatus.FAILED, last_verdict, "max_iterations reached")
+            return _finish(paths, state, TaskStatus.BLOCKED, last_verdict, "max_iterations reached")
         if time.monotonic() - started >= config.max_wall_clock_s:
-            return _finish(paths, state, TaskStatus.FAILED, last_verdict, "max_wall_clock reached")
+            return _finish(paths, state, TaskStatus.BLOCKED, last_verdict, "max_wall_clock reached")
         if pending_prompt is None:
             return _finish(
-                paths, state, TaskStatus.FAILED, last_verdict, "no prompt to send"
+                paths, state, TaskStatus.BLOCKED, last_verdict, "no prompt to send"
             )
 
         state.iteration += 1
         progress.iteration_start(state.iteration, state.generation, "review")
 
-        # --- Compaction decision (before spawn). ---
+        # --- Context decision (before spawn): resume, compact, or reset. ---
         gen = binding.current
         transcript_bytes = gen.transcript_bytes if gen else 0
         resume_id = gen.native_id if gen else None
         prompt = pending_prompt
 
-        if gen and compact_mod.should_compact(transcript_bytes, config):
+        if pending_reset:
+            # Operator abandoned the session chat: fresh session, no fork, no
+            # resume -- only the marker and the next prompt.
+            new_n = (gen.n + 1) if gen else 1
+            binding = next_generation(binding, new_n)
+            state.generation = new_n
+            resume_id = None
+            prompt = marker_mod.prepend_marker(binding.root_uuid, new_n, pending_prompt)
+            pending_reset = False
+        elif gen and compact_mod.should_compact(transcript_bytes, config):
             if compact_mod.can_compact_again(gen.n, config):
                 fork_text = compact_mod.render_fork(binding.root_uuid, provider.history_provider)
                 # New generation: fresh session, marker with incremented #n.
@@ -146,7 +163,7 @@ def run_task(
             cwd=config.workspace_root,
             resume_native_id=resume_id,
             timeout_s=config.turn_timeout_s,
-            extra_args=config.extra_args,
+            extra_args=managed_extra,
         )
         result = managed_runner(provider, spec)
         binding = _record_native(binding, result, provider)
@@ -161,8 +178,8 @@ def run_task(
         # --- Capture the full session transcript for review. ---
         transcript_file = _capture_transcript(paths, binding, provider, config.workspace_root)
 
-        # --- Review: a fresh system agent assesses the turn. ---
-        verdict = call_system_agent(outcome, transcript_file)
+        # --- Review: a fresh operator assesses the turn. ---
+        verdict = call_operator(outcome, transcript_file)
         _persist(paths, state, binding, verdict, result, phase="review")
         _report(verdict)
         last_verdict = verdict.kind
@@ -173,6 +190,7 @@ def run_task(
             return terminal
         # continue or problem: repeat with the next prompt (problem repeats naturally).
         pending_prompt = verdict.next_prompt or pending_prompt
+        pending_reset = verdict.reset_context
 
 
 def _list_docs(paths: TaskPaths, workspace_root) -> list[str]:
@@ -214,7 +232,7 @@ def _capture_transcript(
 
 
 def _operator_fork(binding: Binding, provider: Provider) -> str:
-    """Render the managed session for the system agent, marker redacted.
+    """Render the managed session for the operator, marker redacted.
 
     Redaction keeps the operator's own stored session from matching the task's
     marker search (see marker.redact).
@@ -254,6 +272,7 @@ def _persist(
             duration_s=result.duration_s if result else 0.0,
             notes=verdict.notes,
             next_prompt=verdict.next_prompt,
+            reset_context=verdict.reset_context,
             phase=phase,
         ),
     )
@@ -269,9 +288,9 @@ def _terminal(paths: TaskPaths, state: TaskState, verdict: Verdict) -> TaskResul
     """Return the terminal result a verdict implies, or None to keep going."""
     merged = checklist_mod.load_checklist(paths.checklist)
     if verdict.kind is VerdictKind.DONE or checklist_mod.all_done(merged):
-        return _finish(paths, state, TaskStatus.DONE, verdict.kind, verdict.notes)
+        return _finish(paths, state, TaskStatus.COMPLETE, verdict.kind, verdict.notes)
     if verdict.kind is VerdictKind.ASK_HUMAN:
-        return _finish(paths, state, TaskStatus.PAUSED, verdict.kind, verdict.notes)
+        return _finish(paths, state, TaskStatus.BLOCKED, verdict.kind, verdict.notes)
     return None
 
 
@@ -312,6 +331,7 @@ def _finish(
     reason: str,
 ) -> TaskResult:
     state.status = status
+    state.reason = reason
     storage.save_state(paths, state)
     return TaskResult(
         slug=state.slug,

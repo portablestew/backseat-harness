@@ -33,6 +33,8 @@ for v0.1, but `task_dir` is a parameter from day one so it stays cheap to add.
 ```toml
 [harness]
 provider = "opencode"          # managed-agent CLI (v0.1: opencode)
+model = "..."                  # optional: managed agent's model (--model)
+agent = "..."                  # optional: named provider agent for managed turns
 extra_args = []                # flags per managed turn; where you grant perms
 turn_timeout_s = 3600          # hard per-turn ceiling
 compact_threshold_bytes = 1000000
@@ -40,7 +42,7 @@ max_iterations = 50
 max_wall_clock_s = 86400
 max_generations = 20
 
-[system_agent]
+[operator]
 provider = "opencode"          # operator CLI (may differ / be stronger)
 model = "..."                  # optional
 agent = "..."                  # optional: your own agent instead of backseat-operator
@@ -57,19 +59,30 @@ grant is the workspace owner's call, not the harness's.
 Unless `agent` is set, every `run` writes the operator profile under
 `agents/<provider>/`: the persona as system prompt, and deny-by-default
 permissions allowing reads, search, read-only git, and `verify_commands`.
+The managed side has no harness-written profile; `[harness].agent` only
+forwards `--agent` so a turn can run under a named agent definition of yours.
+
+## session markers
+
+Every managed generation's first user message starts with
+`<meta>START SESSION <root_uuid> #n</meta>` (see `binding.json` below). Every
+operator prompt starts with the UUID-free `<meta>OPERATOR SESSION <slug>
+<phase></meta>` (`phase` is `plan` or `review`) so stored operator sessions can
+be recognized and filtered without ever matching the task's root-UUID marker
+search — the operator must not be discoverable as a managed generation.
 
 ## checklist.json
 
 A **map** of steps keyed by id (never an array — arrays are how agents erase
-history). The system agent emits a `checklist_update` delta each turn; the
+history). The operator emits a `checklist_update` delta each turn; the
 harness validates and merges it. Rules:
 
 - **Additive / no deletes.** `null` values are stripped before merge.
 - **Field whitelist** per step: `title`, `status`, `notes`, `evidence`,
   `updated_at`. Unknown fields are dropped.
-- **Forward-only status:** `pending -> active -> done` (`blocked` is a sidecar
-  at the `active` rank). A regress requires an explicit `"reopen": true` on that
-  step in the delta.
+- **Free status.** A step's `status` may be set to any of `pending`, `active`,
+  `blocked`, or `done` at any time -- there is no forward-only ordering, so the
+  operator can move a step back to redo it. Invalid values are ignored.
 - **`remarks`** is a freeform append-only log channel.
 
 ```json
@@ -122,16 +135,17 @@ row bytes for opencode, file bytes for a JSONL-backed CLI — so compare it agai
 {
   "v": 1,
   "slug": "hello-endpoint",
-  "status": "active",        // active | paused (ask_human) | done | failed
+  "status": "continue",      // continue | blocked (needs human) | complete
   "iteration": 7,
   "generation": 2,
-  "updated_at": 1750003600.0
+  "updated_at": 1750003600.0,
+  "reason": ""               // why the lane is terminal (question / budget guard)
 }
 ```
 
 ## ledger.jsonl
 
-Append-only, one JSON object per system-agent decision. It is written **last**
+Append-only, one JSON object per operator decision. It is written **last**
 (after checklist + binding + state), so its final line marks the last
 fully-committed step — the anchor for crash recovery. `phase` is `"plan"` for a
 decision made with no managed turn (a new or resumed run; `iteration` is the
@@ -165,9 +179,9 @@ operator prompt, but never writes inside it. It is the only place under
 `.backseat/` the managed agent is asked to write; that is a prompt-level
 convention, not an enforced permission.
 
-## Verdict envelope (system agent -> harness, on stdout)
+## Verdict envelope (operator -> harness, on stdout)
 
-Not stored as a file; the harness parses the system agent's final message and
+Not stored as a file; the harness parses the operator's final message and
 applies it. Tolerates prose around a single JSON object.
 
 ```json
@@ -180,7 +194,7 @@ applies it. Tolerates prose around a single JSON object.
 }
 ```
 
-`ask_human` pauses the lane (`status` = `paused`, `notes` = the question). The
+`ask_human` blocks the lane (`status` = `blocked`, `notes` = the question). The
 human answers with `backseat-harness takeover <slug>`, which opens the managed
 session in the provider's interactive UI, waits for them to advance it, then
 re-plans from the advanced session on exit. There is no stored answer channel:

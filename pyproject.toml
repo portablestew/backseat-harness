@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "backseat-harness"
-description = "Meta-harness that drives an off-the-shelf CLI agent one small step at a time, with an adversarial system agent reviewing each turn."
+description = "Meta-harness that drives an off-the-shelf CLI agent one small step at a time, with an adversarial operator reviewing each turn."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     # Chat history access: search/fork/checkpoint of managed sessions.
-    # Compaction-by-fork and system-agent review both depend on it, so it is core.
+    # Compaction-by-fork and operator review both depend on it, so it is core.
     # 0.2.0 first shipped the public library API (fork_chat / find_chats /
     # ChatRef.size_bytes); 0.2.1 adds the public load_chat that turn capture uses
     # for a full, untruncated transcript.

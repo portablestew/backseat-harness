@@ -18,7 +18,7 @@ SCHEMA_VERSION = 1
 
 
 class VerdictKind(str, Enum):
-    """What the system agent decided after reviewing a managed turn."""
+    """What the operator decided after reviewing a managed turn."""
 
     CONTINUE = "continue"
     DONE = "done"
@@ -27,17 +27,23 @@ class VerdictKind(str, Enum):
 
 
 class TaskStatus(str, Enum):
-    """Lifecycle of a single task lane."""
+    """Lifecycle of a single task lane.
 
-    ACTIVE = "active"
-    PAUSED = "paused"
-    DONE = "done"
-    FAILED = "failed"
+    ``continue`` = keep running (safe to auto-resume if abandoned); ``blocked``
+    = needs a human (``ask_human``, a takeover, or harness budget exhaustion);
+    ``complete`` = terminal and implicitly approved. There is deliberately no
+    ``failed``: the harness cannot fail a goal, it can only run out of budget,
+    which is ``blocked``.
+    """
+
+    CONTINUE = "continue"
+    BLOCKED = "blocked"
+    COMPLETE = "complete"
 
 
 @dataclass(frozen=True)
 class Verdict:
-    """The system agent's structured output, parsed from its final message.
+    """The operator's structured output, parsed from its final message.
 
     The harness is the only writer to disk; ``checklist_update`` is a merge
     delta (see checklist.py) applied by the harness, never written verbatim.
@@ -45,6 +51,7 @@ class Verdict:
 
     kind: VerdictKind
     next_prompt: str | None = None
+    reset_context: bool = False
     checklist_update: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -62,6 +69,7 @@ class Verdict:
         return cls(
             kind=kind,
             next_prompt=data.get("next_prompt"),
+            reset_context=bool(data.get("reset_context", False)),
             checklist_update=update,
             notes=data.get("notes", "") or "",
             schema_version=int(data.get("v", SCHEMA_VERSION)),
@@ -72,6 +80,7 @@ class Verdict:
             "v": self.schema_version,
             "verdict": self.kind.value,
             "next_prompt": self.next_prompt,
+            "reset_context": self.reset_context,
             "checklist_update": self.checklist_update,
             "notes": self.notes,
         }
@@ -167,9 +176,12 @@ class TaskState:
     """Mutable status of a task lane, persisted to state.json."""
 
     slug: str
-    status: TaskStatus = TaskStatus.ACTIVE
+    status: TaskStatus = TaskStatus.CONTINUE
     iteration: int = 0
     generation: int = 1
+    #: Why the lane is in a terminal state (an ``ask_human`` question or a
+    #: budget guard). Empty while the lane is ``continue``.
+    reason: str = ""
     updated_at: float = field(default_factory=time.time)
     schema_version: int = SCHEMA_VERSION
 
@@ -185,15 +197,17 @@ class TaskState:
             "iteration": self.iteration,
             "generation": self.generation,
             "updated_at": self.updated_at,
+            "reason": self.reason,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TaskState:
         return cls(
             slug=data["slug"],
-            status=TaskStatus(data.get("status", TaskStatus.ACTIVE.value)),
+            status=TaskStatus(data.get("status", TaskStatus.CONTINUE.value)),
             iteration=int(data.get("iteration", 0)),
             generation=int(data.get("generation", 1)),
+            reason=data.get("reason", "") or "",
             updated_at=float(data.get("updated_at", time.time())),
             schema_version=int(data.get("v", SCHEMA_VERSION)),
         )
@@ -214,8 +228,10 @@ class LedgerEntry:
     #: (None for terminal verdicts that queue no prompt). Recording it makes the
     #: ledger a full audit trail of the conversation the operator drove.
     next_prompt: str | None = None
+    #: True when the operator abandoned the session chat (fresh context next turn).
+    reset_context: bool = False
     at: float = field(default_factory=time.time)
-    #: "review" (after a managed turn) or "plan" (system agent only, no turn).
+    #: "review" (after a managed turn) or "plan" (operator only, no turn).
     phase: str = "review"
 
     def to_dict(self) -> dict[str, Any]:
@@ -230,6 +246,7 @@ class LedgerEntry:
             "duration_s": self.duration_s,
             "notes": self.notes,
             "next_prompt": self.next_prompt,
+            "reset_context": self.reset_context,
         }
 
     @classmethod
@@ -243,6 +260,7 @@ class LedgerEntry:
             duration_s=float(data.get("duration_s", 0.0)),
             notes=data.get("notes", "") or "",
             next_prompt=data.get("next_prompt"),
+            reset_context=bool(data.get("reset_context", False)),
             at=float(data.get("at", time.time())),
             phase=data.get("phase", "review") or "review",
         )

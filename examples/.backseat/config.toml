@@ -4,6 +4,9 @@
 [harness]
 # Managed-agent CLI to drive. v0.1 supports "opencode".
 provider = "opencode"
+# model = "anthropic/claude-opus-4"  # optional, managed agent's model (--model)
+# agent = "my-builder"               # optional, named provider agent (--agent);
+#                                    # otherwise the CLI's default agent runs
 
 # Flags passed straight through to every managed turn. This is where you grant
 # the CLI its non-interactive permissions -- the harness picks no default,
@@ -34,7 +37,7 @@ max_iterations = 50
 max_wall_clock_s = 86400
 max_generations = 20
 
-[system_agent]
+[operator]
 # The operator agent. Same CLI tool, read-only profile. Often a stronger
 # model than the managed agent; kept decoupled and configurable.
 provider = "opencode"

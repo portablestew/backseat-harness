@@ -10,7 +10,7 @@ def test_defaults_without_config_file(tmp_path):
     assert cfg.turn_timeout_s == DEFAULT_TURN_TIMEOUT_S
     assert cfg.compact_threshold_bytes == DEFAULT_COMPACT_THRESHOLD_BYTES
     assert cfg.provider == "opencode"
-    assert cfg.system_agent.provider == "opencode"
+    assert cfg.operator.provider == "opencode"
 
 
 def test_paths_derive_from_workspace(tmp_path):
@@ -27,10 +27,12 @@ def test_config_toml_overrides(tmp_path):
     (backseat / "config.toml").write_text(
         "[harness]\n"
         "provider = 'opencode'\n"
+        "model = 'anthropic/claude-opus-4'\n"
+        "agent = 'my-builder'\n"
         "turn_timeout_s = 120\n"
         "max_iterations = 3\n"
         "\n"
-        "[system_agent]\n"
+        "[operator]\n"
         "model = 'opus'\n"
         "verify_commands = ['pytest']\n",
         encoding="utf-8",
@@ -38,5 +40,7 @@ def test_config_toml_overrides(tmp_path):
     cfg = load_config(tmp_path)
     assert cfg.turn_timeout_s == 120
     assert cfg.max_iterations == 3
-    assert cfg.system_agent.model == "opus"
-    assert cfg.system_agent.verify_commands == ["pytest"]
+    assert cfg.model == "anthropic/claude-opus-4"
+    assert cfg.agent == "my-builder"
+    assert cfg.operator.model == "opus"
+    assert cfg.operator.verify_commands == ["pytest"]

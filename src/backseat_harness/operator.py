@@ -1,7 +1,7 @@
-"""The adversarial system agent: fresh context each turn, verdict on stdout.
+"""The adversarial operator: fresh context each turn, verdict on stdout.
 
-The system agent is a one-shot invocation of the same CLI tool under a
-read-only operator profile. Responsibilities are split in two:
+The operator is a one-shot invocation of the same CLI tool under a read-only
+profile. Responsibilities are split in two:
 
 - **Persona** (``operator_persona.md``): who the operator is and how it works --
   the vibecoding-operator stance, review procedure, strategy, prompt-writing
@@ -17,8 +17,8 @@ managed agent (a fresh task, or a resumed one): the operator plans or re-plans
 the checklist and writes the first prompt. **Review** runs after every managed
 turn. The harness parses the verdict and is the only writer to disk.
 
-The actual invocation of the system-agent CLI is injected (``invoke``) so the
-loop and tests can supply a real subprocess runner or a fake.
+The actual invocation of the operator CLI is injected (``invoke``) so the loop
+and tests can supply a real subprocess runner or a fake.
 """
 
 from __future__ import annotations
@@ -28,10 +28,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
 
+from backseat_harness import marker as marker_mod
 from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, Verdict
 
-# A callable that takes the fully-assembled system-agent prompt and returns its
+# A callable that takes the fully-assembled operator prompt and returns its
 # final textual message. Injected by the loop (real CLI) or tests (fake).
 InvokeFn = Callable[[str], str]
 
@@ -70,10 +71,13 @@ class ReviewInputs:
 
 
 def build_prompt(inputs: ReviewInputs) -> str:
-    """Assemble the per-call system-agent prompt.
+    """Assemble the per-call operator prompt.
 
-    The managed fork is injected as historical reference; the instruction and
-    response contract come last so the model weights them most.
+    Opens with the UUID-free ``<meta>OPERATOR SESSION ...</meta>`` tag so the
+    operator's own stored session is identifiable (and filterable) without ever
+    matching the task's root-UUID marker search. The managed fork is injected as
+    historical reference; the instruction and response contract come last so the
+    model weights them most.
     """
     checklist_json = json.dumps(inputs.checklist.to_dict(), indent=2, ensure_ascii=False)
     fork = inputs.managed_fork.strip() or "(no managed session yet)"
@@ -81,6 +85,9 @@ def build_prompt(inputs: ReviewInputs) -> str:
         task = _plan_task(inputs)
     else:
         task = _review_task(inputs)
+    slug = inputs.task_dir.rsplit("/", 1)[-1] if inputs.task_dir else ""
+    phase = "plan" if inputs.is_planning else "review"
+    head = marker_mod.format_operator_marker(slug=slug, phase=phase)
     verify = ""
     if inputs.verify_commands:
         cmds = "\n".join(f"- `{c}`" for c in inputs.verify_commands)
@@ -101,7 +108,7 @@ def build_prompt(inputs: ReviewInputs) -> str:
         )
     else:
         transcript = ""
-    return _TEMPLATE.format(
+    return f"{head}\n\n" + _TEMPLATE.format(
         meta_prompt=inputs.meta_prompt.strip(),
         task_dir=task_dir,
         docs_dir=f"{task_dir}/docs",
@@ -161,7 +168,7 @@ def _review_task(inputs: ReviewInputs) -> str:
 
 
 def parse_verdict(text: str) -> Verdict | None:
-    """Parse the verdict envelope from the system agent's final message.
+    """Parse the verdict envelope from the operator's final message.
 
     Tolerates prose and stray braces around the envelope: every ``{`` is tried
     as the start of a JSON object, and the last object that is a valid verdict
@@ -187,7 +194,7 @@ def parse_verdict(text: str) -> Verdict | None:
 
 
 def review(inputs: ReviewInputs, invoke: InvokeFn) -> Verdict | None:
-    """Run one system-agent call, with a single re-ask on parse failure."""
+    """Run one operator call, with a single re-ask on parse failure."""
     prompt = build_prompt(inputs)
     verdict = parse_verdict(invoke(prompt))
     if verdict is not None:
@@ -195,7 +202,7 @@ def review(inputs: ReviewInputs, invoke: InvokeFn) -> Verdict | None:
     return parse_verdict(invoke(prompt + "\n\nOutput the JSON object only, no prose."))
 
 
-_TEMPLATE = """# backseat-harness: system agent call
+_TEMPLATE = """# backseat-harness: operator call
 
 ## Goal (meta-prompt)
 {meta_prompt}
@@ -223,6 +230,7 @@ Respond with a SINGLE JSON object and nothing after it:
   "v": 1,
   "verdict": "continue" | "done" | "ask_human" | "problem",
   "next_prompt": "the exact prompt to send the managed agent next (null for done / ask_human)",
+  "reset_context": false,
   "checklist_update": {{
     "steps": {{
       "step-id": {{
@@ -241,5 +249,7 @@ Verdicts: `continue` = the next prompt moves the work forward (including
 revisions and clarifications); `problem` = the turn failed or regressed and the
 next prompt is a recovery; `ask_human` = you need the human; `done` = every step
 is verified and the goal is met. Step ids are stable keys: reuse them to update
-a step, and never remove one.
+a step, and never remove one. Set `reset_context` to `true` only with a
+`continue` verdict, to start the next turn in a brand-new session with no
+carried chat history; use it sparingly.
 """

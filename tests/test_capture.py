@@ -51,12 +51,14 @@ def test_loop_writes_transcript_and_names_it_for_operator(config, task, stub_his
     )
     prompts: list[str] = []
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
         return '{"verdict":"done"}'
 
-    result = run_task(slug, config, FakeProvider(), _runner_ok, system_invoker, first_prompt="go")
-    assert result.status is TaskStatus.DONE
+    result = run_task(
+        slug, config, FakeProvider(), _runner_ok, operator_invoker, first_prompt="go"
+    )
+    assert result.status is TaskStatus.COMPLETE
 
     # A single transcript file exists and holds the untruncated payload.
     assert paths.transcript.exists()
@@ -80,7 +82,7 @@ def test_loop_overwrites_single_transcript_across_turns(config, task, stub_histo
     result = run_task(
         slug, config, FakeProvider(), _runner_ok, lambda p: next(verdicts), first_prompt="go"
     )
-    assert result.status is TaskStatus.DONE
+    assert result.status is TaskStatus.COMPLETE
     assert result.iterations == 2
     # Exactly one transcript artifact, at the task root -- no per-turn files.
     assert paths.transcript.exists()
@@ -102,7 +104,7 @@ def test_loop_survives_capture_failure(config, task, stub_history, monkeypatch):
         slug, config, FakeProvider(), _runner_ok,
         lambda p: '{"verdict":"done"}', first_prompt="go",
     )
-    assert result.status is TaskStatus.DONE
+    assert result.status is TaskStatus.COMPLETE
     assert not paths.transcript.exists()
 
 
@@ -112,11 +114,11 @@ def test_plan_phase_writes_no_transcript(config, task, stub_history):
     stub_history["transcript"] = "## USER\ngo\n\n## ASSISTANT\nx"
     prompts: list[str] = []
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
         return '{"verdict":"ask_human","notes":"which framework?"}'
 
-    result = run_task(slug, config, FakeProvider(), _runner_ok, system_invoker)
-    assert result.status is TaskStatus.PAUSED
+    result = run_task(slug, config, FakeProvider(), _runner_ok, operator_invoker)
+    assert result.status is TaskStatus.BLOCKED
     assert not paths.transcript.exists()
     assert "Full session transcript" not in prompts[0]

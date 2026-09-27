@@ -1,6 +1,6 @@
 from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, VerdictKind
-from backseat_harness.system_agent import ReviewInputs, build_prompt, parse_verdict, review
+from backseat_harness.operator import ReviewInputs, build_prompt, parse_verdict, review
 
 
 def _outcome(exit_code=0, timed_out=False):
@@ -26,6 +26,33 @@ def test_parse_unknown_verdict_returns_none():
 
 def test_parse_garbage_returns_none():
     assert parse_verdict("no json at all") is None
+
+
+def test_prompt_opens_with_operator_meta_tag():
+    """Every operator prompt starts with the UUID-free operator session tag."""
+    plan = build_prompt(
+        ReviewInputs(
+            meta_prompt="Goal", checklist=Checklist(), managed_fork="",
+            outcome=None, iteration=0, task_dir=".backseat/tasks/demo",
+        )
+    )
+    assert plan.startswith("<meta>OPERATOR SESSION demo plan</meta>\n\n")
+
+    review = build_prompt(
+        ReviewInputs(
+            meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+            outcome=_outcome(), iteration=1, task_dir=".backseat/tasks/demo",
+        )
+    )
+    assert review.startswith("<meta>OPERATOR SESSION demo review</meta>\n\n")
+
+
+def test_prompt_meta_tag_omits_unknown_slug():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+    )
+    assert build_prompt(inputs).startswith("<meta>OPERATOR SESSION review</meta>\n\n")
 
 
 def test_build_prompt_includes_problem_hint():
@@ -109,7 +136,7 @@ def test_verify_commands_listed_when_configured():
 
 
 def test_persona_ships_with_package():
-    from backseat_harness.system_agent import load_persona
+    from backseat_harness.operator import load_persona
 
     persona = load_persona()
     assert "vibecoding" in persona
@@ -118,7 +145,7 @@ def test_persona_ships_with_package():
 
 def test_prompt_lists_handoff_docs():
     from backseat_harness.checklist import Checklist
-    from backseat_harness.system_agent import ReviewInputs, build_prompt
+    from backseat_harness.operator import ReviewInputs, build_prompt
 
     base = dict(
         meta_prompt="goal", checklist=Checklist(), managed_fork="", outcome=None,

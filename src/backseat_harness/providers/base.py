@@ -55,7 +55,7 @@ class TurnResult:
 
 @dataclass(frozen=True)
 class OperatorLaunch:
-    """How to launch the system agent under a harness-managed operator profile.
+    """How to launch the operator under a harness-managed read-only profile.
 
     ``env`` is merged over the parent environment for the operator process only;
     ``extra_args`` are appended to its command line. Both empty means the
@@ -67,7 +67,13 @@ class OperatorLaunch:
 
 
 class Provider(ABC):
-    """Adapter contract. Adapters never mint session ids; they capture them."""
+    """Adapter contract. Adapters never mint session ids; they capture them.
+
+    Every method is abstract: a provider must implement the full surface --
+    one-shot spawning, id parsing, text extraction, a read-only operator
+    profile, and interactive takeover -- before it can be instantiated and
+    registered.
+    """
 
     #: Short name used in config (e.g. "opencode").
     name: str
@@ -95,22 +101,23 @@ class Provider(ABC):
     def extract_text(self, stdout: str) -> str:
         """Return the agent's final assistant text from process output.
 
-        Used for the system agent, whose verdict JSON has to be parsed out of
+        Used for the operator, whose verdict JSON has to be parsed out of
         its reply. Adapters that emit a structured event stream should
         reassemble the text parts rather than hand back raw events.
         """
 
+    @abstractmethod
     def prepare_operator(
         self, profile_dir: Path, persona: str, verify_commands: list[str]
     ) -> OperatorLaunch:
         """Write (or overwrite) a read-only operator profile and say how to use it.
 
         ``profile_dir`` is harness-owned scratch space under ``.backseat/``.
-        The default is a no-op: a provider without profile support runs the
-        operator with CLI defaults, which are NOT read-only.
+        Every adapter must run its operator read-only, so this is mandatory --
+        there is deliberately no permissive default.
         """
-        return OperatorLaunch(env={}, extra_args=())
 
+    @abstractmethod
     def interactive_command(self, native_session_id: str | None) -> list[str]:
         """Return argv that opens the managed session in the CLI's interactive UI.
 
@@ -119,4 +126,3 @@ class Provider(ABC):
         when no session exists yet (e.g. paused during planning); the CLI should
         then open a fresh interactive session in the workspace.
         """
-        raise ProviderError(f"{self.name} does not support interactive takeover")

@@ -1,4 +1,4 @@
-"""Checklist merge protocol: additive, whitelisted, forward-only, no deletes."""
+"""Checklist merge protocol: additive, whitelisted, free-status, no deletes."""
 
 from backseat_harness.checklist import Checklist, all_done, merge_update
 
@@ -21,16 +21,16 @@ def test_null_values_stripped_not_deleting():
     assert result.steps["s1"]["status"] == "done"
 
 
-def test_status_is_forward_only():
+def test_status_can_regress():
     base = merge_update(Checklist(), {"steps": {"s1": {"status": "done"}}})
     result = merge_update(base, {"steps": {"s1": {"status": "pending"}}})
-    assert result.steps["s1"]["status"] == "done"  # cannot regress
+    assert result.steps["s1"]["status"] == "pending"  # operator may move it back
 
 
-def test_reopen_allows_regress():
+def test_invalid_status_ignored():
     base = merge_update(Checklist(), {"steps": {"s1": {"status": "done"}}})
-    result = merge_update(base, {"steps": {"s1": {"status": "active", "reopen": True}}})
-    assert result.steps["s1"]["status"] == "active"
+    result = merge_update(base, {"steps": {"s1": {"status": "banana"}}})
+    assert result.steps["s1"]["status"] == "done"
 
 
 def test_remarks_append():

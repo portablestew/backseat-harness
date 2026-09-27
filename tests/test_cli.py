@@ -1,4 +1,4 @@
-"""CLI lane creation: `run --meta` bootstraps a task from nothing."""
+"""CLI lane creation: a `run` meta-prompt argument bootstraps a task."""
 
 from backseat_harness.cli import _ensure_meta, main
 from backseat_harness.config import load_config
@@ -7,9 +7,28 @@ from backseat_harness.config import load_config
 def test_run_requires_meta_for_new_task(tmp_path, capsys):
     rc = main(["-C", str(tmp_path), "run", "fresh"])
     assert rc == 2
-    assert "--meta" in capsys.readouterr().out
+    assert "second argument" in capsys.readouterr().out
     # Nothing is created on the error path.
     assert not (tmp_path / ".backseat").exists()
+
+
+def test_run_accepts_positional_meta_for_new_task(tmp_path, monkeypatch):
+    """`run slug "goal"` creates meta.md; `run slug` alone does not."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+
+    def fake_run_task(**kwargs):
+        return TaskResult(slug="fresh", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    rc = main(["-C", str(tmp_path), "run", "fresh", "Build the thing."])
+    assert rc == 0
+    paths = load_config(tmp_path).task_paths("fresh")
+    assert paths.meta.read_text(encoding="utf-8") == "Build the thing.\n"
 
 
 def test_ensure_meta_creates_lane(tmp_path):
@@ -71,11 +90,11 @@ def test_takeover_opens_session_then_resumes(tmp_path, monkeypatch):
         resumed["first_prompt"] = kwargs["first_prompt"]
         from backseat_harness.models import TaskResult, TaskStatus
 
-        return TaskResult(slug="t", status=TaskStatus.DONE, iterations=1)
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
 
     monkeypatch.setattr(cli.spawn, "run_interactive", fake_run_interactive)
     monkeypatch.setattr(cli, "run_task", fake_run_task)
-    monkeypatch.setattr(cli, "_make_system_invoker", lambda c, s: (lambda p: ""))
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
 
     rc = main(["-C", str(ws), "takeover", "t"])
     assert rc == 0
@@ -121,15 +140,15 @@ def test_resolve_argv_uses_path_lookup(monkeypatch):
         spawn.resolve_argv(["opencode"])
 
 
-def test_result_line_omits_reason_on_done_only():
+def test_result_line_omits_reason_on_complete_only():
     from backseat_harness.cli import _result_line
     from backseat_harness.models import TaskResult, TaskStatus
 
-    done = TaskResult(slug="t", status=TaskStatus.DONE, iterations=4, reason="goal met")
-    assert _result_line(done) == "t: done after 4 iterations"
-    paused = TaskResult(slug="t", status=TaskStatus.PAUSED, iterations=2, reason="which db?")
-    assert _result_line(paused) == "t: paused after 2 iterations (which db?)"
-    failed = TaskResult(
-        slug="t", status=TaskStatus.FAILED, iterations=50, reason="max_iterations reached"
+    complete = TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=4, reason="goal met")
+    assert _result_line(complete) == "t: complete after 4 iterations"
+    blocked = TaskResult(slug="t", status=TaskStatus.BLOCKED, iterations=2, reason="which db?")
+    assert _result_line(blocked) == "t: blocked after 2 iterations (which db?)"
+    out_of_budget = TaskResult(
+        slug="t", status=TaskStatus.BLOCKED, iterations=50, reason="max_iterations reached"
     )
-    assert _result_line(failed).endswith("(max_iterations reached)")
+    assert _result_line(out_of_budget).endswith("(max_iterations reached)")

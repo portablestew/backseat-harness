@@ -1,6 +1,6 @@
 """Durable, append-only-in-spirit checklist with a safe merge protocol.
 
-The system agent emits a ``checklist_update`` delta; the harness is the only
+The operator emits a ``checklist_update`` delta; the harness is the only
 writer. The rules (locked in design) exist so an agent can add steps or advance
 their status but can *never* erase history:
 
@@ -9,8 +9,9 @@ their status but can *never* erase history:
 * ``null`` values are stripped before merge (RFC 7396 would treat them as
   deletes; we forbid deletes).
 * Per-step fields are whitelisted; unknown fields are dropped.
-* Status is forward-only (``pending -> active -> done``; ``blocked`` is a
-  sidecar) unless the delta explicitly sets ``reopen: true``.
+* Status may be set to any valid value (``pending``, ``active``, ``blocked``,
+  ``done``); there is no forward-only ordering, so the operator can move a step
+  back to redo it. Invalid statuses are ignored.
 * A freeform ``remarks`` channel appends narrative without touching structure.
 """
 
@@ -24,9 +25,9 @@ from typing import Any
 # Allowed per-step fields. Anything else in a delta is ignored.
 STEP_FIELDS = {"title", "status", "notes", "evidence", "updated_at"}
 
-# Forward-only status ordering. Higher rank cannot regress to lower unless the
-# delta carries reopen=true for that step.
-STATUS_RANK = {"pending": 0, "active": 1, "blocked": 1, "done": 2}
+# Valid per-step statuses. There is no ordering: the operator may move a step
+# to any of these freely, including back to redo it.
+STEP_STATUSES = {"pending", "active", "blocked", "done"}
 DEFAULT_STATUS = "pending"
 
 
@@ -69,17 +70,14 @@ def merge_update(current: Checklist, update: dict[str, Any]) -> Checklist:
             if not isinstance(raw, dict):
                 continue
             incoming = _strip_nulls({k: v for k, v in raw.items() if k in STEP_FIELDS})
-            reopen = bool(raw.get("reopen"))
             existing = steps.get(step_id, {})
             merged = dict(existing)
             merged.update(incoming)
-            # Enforce forward-only status unless reopening.
             new_status = merged.get("status", existing.get("status", DEFAULT_STATUS))
-            old_status = existing.get("status", DEFAULT_STATUS)
-            if not reopen and _rank(new_status) < _rank(old_status):
-                merged["status"] = old_status
-            else:
+            if new_status in STEP_STATUSES:
                 merged["status"] = new_status
+            else:
+                merged["status"] = existing.get("status", DEFAULT_STATUS)
             steps[step_id] = merged
 
     delta_remarks = update.get("remarks")
@@ -87,10 +85,6 @@ def merge_update(current: Checklist, update: dict[str, Any]) -> Checklist:
         remarks.extend(str(r) for r in delta_remarks if r is not None)
 
     return Checklist(steps=steps, remarks=remarks)
-
-
-def _rank(status: str) -> int:
-    return STATUS_RANK.get(status, 0)
 
 
 def load_checklist(path: Path) -> Checklist:

@@ -1,4 +1,4 @@
-"""End-to-end loop with fake managed + system agents (no live CLI)."""
+"""End-to-end loop with fake managed + operator agents (no live CLI)."""
 
 import json
 
@@ -42,14 +42,14 @@ def test_loop_completes_on_done_verdict(config, task):
         }),
     ])
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         return next(verdicts)
 
     result = run_task(
-        slug, config, provider, _managed_runner_ok, system_invoker, first_prompt="step 1"
+        slug, config, provider, _managed_runner_ok, operator_invoker, first_prompt="step 1"
     )
 
-    assert result.status is TaskStatus.DONE
+    assert result.status is TaskStatus.COMPLETE
     assert result.iterations == 2
     assert result.final_verdict is VerdictKind.DONE
 
@@ -70,11 +70,13 @@ def test_loop_pauses_on_ask_human(config, task):
     slug, paths = task
     provider = FakeProvider()
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         return '{"verdict":"ask_human","notes":"which db?"}'
 
-    result = run_task(slug, config, provider, _managed_runner_ok, system_invoker, first_prompt="go")
-    assert result.status is TaskStatus.PAUSED
+    result = run_task(
+        slug, config, provider, _managed_runner_ok, operator_invoker, first_prompt="go"
+    )
+    assert result.status is TaskStatus.BLOCKED
     assert result.iterations == 1
 
 
@@ -85,13 +87,16 @@ def test_loop_stops_at_max_iterations(config, task):
     config = replace(config, max_iterations=3)
     provider = FakeProvider()
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         return '{"verdict":"continue","next_prompt":"again"}'
 
-    result = run_task(slug, config, provider, _managed_runner_ok, system_invoker, first_prompt="go")
-    assert result.status is TaskStatus.FAILED
+    result = run_task(
+        slug, config, provider, _managed_runner_ok, operator_invoker, first_prompt="go"
+    )
+    assert result.status is TaskStatus.BLOCKED
     assert "max_iterations" in result.reason
     assert result.iterations == 3
+    assert storage.load_state(paths, slug).reason == "max_iterations reached"
 
 
 def test_first_turn_applies_marker(config, task):
@@ -103,10 +108,10 @@ def test_first_turn_applies_marker(config, task):
         seen["prompt"] = spec.prompt
         return _managed_runner_ok(provider, spec)
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         return '{"verdict":"done"}'
 
-    run_task(slug, config, provider, runner, system_invoker, first_prompt="hello")
+    run_task(slug, config, provider, runner, operator_invoker, first_prompt="hello")
     assert seen["prompt"].startswith("<meta>START SESSION")
     assert "hello" in seen["prompt"]
 
@@ -158,8 +163,95 @@ def test_oversized_session_starts_a_new_generation(config, task, _history):
     assert storage.load_state(paths, slug).generation == 2
 
 
+def test_managed_model_flag_is_passed(config, task):
+    """A dedicated [harness] model is forwarded to the managed turn as --model."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="anthropic/claude-opus-4")
+    seen = {}
+
+    def runner(prov, spec):
+        seen["extra_args"] = spec.extra_args
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen["extra_args"] == ("--model", "anthropic/claude-opus-4")
+
+
+def test_managed_agent_flag_is_passed(config, task):
+    """A dedicated [harness] agent is forwarded to the managed turn as --agent."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, agent="my-builder")
+    seen = {}
+
+    def runner(prov, spec):
+        seen["extra_args"] = spec.extra_args
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen["extra_args"] == ("--agent", "my-builder")
+
+
+def test_managed_flags_keep_declared_order(config, task):
+    """extra_args first, then --model, then --agent (last wins in the CLI)."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, extra_args=("--flag", "x"), model="m", agent="a")
+    seen = {}
+
+    def runner(prov, spec):
+        seen["extra_args"] = spec.extra_args
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen["extra_args"] == ("--flag", "x", "--model", "m", "--agent", "a")
+
+
+def test_reset_context_abandons_session(config, task):
+    """reset_context starts a fresh session: new generation, no fork, no resume."""
+    slug, paths = task
+    provider = FakeProvider()
+
+    seen: list[tuple[str, str | None]] = []
+
+    def runner(prov, spec):
+        seen.append((spec.prompt, spec.resume_native_id))
+        return _managed_runner_ok(prov, spec)
+
+    verdicts = iter([
+        json.dumps({"verdict": "continue", "next_prompt": "step 2", "reset_context": True}),
+        '{"verdict":"done"}',
+    ])
+
+    run_task(slug, config, provider, runner, lambda p: next(verdicts), first_prompt="step 1")
+
+    assert len(seen) == 2
+    # Turn 1 establishes generation 1 (no prior session to resume).
+    assert "#1" in seen[0][0]
+    assert seen[0][1] is None
+    # Turn 2 resets: fresh session, generation 2, no carried fork or resume.
+    second_prompt, second_resume = seen[1]
+    assert second_resume is None
+    assert "#2" in second_prompt
+    assert "step 2" in second_prompt
+    assert storage.load_state(paths, slug).generation == 2
+
+
 def test_new_task_plans_before_first_turn(config, task):
-    """No first_prompt: the system agent plans the checklist and writes turn 1."""
+    """No first_prompt: the operator plans the checklist and writes turn 1."""
     slug, paths = task
     provider = FakeProvider()
     prompts: list[str] = []
@@ -178,7 +270,7 @@ def test_new_task_plans_before_first_turn(config, task):
         '{"verdict":"ask_human","notes":"which framework?"}',
     ])
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
         return next(verdicts)
 
@@ -186,11 +278,11 @@ def test_new_task_plans_before_first_turn(config, task):
         seen_managed.append(spec.prompt)
         return _managed_runner_ok(prov, spec)
 
-    result = run_task(slug, config, provider, runner, system_invoker)
+    result = run_task(slug, config, provider, runner, operator_invoker)
 
-    assert result.status is TaskStatus.PAUSED
+    assert result.status is TaskStatus.BLOCKED
     assert result.iterations == 1
-    # First system call is the plan phase, second reviews turn 1.
+    # First operator call is the plan phase, second reviews turn 1.
     assert "Your task: plan" in prompts[0]
     assert "Your task: review managed turn 1" in prompts[1]
     # The planned prompt drove the first managed turn, marker applied.
@@ -213,7 +305,7 @@ def test_plan_phase_can_pause_without_spawning(config, task):
         slug, config, FakeProvider(), runner,
         lambda p: '{"verdict":"ask_human","notes":"goal is ambiguous"}',
     )
-    assert result.status is TaskStatus.PAUSED
+    assert result.status is TaskStatus.BLOCKED
     assert result.iterations == 0
     assert result.reason == "goal is ambiguous"
 
@@ -224,7 +316,7 @@ def test_operator_fork_has_marker_redacted(config, task, _history):
     slug, paths = task
     prompts: list[str] = []
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
         return '{"verdict":"done"}'
 
@@ -238,7 +330,7 @@ def test_operator_fork_has_marker_redacted(config, task, _history):
         _history["uuid"] = uuid
         return _managed_runner_ok(prov, spec)
 
-    run_task(slug, config, FakeProvider(), runner, system_invoker, first_prompt="go")
+    run_task(slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go")
 
     review_prompt = prompts[-1]
     assert "work done" in review_prompt
@@ -255,10 +347,10 @@ def test_loop_creates_docs_dir_and_lists_docs(config, task):
         (paths.docs / "1-research.md").write_text("findings", encoding="utf-8")
         return _managed_runner_ok(prov, spec)
 
-    def system_invoker(prompt: str) -> str:
+    def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
         return '{"verdict":"done"}'
 
-    run_task(slug, config, FakeProvider(), runner, system_invoker, first_prompt="go")
+    run_task(slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go")
     assert paths.docs.is_dir()
     assert "docs/1-research.md`" in prompts[-1]

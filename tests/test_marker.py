@@ -1,5 +1,7 @@
 from backseat_harness.marker import (
+    OPERATOR_SESSION_RE,
     format_marker,
+    format_operator_marker,
     new_root_uuid,
     parse_marker,
     prepend_marker,
@@ -39,3 +41,24 @@ def test_redact_removes_root_uuid_but_keeps_generation():
     assert f"<meta>START SESSION {REDACTED_ROOT} #2</meta>" in out
     # A redacted marker no longer parses, so it can't be mistaken for identity.
     assert parse_marker(out) is None
+
+
+def test_operator_marker_bare():
+    assert format_operator_marker() == "<meta>OPERATOR SESSION</meta>"
+
+
+def test_operator_marker_with_slug_and_phase():
+    assert (
+        format_operator_marker(slug="demo", phase="review")
+        == "<meta>OPERATOR SESSION demo review</meta>"
+    )
+
+
+def test_operator_marker_matches_and_never_holds_a_uuid():
+    root = new_root_uuid()
+    text = format_operator_marker(slug="demo", phase="plan")
+    assert OPERATOR_SESSION_RE.search(text)
+    # The operator tag is UUID-free by contract: an operator session must never
+    # match the task's root-UUID marker search even if the slug were a UUID.
+    assert root not in text
+    assert parse_marker(text) is None

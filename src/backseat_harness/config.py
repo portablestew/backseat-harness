@@ -31,7 +31,7 @@ DEFAULT_MAX_GENERATIONS = 20
 
 
 @dataclass(frozen=True)
-class SystemAgentConfig:
+class OperatorConfig:
     """Profile for the ephemeral, read-only operator agent.
 
     Same underlying CLI tool as the managed agent, different agent definition:
@@ -53,6 +53,12 @@ class Config:
 
     workspace_root: Path
     provider: str = "opencode"
+    model: str | None = None
+    # Named provider agent for the managed side (e.g. opencode ``--agent``).
+    # Unlike the operator, the harness writes no managed profile: this simply
+    # forwards the flag so the workspace owner can run a task under their own
+    # agent definition instead of the CLI default.
+    agent: str | None = None
     turn_timeout_s: int = DEFAULT_TURN_TIMEOUT_S
     compact_threshold_bytes: int = DEFAULT_COMPACT_THRESHOLD_BYTES
     max_iterations: int = DEFAULT_MAX_ITERATIONS
@@ -64,7 +70,7 @@ class Config:
     # is the owner's to make, and a turn that blocks on an approval prompt just
     # burns the timeout.
     extra_args: tuple[str, ...] = ()
-    system_agent: SystemAgentConfig = field(default_factory=SystemAgentConfig)
+    operator: OperatorConfig = field(default_factory=OperatorConfig)
 
     # --- Path helpers: the entire .backseat/ contract lives here. ---
 
@@ -166,18 +172,20 @@ def load_config(workspace_root: Path | str) -> Config:
 
 def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
     harness = data.get("harness", {})
-    sa_data = data.get("system_agent", {})
-    system_agent = replace(
-        cfg.system_agent,
-        provider=sa_data.get("provider", cfg.system_agent.provider),
-        model=sa_data.get("model", cfg.system_agent.model),
-        agent=sa_data.get("agent", cfg.system_agent.agent),
-        verify_commands=list(sa_data.get("verify_commands", cfg.system_agent.verify_commands)),
-        extra_args=tuple(sa_data.get("extra_args", cfg.system_agent.extra_args)),
+    op_data = data.get("operator", {})
+    operator = replace(
+        cfg.operator,
+        provider=op_data.get("provider", cfg.operator.provider),
+        model=op_data.get("model", cfg.operator.model),
+        agent=op_data.get("agent", cfg.operator.agent),
+        verify_commands=list(op_data.get("verify_commands", cfg.operator.verify_commands)),
+        extra_args=tuple(op_data.get("extra_args", cfg.operator.extra_args)),
     )
     return replace(
         cfg,
         provider=harness.get("provider", cfg.provider),
+        model=harness.get("model", cfg.model),
+        agent=harness.get("agent", cfg.agent),
         extra_args=tuple(harness.get("extra_args", cfg.extra_args)),
         turn_timeout_s=int(harness.get("turn_timeout_s", cfg.turn_timeout_s)),
         compact_threshold_bytes=int(
@@ -186,5 +194,5 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         max_iterations=int(harness.get("max_iterations", cfg.max_iterations)),
         max_wall_clock_s=int(harness.get("max_wall_clock_s", cfg.max_wall_clock_s)),
         max_generations=int(harness.get("max_generations", cfg.max_generations)),
-        system_agent=system_agent,
+        operator=operator,
     )

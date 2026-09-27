@@ -19,8 +19,9 @@ not locate files itself.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from backseat_harness.providers.base import Provider, SpawnSpec
+from backseat_harness.providers.base import OperatorLaunch, Provider, ProviderError, SpawnSpec
 
 
 class ClaudeProvider(Provider):
@@ -72,6 +73,24 @@ class ClaudeProvider(Provider):
                         if isinstance(text, str):
                             chunks.append(text)
         return "\n".join(chunks) if chunks else stdout
+
+    def prepare_operator(
+        self, profile_dir: Path, persona: str, verify_commands: list[str]
+    ) -> OperatorLaunch:
+        """Not yet defined: a read-only Claude Code operator profile is still to
+        be designed (see the v0.2 work). Fail loudly rather than run a
+        non-read-only operator.
+        """
+        raise ProviderError(
+            "claude does not yet define a read-only operator profile; "
+            "not registered until it does"
+        )
+
+    def interactive_command(self, native_session_id: str | None) -> list[str]:
+        cmd = ["claude"]
+        if native_session_id:
+            cmd += ["--resume", native_session_id]
+        return cmd
 
 
 def _iter_events(stdout: str):
