@@ -304,8 +304,8 @@ def _record_native(binding: Binding, result: TurnResult, provider: Provider) -> 
     The id is taken from the CLI's own output when it printed one, and otherwise
     recovered by searching history for the task's marker -- the authoritative
     path, since the marker is in the transcript whether or not the process got a
-    chance to report anything. Size always comes from history: the v0.1 provider
-    stores sessions in SQLite, so there is no file for us to stat.
+    chance to report anything. Size always comes from history: opencode stores
+    sessions in SQLite, so there is no file for us to stat.
     """
     if not binding.generations:
         return binding

@@ -9,9 +9,10 @@ read its prompt from stdin, so ``build_command`` returns argv *without* the
 prompt and ``spawn.run_turn`` pipes it in.
 
 **Size lives in history, not on disk.** Adapters deliberately do not locate
-transcript files. The v0.1 provider (opencode) stores sessions in SQLite, so
-there is no file to stat; ``history_provider`` names the chat-mother-forker
-provider that can size and fork this CLI's sessions instead.
+transcript files: opencode stores sessions in SQLite (no file exists to
+stat), and claude and kiro keep JSONL files that adapters still never
+touch. ``history_provider`` names the chat-mother-forker provider that can
+size and fork each CLI's sessions instead.
 """
 
 from __future__ import annotations
@@ -58,12 +59,19 @@ class OperatorLaunch:
     """How to launch the operator under a harness-managed read-only profile.
 
     ``env`` is merged over the parent environment for the operator process only;
-    ``extra_args`` are appended to its command line. Both empty means the
-    provider has no profile support and the operator runs with CLI defaults.
+    ``extra_args`` are appended to its command line. Empty ``env``/``extra_args``
+    is not "no support": it can still be a deliberate profile (e.g. kiro's
+    read-only-by-omission launch), just one expressed with no files and no flags.
+
+    ``persona_in_profile`` is True when the operator process already carries the
+    operator persona itself (opencode's written agent file; a workspace's named
+    agent). When False, the invoker prepends the persona to every operator
+    prompt so the guidance is not lost (claude/kiro).
     """
 
     env: dict[str, str]
     extra_args: tuple[str, ...]
+    persona_in_profile: bool = False
 
 
 class Provider(ABC):

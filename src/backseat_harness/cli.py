@@ -248,23 +248,36 @@ def _ensure_meta(paths: TaskPaths, meta: str | None) -> str | None:
 def _make_operator_invoker(config: Config, op_config: OperatorConfig):
     """Build the operator invoker: one-shot read-only CLI, capture final text.
 
-    Uses the operator provider (may differ from the managed provider). Unless
-    config names its own agent, the provider writes the harness's read-only
-    operator profile (persona + permissions) under ``.backseat/agents/`` once,
-    here at startup, and every call launches under it.
+    Uses the operator provider (may differ from the managed provider).
+    ``prepare_operator`` expresses each provider's read-only profile in its own
+    way: opencode gets a written agent file under ``.backseat/agents/``
+    (persona included), claude gets flags, kiro gets no file and no flags.
+    The operator process only carries the persona itself when the launch says
+    so (``persona_in_profile``) -- written agent file, or a workspace's named
+    ``[operator].agent``, which owns its own persona. Otherwise ``invoke``
+    prepends the persona to every prompt so claude/kiro operators keep the
+    same guidance; the persona text is captured once, here at startup.
     """
     provider: Provider = get_provider(op_config.provider)
+    persona = load_persona()
     if op_config.agent:
-        launch = OperatorLaunch(env={}, extra_args=("--agent", op_config.agent))
+        launch = OperatorLaunch(
+            env={},
+            extra_args=("--agent", op_config.agent),
+            persona_in_profile=True,
+        )
     else:
         launch = provider.prepare_operator(
             config.agents_dir / provider.name,
-            load_persona(),
+            persona,
             list(op_config.verify_commands),
         )
     env = {**os.environ, **launch.env} if launch.env else None
+    prompt_prefix = None if launch.persona_in_profile else persona
 
     def invoke(prompt: str) -> str:
+        if prompt_prefix:
+            prompt = f"{prompt_prefix}\n\n{prompt}"
         extra: list[str] = list(launch.extra_args)
         if op_config.model:
             extra += ["--model", op_config.model]

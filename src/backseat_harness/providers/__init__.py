@@ -6,27 +6,26 @@ It does *not* know where transcripts live: sizing and forking go through
 chat-mother-forker, scoped by the adapter's ``history_provider`` (see
 history.py).
 
-v0.1 supports **opencode** only. The Claude Code adapter exists
-(providers/claude.py) and conforms to the contract, but is unvalidated against a
-live install, so it is not registered -- asking for it fails loudly instead of
-half-working. Registering it is the bulk of v0.2, alongside kiro-cli.
+Supported providers: **opencode**, **claude** (Claude Code), and **kiro**
+(kiro-cli). All three are registered and were validated live end to end:
+one-shot and resume on a real install, plus each provider's read-only
+operator profile -- opencode writes an agent file, claude uses CLI flags,
+kiro denies by omitting trust flags (file-reads-only on ``kiro-cli-chat``
+2.24.1; see the adapter docstrings).
 """
 
 from __future__ import annotations
 
 from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, TurnResult
+from backseat_harness.providers.claude import ClaudeProvider
+from backseat_harness.providers.kiro import KiroProvider
 from backseat_harness.providers.opencode import OpencodeProvider
 
 # Registry keyed by the short name used in config (harness.provider).
 _REGISTRY: dict[str, type[Provider]] = {
+    "claude": ClaudeProvider,
+    "kiro": KiroProvider,
     "opencode": OpencodeProvider,
-}
-
-# Adapters that exist but are not yet validated end-to-end. Named here so the
-# error message can say "coming, not missing" instead of just "unknown".
-_DEFERRED: dict[str, str] = {
-    "claude": "v0.2",
-    "kiro": "v0.2",
 }
 
 
@@ -35,13 +34,9 @@ def get_provider(name: str) -> Provider:
         cls = _REGISTRY[name]
     except KeyError as exc:
         known = ", ".join(sorted(_REGISTRY)) or "(none)"
-        detail = f"unknown provider {name!r}; available in this version: {known}"
-        if name in _DEFERRED:
-            detail = (
-                f"provider {name!r} is not supported yet (planned for "
-                f"{_DEFERRED[name]}); available in this version: {known}"
-            )
-        raise ProviderError(detail) from exc
+        raise ProviderError(
+            f"unknown provider {name!r}; available in this version: {known}"
+        ) from exc
     return cls()
 
 
@@ -54,6 +49,8 @@ __all__ = [
     "ProviderError",
     "SpawnSpec",
     "TurnResult",
+    "ClaudeProvider",
+    "KiroProvider",
     "OpencodeProvider",
     "get_provider",
     "available_providers",

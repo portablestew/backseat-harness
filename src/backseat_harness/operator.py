@@ -5,9 +5,12 @@ profile. Responsibilities are split in two:
 
 - **Persona** (``operator_persona.md``): who the operator is and how it works --
   the vibecoding-operator stance, review procedure, strategy, prompt-writing
-  and escalation rules. Standing guidance, identical every call, so it lives in
-  the provider's agent definition as the system prompt (see
-  ``Provider.prepare_operator``).
+  and escalation rules. Standing guidance, identical every call, so it rides
+  with the launch: opencode's written agent definition carries it as the
+  system prompt (``persona_in_profile`` on the ``OperatorLaunch``, set by
+  ``prepare_operator``), a workspace's named ``[operator].agent`` owns its
+  persona, and for providers with neither (claude/kiro) the invoker prepends
+  the text to every operator prompt (see ``cli._make_operator_invoker``).
 - **Prompt** (this module): the per-call data and the response contract -- the
   goal, the checklist, the redacted session fork, the turn outcome, and the
   exact JSON envelope to return.

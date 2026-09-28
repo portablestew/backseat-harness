@@ -1,4 +1,4 @@
-"""opencode adapter (the v0.1 target provider).
+"""opencode adapter (registered; sessions live in SQLite).
 
 Drives ``opencode run`` in non-interactive mode with ``--format json``, which
 emits one JSON event per line on stdout. Two things we need are in there:
@@ -167,6 +167,9 @@ class OpencodeProvider(Provider):
         return OperatorLaunch(
             env={"OPENCODE_CONFIG_DIR": str(profile_dir)},
             extra_args=("--agent", OPERATOR_AGENT),
+            # The agent file's body *is* the persona, so the invoker must not
+            # prepend it to the prompt as well.
+            persona_in_profile=True,
         )
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:

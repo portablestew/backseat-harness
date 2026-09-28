@@ -1,7 +1,13 @@
 """Claude adapter tests.
 
-Claude is not a registered v0.1 provider (opencode is), but the adapter is kept
-contract-conformant for v0.2, so these tests guard it against ABC drift.
+Claude is a registered, live-validated provider (``providers/__init__.py``),
+so these tests guard the adapter against ABC drift.
+
+Provenance: the operator-recipe assertions below are transcribed verbatim from
+the read-only recipe validated live against ``claude`` 2.1.283 (deny-by-default
+validation runs; the version stamp lives here so traceability does not depend
+on external notes). The one-shot parse/extract strings are synthetic contract
+guards, not captures.
 """
 
 from pathlib import Path
@@ -61,3 +67,53 @@ def test_extract_text_falls_back_to_assistant_blocks():
         '{"type":"assistant","message":{"role":"assistant","content":"part two"}}\n'
     )
     assert p.extract_text(stdout) == "part one\npart two"
+
+
+def test_prepare_operator_recipe_is_the_validated_one():
+    p = ClaudeProvider()
+    launch = p.prepare_operator(Path("unused-profile"), "reviewer", ["git", "status"])
+    assert launch.env == {}
+    assert launch.extra_args == (
+        "--permission-prompts", "none",
+        "--disallowedTools", "Write", "Edit", "NotebookEdit", "PowerShell",
+        "--setting-sources", "project,local",
+    )
+    # No profile file carries the persona: the invoker prepends it per prompt.
+    assert launch.persona_in_profile is False
+
+
+def test_prepare_operator_writes_nothing(tmp_path: Path):
+    p = ClaudeProvider()
+    p.prepare_operator(tmp_path, "reviewer", ["git", "diff"])
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_extract_text_empty_result_falls_back_to_assistant_blocks():
+    p = ClaudeProvider()
+    stdout = (
+        '{"type":"assistant","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"draft"}]}}\n'
+        '{"type":"result","result":"","session_id":"s1"}\n'
+    )
+    # An empty result string is not terminal: the assistant blocks win,
+    # matching kiro's finalText handling.
+    assert p.extract_text(stdout) == "draft"
+
+
+def test_interactive_command_resumes_session():
+    p = ClaudeProvider()
+    assert p.interactive_command("abc-123") == ["claude", "--resume", "abc-123"]
+
+
+def test_interactive_command_fresh_session_when_no_id():
+    p = ClaudeProvider()
+    assert p.interactive_command(None) == ["claude"]
+
+
+def test_history_provider_matches_chat_mother_forker_name():
+    # history.py scopes lookups by this name; a typo silently disables sizing.
+    from chat_mother_forker import default_providers
+
+    assert ClaudeProvider.history_provider == "claude_code"
+    names = {p.name for p in default_providers()}
+    assert ClaudeProvider.history_provider in names

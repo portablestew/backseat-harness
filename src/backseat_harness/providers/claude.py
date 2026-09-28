@@ -1,9 +1,11 @@
-"""Claude Code adapter -- written, but NOT a supported provider in v0.1.
+"""Claude Code adapter -- registered and live-validated (``claude`` 2.1.283).
 
-v0.1 ships opencode only (see providers/__init__.py). This adapter conforms to
-the current Provider contract and is kept as the head start on v0.2, but it has
-not been validated against a live ``claude`` install, so it is deliberately left
-out of the registry rather than offered as if it worked.
+This is one of the providers registered in ``providers/__init__.py``. Its
+one-shot path, same-id resume, and read-only operator recipe were all
+validated live against ``claude`` 2.1.283: the prompt arrives on stdin,
+``session_id`` is captured from the stream, ``--resume`` appends to the same
+project JSONL, and under the recipe a file write is auto-denied while a file
+read and ``git status --porcelain`` run unattended.
 
 Shape: headless ``-p`` with newline-delimited ``stream-json`` so the terminal
 ``result`` object (carrying ``session_id``) is readable. The prompt arrives on
@@ -14,6 +16,16 @@ native id Claude reports.
 Claude Code stores transcripts as JSONL under ``~/.claude/projects/``; sizing
 goes through chat-mother-forker's ``claude_code`` provider, so this adapter does
 not locate files itself.
+
+Residuals of the read-only recipe, documented by decision:
+
+- R-C1 -- ``--setting-sources project,local`` isolates the *user* scope only;
+  workspace project/local settings still load. That is by design (the workspace
+  owner owns them) but must be stated wherever the recipe is handed out.
+- R-C2 -- ``build_command`` passes no permission flags, so an agent turn that
+  needs approval blocks until the spawn watchdog fires. Grants are structurally
+  the workspace owner's channel (``[harness] extra_args``); operator turns never
+  receive them (cli.py composes only launch + operator extra_args).
 """
 
 from __future__ import annotations
@@ -21,7 +33,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from backseat_harness.providers.base import OperatorLaunch, Provider, ProviderError, SpawnSpec
+from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
 
 
 class ClaudeProvider(Provider):
@@ -58,8 +70,11 @@ class ClaudeProvider(Provider):
         """
         chunks: list[str] = []
         for event in _iter_events(stdout):
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                return event["result"]
+            value = event.get("result")
+            # An empty ``result`` is not terminal: fall through to the
+            # assistant blocks below, like kiro does with ``finalText``.
+            if event.get("type") == "result" and isinstance(value, str) and value:
+                return value
             message = event.get("message")
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
@@ -77,13 +92,28 @@ class ClaudeProvider(Provider):
     def prepare_operator(
         self, profile_dir: Path, persona: str, verify_commands: list[str]
     ) -> OperatorLaunch:
-        """Not yet defined: a read-only Claude Code operator profile is still to
-        be designed (see the v0.2 work). Fail loudly rather than run a
-        non-read-only operator.
+        """Read-only operator expressed purely as CLI flags -- no files.
+
+        Three stacked cuts make it read-only: mutating tools are removed
+        outright (``--disallowedTools Write Edit NotebookEdit PowerShell``),
+        every remaining approval prompt auto-denies (``--permission-prompts
+        none`` -- nothing in the recipe can prompt), and ambient user-scope
+        settings/MCP/allow rules are excluded (``--setting-sources
+        project,local``; user scope only, see the module docstring R-C1).
+        Reads, Glob/Grep, and read-only git run unattended and never prompt.
+
+        ``profile_dir`` and ``persona`` are unused by design: claude needs no
+        settings file there (``env={}`` -- read-only git needs no allow rule).
+        ``verify_commands`` is accepted but never passed through: by convention
+        they are read-only git commands, which need no allow rule either.
         """
-        raise ProviderError(
-            "claude does not yet define a read-only operator profile; "
-            "not registered until it does"
+        return OperatorLaunch(
+            env={},
+            extra_args=(
+                "--permission-prompts", "none",
+                "--disallowedTools", "Write", "Edit", "NotebookEdit", "PowerShell",
+                "--setting-sources", "project,local",
+            ),
         )
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:

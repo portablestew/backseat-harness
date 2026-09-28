@@ -152,3 +152,62 @@ def test_result_line_omits_reason_on_complete_only():
         slug="t", status=TaskStatus.BLOCKED, iterations=50, reason="max_iterations reached"
     )
     assert _result_line(out_of_budget).endswith("(max_iterations reached)")
+
+
+def _capture_operator_spawn(monkeypatch, provider=None):
+    """Stub the operator spawn end to end and capture the stdin prompt."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: provider or FakeProvider())
+    monkeypatch.setattr(cli.spawn, "resolve_argv", lambda cmd: cmd)
+    seen = {}
+
+    class _Proc:
+        stdout = "ok"
+
+    def fake_run(cmd, **kwargs):
+        seen["input"] = kwargs["input"]
+        return _Proc()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    return seen
+
+
+def test_operator_invoker_prepends_persona_when_launch_has_none(config, monkeypatch):
+    """Flag False (claude/kiro shape): every prompt carries the persona."""
+    import backseat_harness.cli as cli
+    from backseat_harness.operator import load_persona
+
+    seen = _capture_operator_spawn(monkeypatch)
+    cli._make_operator_invoker(config, config.operator)("Do the review.")
+    assert seen["input"] == f"{load_persona()}\n\nDo the review."
+
+
+def test_operator_invoker_keeps_persona_in_profile(config, monkeypatch):
+    """Flag True (opencode shape): the agent file already has the persona."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness.providers.base import OperatorLaunch
+
+    class InProfileProvider(FakeProvider):
+        def prepare_operator(self, profile_dir, persona, verify_commands):
+            return OperatorLaunch(env={}, extra_args=(), persona_in_profile=True)
+
+    seen = _capture_operator_spawn(monkeypatch, provider=InProfileProvider())
+    cli._make_operator_invoker(config, config.operator)("Do the review.")
+    assert seen["input"] == "Do the review."
+
+
+def test_operator_invoker_named_agent_owns_persona(config, monkeypatch):
+    """[operator].agent: your agent definition carries its own persona."""
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+
+    seen = _capture_operator_spawn(monkeypatch)
+    op_config = replace(config.operator, agent="my-operator")
+    cli._make_operator_invoker(config, op_config)("Do the review.")
+    assert seen["input"] == "Do the review."

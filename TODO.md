@@ -1,6 +1,11 @@
+# TODO
 
 Core agent loop
-- Additional providers: kiro-cli, claude
+- ~~Additional providers: kiro-cli, claude~~ — shipped: both live-validated and registered
+  - Aanlyze session results, prompt success/failure and lengths
+- Recommended length limit on operator prompts; be less specific? more guidance on human-like prompting
+- Persistent session for operator? Always start with fork of previous operator session
+  - Goal is to burn less context re-treading the same ground each time
 
 High level interface
 - Background daemon

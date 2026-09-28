@@ -27,6 +27,9 @@ venv/
 # Throwaway live-run scratch workspace (disposable, not a project artifact)
 test_workspace/
 
+# Task workspace (operator/agent working notes; never committed)
+.backseat/
+
 # OS / editor
 .DS_Store
 Thumbs.db

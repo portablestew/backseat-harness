@@ -12,7 +12,8 @@ sections are ignored, not rejected.
 .backseat/
   config.toml                # harness defaults, provider prefs, budgets
   agents/<provider>/         # harness-written operator profile, rewritten each run
-                             #   (opencode: agents/backseat-operator.md)
+                             #   (opencode: agents/backseat-operator.md; claude and
+                             #    kiro prepare no file -- flags / trust omission)
   tasks/
     <task-slug>/             # one lane = one meta-prompt goal
       meta.md                # the meta-prompt (free text)
@@ -32,7 +33,7 @@ for v0.1, but `task_dir` is a parameter from day one so it stays cheap to add.
 
 ```toml
 [harness]
-provider = "opencode"          # managed-agent CLI (v0.1: opencode)
+provider = "opencode"          # managed-agent CLI (opencode | claude | kiro)
 model = "..."                  # optional: managed agent's model (--model)
 agent = "..."                  # optional: named provider agent for managed turns
 extra_args = []                # flags per managed turn; where you grant perms
@@ -56,9 +57,25 @@ The whole file is optional; code defaults apply to anything omitted.
 anything its CLI would *ask* about goes unanswered — but which permissions to
 grant is the workspace owner's call, not the harness's.
 
-Unless `agent` is set, every `run` writes the operator profile under
-`agents/<provider>/`: the persona as system prompt, and deny-by-default
-permissions allowing reads, search, read-only git, and `verify_commands`.
+Unless `agent` is set, every `run` prepares the operator profile through the
+provider's `prepare_operator` — with a file only for opencode:
+`agents/opencode/agents/backseat-operator.md`, the persona as system prompt
+plus deny-by-default permissions allowing reads, search, read-only git, and
+`verify_commands`. Claude writes no file: read-only is CLI flags (mutating
+tools removed, prompts auto-denied, user-scope settings excluded), and reads
+plus read-only git run unattended. Kiro writes no file either: read-only is
+the omission of trust flags — and on `kiro-cli-chat` 2.24.1 that leaves the
+operator file-reads-only (writes and shell, including read-only git, are
+denied fast; `verify_commands` cannot run unattended); the operator
+prompt's own verify/git guidance is inert there, so the kiro operator
+falls back to file reads.
+
+The persona reaches the operator by one of two paths: opencode's written
+agent file carries it as the system prompt (a workspace's named
+`[operator].agent` owns its own persona), while claude and kiro — which
+write no profile file — receive the persona prepended to every operator
+prompt by the invoker.
+
 The managed side has no harness-written profile; `[harness].agent` only
 forwards `--agent` so a turn can run under a named agent definition of yours.
 

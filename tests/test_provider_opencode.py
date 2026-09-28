@@ -6,8 +6,12 @@ output (opencode 1.18.32), which is why the field names look the way they do.
 
 from pathlib import Path
 
-from backseat_harness.providers import get_provider
+import pytest
+
+from backseat_harness.providers import available_providers, get_provider
 from backseat_harness.providers.base import ProviderError, SpawnSpec
+from backseat_harness.providers.claude import ClaudeProvider
+from backseat_harness.providers.kiro import KiroProvider
 from backseat_harness.providers.opencode import OpencodeProvider
 
 _SESSION = "ses_f2912cb3bffew2JrdmxTShIbSX"
@@ -94,14 +98,15 @@ def test_extract_text_falls_back_to_raw_output():
     )
 
 
-def test_registry_serves_opencode_and_defers_claude():
+def test_registry_serves_all_three_providers():
+    # opencode, claude, and kiro are all registered and live-validated;
+    # nothing is deferred, so an unknown name is simply unknown.
     assert isinstance(get_provider("opencode"), OpencodeProvider)
-    try:
-        get_provider("claude")
-    except ProviderError as exc:
-        assert "not supported yet" in str(exc)
-    else:  # pragma: no cover - registry regression
-        raise AssertionError("claude should not be a registered v0.1 provider")
+    assert isinstance(get_provider("claude"), ClaudeProvider)
+    assert isinstance(get_provider("kiro"), KiroProvider)
+    assert available_providers() == ["claude", "kiro", "opencode"]
+    with pytest.raises(ProviderError, match="unknown provider"):
+        get_provider("nope")
 
 
 def test_history_provider_matches_chat_mother_forker_name():
@@ -147,6 +152,8 @@ def test_prepare_operator_writes_agent_and_returns_launch(tmp_path):
 
     assert launch.env == {"OPENCODE_CONFIG_DIR": str(tmp_path / "prof")}
     assert launch.extra_args == ("--agent", OPERATOR_AGENT)
+    # The persona lives in the written agent file, so no prompt prepend.
+    assert launch.persona_in_profile is True
     # Frontmatter values are JSON (valid YAML flow syntax).
     front, _, body = text.removeprefix("---\n").partition("\n---\n")
     fields = dict(line.split(": ", 1) for line in front.splitlines())

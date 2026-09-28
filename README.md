@@ -2,8 +2,8 @@
 
 Simple, single-task agent loops. _Buckle up, you're not at the wheel anymore._
 
-backseat-harness drives an off-the-shelf CLI coding agent (opencode today,
-Claude Code / kiro-cli later) one small step at a time toward a goal you write
+backseat-harness drives an off-the-shelf CLI coding agent (opencode, Claude
+Code, or kiro-cli) one small step at a time toward a goal you write
 once. After each managed turn, a **fresh, adversarial operator** reviews the
 whole session — code, tests, transcript — against a durable checklist and
 decides the single next prompt.
@@ -71,25 +71,46 @@ uv sync            # dev environment (installs chat-mother-forker + dev tools)
 pip install -e .
 ```
 
-Requires Python 3.10+ and the managed agent's own CLI — for v0.1 that is
-[`opencode`](https://opencode.ai) — installed and authenticated on your PATH.
+Requires Python 3.10+ and the managed agent's own CLI — one of
+[`opencode`](https://opencode.ai), Claude Code (`claude`), or kiro-cli
+(`kiro-cli`) — installed and authenticated on your PATH.
 backseat-harness never stores provider keys; it uses the CLI's ambient auth.
 
-Permissions: the managed agent runs as opencode's default agent with no extra
+Permissions: with the default opencode provider, the managed agent runs as
+opencode's default agent with no extra
 flags (or under a named agent via `[harness].agent`). Anything it would have to
 *ask* about can't be answered in a non-interactive run, so grant more via
 `extra_args` if your task needs it (opencode's `--auto` approves everything not
 explicitly denied, which it flags as dangerous for good reason). The harness
 never assumes `--auto`.
 
-The operator runs under a harness-written `backseat-operator` opencode agent
-(`.backseat/agents/opencode/agents/backseat-operator.md`, rewritten at every
-`run`). Its system prompt is the operator persona
+Provider-specific grants also go through `[harness] extra_args`:
+
+- **kiro:** a workspace's managed agent **cannot write anything** without a
+  trust grant there — `extra_args = ["-a"]`, or a narrower
+  `--trust-tools=…` — because non-interactive kiro-cli denies every write
+  otherwise (silently: the denial is just a failed tool call).
+- **claude:** agent turns run with the default `permissionMode` and no
+  permission flags of their own, so a turn that would need approval blocks
+  until the turn watchdog fires (1h default) — grant up front via
+  `extra_args` rather than waiting it out. The read-only *operator* recipe
+  cuts ambient *user-scope* settings only (`--setting-sources
+  project,local`); workspace project/local settings still apply, by design.
+
+With the opencode operator provider, the operator runs under a harness-written
+`backseat-operator` agent (`.backseat/agents/opencode/agents/backseat-operator.md`,
+rewritten at every `run`). Its system prompt is the operator persona
 (`src/backseat_harness/operator_persona.md`), and its permissions deny
 everything except reads, search, read-only git, and any configured
 `verify_commands`. It's loaded through `OPENCODE_CONFIG_DIR` on the operator
 process only, so your own opencode config is untouched. Set
 `[operator].agent` to use your own agent instead.
+
+The persona reaches the operator by one of two paths: opencode's written
+agent file carries it as the system prompt (and a workspace's named
+`[operator].agent` owns its own), while claude and kiro operators — which
+write no profile file — receive the same text prepended to every operator
+prompt.
 
 ## Use as a CLI
 
@@ -173,12 +194,23 @@ generation's id, not the whole chain — `binding.json` has the rest.
 
 ## Scope
 
-**v0.1 target:** opencode provider, marker + binding, checklist, verdict loop,
-compaction-by-fork. Library + thin CLI.
+**v0.1 target:** three registered providers — opencode, Claude Code
+(`claude`), and kiro-cli (`kiro`), each live-validated end to end
+(one-shot, resume, read-only operator) — plus marker + binding, checklist,
+verdict loop, compaction-by-fork. Library + thin CLI.
 
-**Deferred to later versions:** Claude Code and kiro-cli adapters (the Claude
-adapter is written and contract-conformant in `providers/claude.py`, but is
-unvalidated against a live install, so it is not registered yet), parallel lanes
+Operator read-only shape is provider-specific. opencode's operator is the
+harness-written `backseat-operator` agent with deny-by-default permissions;
+claude's is flag-based and fully read-only, read-only git included;
+kiro's is deny-by-omission (no trust flags) — and **on `kiro-cli-chat`
+2.24.1 the kiro operator is file-reads-only**: writes and shell commands,
+including `git status`, are denied fast with exit 0, so `verify_commands`
+cannot run unattended on that binary (its only trust grants are
+category-wide or all-or-nothing). The operator prompt's verify/git
+guidance is therefore inert on kiro — the operator falls back to file
+reads.
+
+**Deferred to later versions:** parallel lanes
 / git worktrees, a workspace-templates orchestrator, a checklist MCP tool,
 mid-turn steering / hooks, and a human-takeover lock beyond dual-CLI semantics.
 

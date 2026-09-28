@@ -1,15 +1,23 @@
 """Tests for the chat-mother-forker seam.
 
-These run against the real library (it is a core dependency) but not against any
-particular stored session, so they stay deterministic on any machine. The
-happy-path lookups are covered in the loop tests via the ``stub_history``
-fixture.
+These run against the real library (it is a core dependency) and against the
+machine's real stored sessions, so the no-match sentinels are generated per
+run: chat-mother-forker's ``find_chats`` content-searches stored transcripts,
+and a fixed literal gets quoted into them by the very sessions that read or
+fail this file, then matches forever. The happy-path lookups are covered in
+the loop tests via the ``stub_history`` fixture.
 """
+
+import uuid
 
 import pytest
 
 from backseat_harness import history
 from backseat_harness.providers.opencode import OpencodeProvider
+
+# A fresh uuid can never appear in any stored transcript, so it can't
+# self-poison the content search no matter how often this file is read.
+_NO_SUCH_SESSION = f"ses_{uuid.uuid4().hex}"
 
 
 def test_no_match_renders_as_empty_string():
@@ -18,11 +26,11 @@ def test_no_match_renders_as_empty_string():
     The loop treats "no history yet" and "empty history" the same, so that
     sentinel must never reach a prompt as if it were transcript content.
     """
-    assert history.fork_session("ses_definitely-not-a-real-session-xyz", "opencode") == ""
+    assert history.fork_session(_NO_SUCH_SESSION, "opencode") == ""
 
 
 def test_missing_session_is_none_not_an_error():
-    assert history.find_session("ses_definitely-not-a-real-session-xyz", "opencode") is None
+    assert history.find_session(_NO_SUCH_SESSION, "opencode") is None
 
 
 def test_unknown_history_provider_fails_loudly():
@@ -33,7 +41,7 @@ def test_unknown_history_provider_fails_loudly():
 
 def test_opencode_history_provider_name_is_valid():
     # Guards the one string linking an adapter to its history backend.
-    assert history.find_session("ses_nope-xyz", OpencodeProvider.history_provider) is None
+    assert history.find_session(_NO_SUCH_SESSION, OpencodeProvider.history_provider) is None
 
 
 @pytest.mark.parametrize(
@@ -54,7 +62,7 @@ def test_load_full_transcript_no_match_is_empty():
     The loop treats "no session yet" and "empty session" the same, so the
     LookupError must never surface as a crash mid-capture.
     """
-    assert history.load_full_transcript("ses_not-a-real-session-xyz", "opencode") == ""
+    assert history.load_full_transcript(_NO_SUCH_SESSION, "opencode") == ""
 
 
 def test_load_full_transcript_returns_load_chat_string(monkeypatch):
