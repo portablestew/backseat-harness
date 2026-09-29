@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 
@@ -19,7 +18,7 @@ from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_conf
 from backseat_harness.loop import run_task
 from backseat_harness.operator import load_persona
 from backseat_harness.providers import get_provider
-from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
+from backseat_harness.providers.base import Provider, SpawnSpec
 from backseat_harness.spawn import run_turn
 
 
@@ -246,39 +245,22 @@ def _ensure_meta(paths: TaskPaths, meta: str | None) -> str | None:
 
 
 def _make_operator_invoker(config: Config, op_config: OperatorConfig):
-    """Build the operator invoker: one-shot read-only CLI, capture final text.
+    """Build the operator invoker: one-shot CLI call, capture the final text.
 
-    Uses the operator provider (may differ from the managed provider).
-    ``prepare_operator`` expresses each provider's read-only profile in its own
-    way: opencode gets a written agent file under ``.backseat/agents/``
-    (persona included), claude gets flags, kiro gets no file and no flags.
-    The operator process only carries the persona itself when the launch says
-    so (``persona_in_profile``) -- written agent file, or a workspace's named
-    ``[operator].agent``, which owns its own persona. Otherwise ``invoke``
-    prepends the persona to every prompt so claude/kiro operators keep the
-    same guidance; the persona text is captured once, here at startup.
+    Uses the operator provider (may differ from the managed provider) and runs
+    its default agent -- or ``[operator].agent`` when set. The persona is
+    prepended to every operator prompt, so one source of truth serves all
+    providers and a workspace's own agent still gets the guidance. Permissions
+    are the workspace owner's; the harness only forwards
+    ``[operator].model``/``extra_args``. The persona is read once, here.
     """
     provider: Provider = get_provider(op_config.provider)
     persona = load_persona()
-    if op_config.agent:
-        launch = OperatorLaunch(
-            env={},
-            extra_args=("--agent", op_config.agent),
-            persona_in_profile=True,
-        )
-    else:
-        launch = provider.prepare_operator(
-            config.agents_dir / provider.name,
-            persona,
-            list(op_config.verify_commands),
-        )
-    env = {**os.environ, **launch.env} if launch.env else None
-    prompt_prefix = None if launch.persona_in_profile else persona
+    base_extra: tuple[str, ...] = ("--agent", op_config.agent) if op_config.agent else ()
 
     def invoke(prompt: str) -> str:
-        if prompt_prefix:
-            prompt = f"{prompt_prefix}\n\n{prompt}"
-        extra: list[str] = list(launch.extra_args)
+        prompt = f"{persona}\n\n{prompt}"
+        extra: list[str] = list(base_extra)
         if op_config.model:
             extra += ["--model", op_config.model]
         extra += list(op_config.extra_args)
@@ -299,7 +281,6 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=env,
                 timeout=config.turn_timeout_s,
             )
         except subprocess.TimeoutExpired:

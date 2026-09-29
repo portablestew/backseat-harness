@@ -2,9 +2,8 @@
 
 This is one of the providers registered in ``providers/__init__.py``. It
 implements the full Provider contract against a live ``kiro-cli`` install
-(``kiro-cli-chat`` 2.24.1): one-shot and same-id resume through
-``--resume-id``, the operator's deny-by-omission behavior, and the
-interactive takeover were all validated live.
+(``kiro-cli-chat`` 2.24.1): one-shot and same-id resume through ``--resume-id``,
+the trust/deny boundary, and the interactive takeover were all validated live.
 
 Shape: ``kiro-cli chat --output-format stream-json --no-interactive``. The
 prompt goes on stdin only -- never a positional argument. The CLI does offer a
@@ -27,24 +26,18 @@ Storage: ``~/.kiro/sessions/cli/<uuid>.jsonl``
 through chat-mother-forker's ``kiro_cli`` provider, so this adapter never
 locates files itself.
 
-Read-only operator: omitting trust flags *is* the profile, but what it buys
-is split (live-validated against ``kiro-cli-chat`` 2.24.1): with no
-``-a/--trust-all-tools`` (or ``--trust-tools``) and ``--no-interactive``,
-writes and shell commands are denied at the permission layer -- fast, exit 0,
-no file written, no prompt surface that could hang the operator -- while file
-*reads* run unattended. Read-only git sits with the shell side: it is denied
-on this binary, so the operator is file-reads-only. Trust flags therefore stay
-out of ``build_command`` (it feeds the operator too): an agent workspace grants
-tool trust through the workspace config's ``[harness] extra_args`` instead, or
-its edits are silently denied.
+Permissions: ``--trust-all-tools`` is the default (see ``build_command``). The
+alternative is a silent auto-deny of every write and shell command, which fails
+loudly in the wrong way. Narrow the tool set with a repo-defined agent selected
+via ``--agent <name>``, whose tool-permission block is the command-scoped axis;
+``--trust-tools`` is category-level.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
+from backseat_harness.providers.base import Provider, SpawnSpec
 
 
 class KiroProvider(Provider):
@@ -53,9 +46,14 @@ class KiroProvider(Provider):
 
     def build_command(self, spec: SpawnSpec) -> list[str]:
         # Bare `chat`: the prompt is piped on stdin (see providers.base) --
-        # no positional INPUT and no `-` marker. Trust flags stay out: this
-        # argv is reused for the read-only operator (deny-by-omission).
-        cmd = ["kiro-cli", "chat", "--output-format", "stream-json", "--no-interactive"]
+        # no positional INPUT and no `-` marker.
+        # --trust-all-tools: a non-interactive process cannot answer a prompt,
+        # so approve rather than silently deny every write. This argv also runs
+        # the operator, which is intentional -- both sides are trusted.
+        cmd = [
+            "kiro-cli", "chat", "--output-format", "stream-json",
+            "--no-interactive", "--trust-all-tools",
+        ]
         if spec.resume_native_id:
             cmd += ["--resume-id", spec.resume_native_id]
         cmd += list(spec.extra_args)
@@ -108,24 +106,6 @@ class KiroProvider(Provider):
             if isinstance(text, str):
                 chunks.append(text)
         return "".join(chunks) if chunks else stdout
-
-    def prepare_operator(
-        self, profile_dir: Path, persona: str, verify_commands: list[str]
-    ) -> OperatorLaunch:
-        """Read-only by omission: no trust flags, no profile file.
-
-        The trust flags are absent from ``build_command`` (never present) and
-        ``--no-interactive`` rejects permission requests at the permission
-        layer without prompting: on ``kiro-cli-chat`` 2.24.1 writes and shell
-        commands are denied instantly (exit 0, no hang, no file), file reads
-        run, and read-only git is denied -- it rides the shell tool, whose only
-        grants are category-wide, so no git-scoped exception exists. The
-        operator is therefore file-reads-only. ``profile_dir`` and ``persona``
-        are unused by design -- there is nothing to write there;
-        ``verify_commands`` are read-only git by convention and cannot run
-        unattended on this binary, so they are accepted but not used.
-        """
-        return OperatorLaunch(env={}, extra_args=())
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:
         cmd = ["kiro-cli", "chat"]

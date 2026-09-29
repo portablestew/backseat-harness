@@ -32,11 +32,11 @@ DEFAULT_MAX_GENERATIONS = 20
 
 @dataclass(frozen=True)
 class OperatorConfig:
-    """Profile for the ephemeral, read-only operator agent.
+    """Profile for the ephemeral operator agent.
 
-    Same underlying CLI tool as the managed agent, different agent definition:
-    read-only tools plus optional verification commands. Often a stronger model
-    than the managed agent; kept configurable and decoupled.
+    Same underlying CLI as the managed agent but a separate, often stronger
+    model and its own agent definition. The harness grants it no permissions:
+    ``agent`` and ``extra_args`` are the workspace owner's channel.
     """
 
     provider: str = "opencode"
@@ -81,10 +81,6 @@ class Config:
     @property
     def config_path(self) -> Path:
         return self.backseat_dir / "config.toml"
-
-    @property
-    def agents_dir(self) -> Path:
-        return self.backseat_dir / "agents"
 
     @property
     def tasks_dir(self) -> Path:

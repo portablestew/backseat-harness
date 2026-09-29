@@ -115,58 +115,6 @@ def test_history_provider_matches_chat_mother_forker_name():
 
     names = {p.name for p in default_providers()}
     assert OpencodeProvider.history_provider in names
-
-
-def test_operator_permissions_deny_by_default_and_never_ask():
-    from backseat_harness.providers.opencode import operator_permissions
-
-    perms = operator_permissions(["pytest -q"])
-    assert perms["*"] == "deny"
-    assert perms["bash"]["*"] == "deny"
-    assert perms["bash"]["git diff*"] == "allow"
-    assert perms["bash"]["pytest -q"] == "allow"
-    # Last match wins in opencode, so the --output deny must come after the allows.
-    assert list(perms["bash"])[-1] == "*--output*"
-    assert perms["read"]["*binding.json"] == "deny"
-
-    def actions(value):
-        if isinstance(value, dict):
-            for v in value.values():
-                yield from actions(v)
-        else:
-            yield value
-
-    # Nobody answers prompts in a non-interactive run.
-    assert "ask" not in set(actions(perms))
-
-
-def test_prepare_operator_writes_agent_and_returns_launch(tmp_path):
-    import json
-
-    from backseat_harness.providers.opencode import OPERATOR_AGENT
-
-    p = OpencodeProvider()
-    launch = p.prepare_operator(tmp_path / "prof", "You are the operator.", [])
-    agent_file = tmp_path / "prof" / "agents" / f"{OPERATOR_AGENT}.md"
-    text = agent_file.read_text(encoding="utf-8")
-
-    assert launch.env == {"OPENCODE_CONFIG_DIR": str(tmp_path / "prof")}
-    assert launch.extra_args == ("--agent", OPERATOR_AGENT)
-    # The persona lives in the written agent file, so no prompt prepend.
-    assert launch.persona_in_profile is True
-    # Frontmatter values are JSON (valid YAML flow syntax).
-    front, _, body = text.removeprefix("---\n").partition("\n---\n")
-    fields = dict(line.split(": ", 1) for line in front.splitlines())
-    assert json.loads(fields["mode"]) == "primary"
-    assert json.loads(fields["permission"])["*"] == "deny"
-    assert body.strip() == "You are the operator."
-
-    # Rewritten (not appended) on every startup.
-    p.prepare_operator(tmp_path / "prof", "Second persona.", [])
-    assert "Second persona." in agent_file.read_text(encoding="utf-8")
-    assert "You are the operator." not in agent_file.read_text(encoding="utf-8")
-
-
 def test_interactive_command_resumes_session():
     p = OpencodeProvider()
     assert p.interactive_command(_SESSION) == ["opencode", "--session", _SESSION]
@@ -175,3 +123,23 @@ def test_interactive_command_resumes_session():
 def test_interactive_command_fresh_session_when_no_id():
     p = OpencodeProvider()
     assert p.interactive_command(None) == ["opencode"]
+
+
+def test_every_provider_defaults_to_auto_approve():
+    """No provider may leave a non-interactive process able to prompt or silently deny.
+
+    build_command feeds the managed turn and the operator alike, so a missing
+    grant is a 1h block on claude/opencode and a silent write-denial on kiro.
+    """
+    from backseat_harness.providers import available_providers, get_provider
+
+    grants = {
+        "opencode": "--auto",
+        "claude": "--permission-mode",
+        "kiro": "--trust-all-tools",
+    }
+    for name in available_providers():
+        argv = get_provider(name).build_command(
+            SpawnSpec(prompt="p", cwd=Path("."), resume_native_id="s1")
+        )
+        assert grants[name] in argv, f"{name} build_command lacks {grants[name]}"

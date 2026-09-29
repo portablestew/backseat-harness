@@ -169,14 +169,15 @@ def _capture_operator_spawn(monkeypatch, provider=None):
 
     def fake_run(cmd, **kwargs):
         seen["input"] = kwargs["input"]
+        seen["argv"] = list(cmd)
         return _Proc()
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     return seen
 
 
-def test_operator_invoker_prepends_persona_when_launch_has_none(config, monkeypatch):
-    """Flag False (claude/kiro shape): every prompt carries the persona."""
+def test_operator_invoker_prepends_persona(config, monkeypatch):
+    """Every provider gets the persona as a prompt prefix, whatever its launch."""
     import backseat_harness.cli as cli
     from backseat_harness.operator import load_persona
 
@@ -185,29 +186,51 @@ def test_operator_invoker_prepends_persona_when_launch_has_none(config, monkeypa
     assert seen["input"] == f"{load_persona()}\n\nDo the review."
 
 
-def test_operator_invoker_keeps_persona_in_profile(config, monkeypatch):
-    """Flag True (opencode shape): the agent file already has the persona."""
-    from conftest import FakeProvider
-
-    import backseat_harness.cli as cli
-    from backseat_harness.providers.base import OperatorLaunch
-
-    class InProfileProvider(FakeProvider):
-        def prepare_operator(self, profile_dir, persona, verify_commands):
-            return OperatorLaunch(env={}, extra_args=(), persona_in_profile=True)
-
-    seen = _capture_operator_spawn(monkeypatch, provider=InProfileProvider())
-    cli._make_operator_invoker(config, config.operator)("Do the review.")
-    assert seen["input"] == "Do the review."
-
-
-def test_operator_invoker_named_agent_owns_persona(config, monkeypatch):
-    """[operator].agent: your agent definition carries its own persona."""
+def test_operator_invoker_prepends_persona_for_named_agent(config, monkeypatch):
+    """[operator].agent changes the agent, not the persona delivery."""
     from dataclasses import replace
 
     import backseat_harness.cli as cli
+    from backseat_harness.operator import load_persona
 
     seen = _capture_operator_spawn(monkeypatch)
     op_config = replace(config.operator, agent="my-operator")
     cli._make_operator_invoker(config, op_config)("Do the review.")
-    assert seen["input"] == "Do the review."
+    assert seen["input"] == f"{load_persona()}\n\nDo the review."
+
+
+def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
+    """[harness].agent (managed) and [operator].agent both land as --agent."""
+    import pathlib as _pathlib
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+    from backseat_harness.providers.opencode import OpencodeProvider
+    from backseat_harness.spawn import SpawnSpec
+
+    # Managed side: loop.py composes ("--agent", config.agent) into SpawnSpec.
+    spec = SpawnSpec(prompt="p", cwd=_pathlib.Path("."), extra_args=("--agent", "my-builder"))
+    argv = OpencodeProvider().build_command(spec)
+    assert argv[-2:] == ["--agent", "my-builder"]
+
+    # Operator side: cli.py composes it from op_config.agent, with the persona
+    # prepended, against a real provider rather than the argv-dropping fake.
+    real_get = cli.get_provider
+    monkeypatch.setattr(cli, "get_provider", lambda name: OpencodeProvider())
+    seen = {}
+    monkeypatch.setattr(cli.spawn, "resolve_argv", lambda cmd: cmd)
+
+    class _Proc:
+        stdout = "ok"
+
+    def fake_run(cmd, **kwargs):
+        seen["argv"] = list(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    try:
+        op_config = replace(config.operator, agent="my-reviewer")
+        cli._make_operator_invoker(config, op_config)("Do the review.")
+    finally:
+        monkeypatch.setattr(cli, "get_provider", real_get)
+    assert seen["argv"][-2:] == ["--agent", "my-reviewer"]

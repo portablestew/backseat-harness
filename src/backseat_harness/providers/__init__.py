@@ -8,10 +8,10 @@ history.py).
 
 Supported providers: **opencode**, **claude** (Claude Code), and **kiro**
 (kiro-cli). All three are registered and were validated live end to end:
-one-shot and resume on a real install, plus each provider's read-only
-operator profile -- opencode writes an agent file, claude uses CLI flags,
-kiro denies by omitting trust flags (file-reads-only on ``kiro-cli-chat``
-2.24.1; see the adapter docstrings).
+one-shot and resume on a real install. Every turn runs auto-approved (a
+non-interactive process cannot answer a prompt), and the operator runs each
+CLI's default agent with the persona prepended to its prompt. The harness writes
+no operator profile.
 """
 
 from __future__ import annotations

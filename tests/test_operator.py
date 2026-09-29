@@ -156,3 +156,43 @@ def test_prompt_lists_handoff_docs():
     assert "(none yet)" in empty
     listed = build_prompt(ReviewInputs(**base, docs=[".backseat/tasks/t/docs/1-research.md"]))
     assert "- `.backseat/tasks/t/docs/1-research.md`" in listed
+
+
+def test_checklist_fields_are_clipped_with_a_marker():
+    """Long evidence is cut, and the prompt says how much and where to look."""
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import render_checklist
+
+    cl = Checklist(
+        steps={"1-research": {"status": "done", "evidence": "E" * 900}},
+        remarks=[],
+    )
+    out = render_checklist(cl, ".backseat/tasks/t")
+    assert "E" * 250 in out
+    assert "..[+650 chars]" in out
+    assert "E" * 251 not in out
+
+
+def test_short_checklist_fields_are_left_alone():
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import render_checklist
+
+    cl = Checklist(steps={"1": {"evidence": "verified at 48a0da1, 134 passed"}}, remarks=[])
+    out = render_checklist(cl, ".backseat/tasks/t")
+    assert "..[" not in out
+    assert "verified at 48a0da1, 134 passed" in out
+
+
+def test_only_recent_remarks_are_inlined_and_older_ones_point_at_the_file():
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import CHECKLIST_RECENT_REMARKS, render_checklist
+
+    total = 20
+    remarks = [f"remark-{i}" for i in range(total)]
+    out = render_checklist(Checklist(steps={}, remarks=remarks), ".backseat/tasks/t")
+    # The most recent CHECKLIST_RECENT_REMARKS survive; the rest are counted off.
+    assert "remark-19" in out
+    assert f"remark-{total - CHECKLIST_RECENT_REMARKS}" in out
+    assert "remark-14" not in out
+    assert f"..[{total - CHECKLIST_RECENT_REMARKS} earlier remarks omitted" in out
+    assert "checklist.json" in out

@@ -146,15 +146,12 @@ def test_build_command_appends_extra_args():
     assert cmd[-2:] == ["--mode", "default"]
 
 
-def test_build_command_contains_no_trust_flags():
-    # Trust must stay a per-workspace grant (config extra_args), never baked
-    # into argv: build_command is also what the read-only operator runs.
-    p = KiroProvider()
-    cmd = p.build_command(SpawnSpec(prompt="x", cwd=Path("."), resume_native_id=_SESSION))
-    for flag in ("-a", "--trust-all-tools", "--trust-tools"):
-        assert flag not in cmd
-    assert "--no-interactive" in cmd
-
+def test_build_command_trusts_all_tools_by_default():
+    # Trust is the default on both sides; a non-interactive process cannot
+    # answer a prompt, so the gate is open rather than silently denying writes.
+    argv = KiroProvider().build_command(SpawnSpec(prompt="p", cwd=Path(".")))
+    assert "--trust-all-tools" in argv
+    assert "--no-interactive" in argv
 
 def test_parse_result_reads_session_id():
     p = KiroProvider()
@@ -225,19 +222,6 @@ def test_extract_text_falls_back_to_raw_output():
     assert p.extract_text("command failed: not authenticated") == (
         "command failed: not authenticated"
     )
-
-
-def test_prepare_operator_is_read_only_by_omission(tmp_path: Path):
-    p = KiroProvider()
-    launch = p.prepare_operator(tmp_path, "You are the operator.", ["git status"])
-    assert launch.env == {}
-    assert launch.extra_args == ()
-    # No profile file carries the persona: the invoker prepends it per prompt.
-    assert launch.persona_in_profile is False
-    # The profile is the absence of trust flags: nothing gets written.
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_interactive_command_resumes_session():
     p = KiroProvider()
     assert p.interactive_command(_SESSION) == ["kiro-cli", "chat", "--resume-id", _SESSION]

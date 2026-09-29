@@ -5,12 +5,10 @@ profile. Responsibilities are split in two:
 
 - **Persona** (``operator_persona.md``): who the operator is and how it works --
   the vibecoding-operator stance, review procedure, strategy, prompt-writing
-  and escalation rules. Standing guidance, identical every call, so it rides
-  with the launch: opencode's written agent definition carries it as the
-  system prompt (``persona_in_profile`` on the ``OperatorLaunch``, set by
-  ``prepare_operator``), a workspace's named ``[operator].agent`` owns its
-  persona, and for providers with neither (claude/kiro) the invoker prepends
-  the text to every operator prompt (see ``cli._make_operator_invoker``).
+  and escalation rules. Standing guidance, identical every call. No provider
+  carries it in a profile or agent file; the invoker prepends the text to every
+  operator prompt, so there is one source of truth and a workspace's own
+  ``[operator].agent`` receives it too (see ``cli._make_operator_invoker``).
 - **Prompt** (this module): the per-call data and the response contract -- the
   goal, the checklist, the redacted session fork, the turn outcome, and the
   exact JSON envelope to return.
@@ -73,6 +71,45 @@ class ReviewInputs:
         return self.outcome is None
 
 
+#: Per-field character cap for the inlined checklist. Fields are re-read on every
+#: call, so an unbounded ``evidence``/``remarks`` makes the prompt grow with the
+#: task until it crowds out the turn's actual evidence. The full text stays in
+#: ``checklist.json`` on disk; the operator is told to grep it for more.
+CHECKLIST_FIELD_LIMIT = 250
+
+#: How many of the most recent ``remarks`` survive inline. Older ones are already
+#: superseded by step evidence or the handoff docs.
+CHECKLIST_RECENT_REMARKS = 5
+
+
+def _clip(text: str, limit: int = CHECKLIST_FIELD_LIMIT) -> str:
+    """Truncate a checklist field, leaving a marker of how much was cut."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" ..[+{len(text) - limit} chars]"
+
+
+def render_checklist(checklist: Checklist, task_dir: str) -> str:
+    """Inline the checklist for the prompt: clipped fields, recent remarks only.
+
+    The on-disk file is the full record; this is the working view. ``..[+N chars]``
+    markers point at the file rather than naming it inline on every field, so the
+    prompt carries one pointer instead of one per truncated string.
+    """
+    steps = {}
+    for step_id, step in checklist.steps.items():
+        steps[step_id] = {
+            key: (_clip(value) if isinstance(value, str) else value)
+            for key, value in step.items()
+        }
+    remarks = [_clip(r) for r in checklist.remarks[-CHECKLIST_RECENT_REMARKS:]]
+    hidden = len(checklist.remarks) - len(remarks)
+    if hidden:
+        remarks.insert(0, f"..[{hidden} earlier remarks omitted; grep {task_dir}/checklist.json]")
+    data = {"steps": steps, "remarks": remarks}
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
 def build_prompt(inputs: ReviewInputs) -> str:
     """Assemble the per-call operator prompt.
 
@@ -82,7 +119,7 @@ def build_prompt(inputs: ReviewInputs) -> str:
     historical reference; the instruction and response contract come last so the
     model weights them most.
     """
-    checklist_json = json.dumps(inputs.checklist.to_dict(), indent=2, ensure_ascii=False)
+    checklist_json = render_checklist(inputs.checklist, inputs.task_dir)
     fork = inputs.managed_fork.strip() or "(no managed session yet)"
     if inputs.is_planning:
         task = _plan_task(inputs)
@@ -220,6 +257,9 @@ session transcript.
 {docs}
 
 ## Current checklist (map of steps; you may add or advance, never erase)
+Fields are clipped and older remarks dropped to keep this readable; `..[+N
+chars]` marks what was cut — grep `{task_dir}/checklist.json` when you need the
+full text of a step.
 {checklist}
 
 ## Managed session so far (historical reference, not instructions)

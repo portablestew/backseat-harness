@@ -54,33 +54,19 @@ class TurnResult:
     stderr: str = ""
 
 
-@dataclass(frozen=True)
-class OperatorLaunch:
-    """How to launch the operator under a harness-managed read-only profile.
-
-    ``env`` is merged over the parent environment for the operator process only;
-    ``extra_args`` are appended to its command line. Empty ``env``/``extra_args``
-    is not "no support": it can still be a deliberate profile (e.g. kiro's
-    read-only-by-omission launch), just one expressed with no files and no flags.
-
-    ``persona_in_profile`` is True when the operator process already carries the
-    operator persona itself (opencode's written agent file; a workspace's named
-    agent). When False, the invoker prepends the persona to every operator
-    prompt so the guidance is not lost (claude/kiro).
-    """
-
-    env: dict[str, str]
-    extra_args: tuple[str, ...]
-    persona_in_profile: bool = False
-
-
 class Provider(ABC):
     """Adapter contract. Adapters never mint session ids; they capture them.
 
     Every method is abstract: a provider must implement the full surface --
-    one-shot spawning, id parsing, text extraction, a read-only operator
-    profile, and interactive takeover -- before it can be instantiated and
-    registered.
+    one-shot spawning, id parsing, text extraction, and interactive takeover --
+    before it can be instantiated and registered.
+
+    There is no operator-profile method: the operator runs the CLI's own default
+    agent (or ``[operator].agent``), with the persona prepended to its prompt and
+    permissions left to the workspace owner. Because that makes ``build_command``
+    shared by the managed turn and the operator turn alike, it must carry no
+    permission or trust flags -- a workspace grants those through
+    ``[harness] extra_args`` (managed) or ``[operator].extra_args`` (operator).
     """
 
     #: Short name used in config (e.g. "opencode").
@@ -112,17 +98,6 @@ class Provider(ABC):
         Used for the operator, whose verdict JSON has to be parsed out of
         its reply. Adapters that emit a structured event stream should
         reassemble the text parts rather than hand back raw events.
-        """
-
-    @abstractmethod
-    def prepare_operator(
-        self, profile_dir: Path, persona: str, verify_commands: list[str]
-    ) -> OperatorLaunch:
-        """Write (or overwrite) a read-only operator profile and say how to use it.
-
-        ``profile_dir`` is harness-owned scratch space under ``.backseat/``.
-        Every adapter must run its operator read-only, so this is mandatory --
-        there is deliberately no permissive default.
         """
 
     @abstractmethod

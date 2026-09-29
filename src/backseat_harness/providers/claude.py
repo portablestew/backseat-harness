@@ -1,11 +1,9 @@
 """Claude Code adapter -- registered and live-validated (``claude`` 2.1.283).
 
 This is one of the providers registered in ``providers/__init__.py``. Its
-one-shot path, same-id resume, and read-only operator recipe were all
-validated live against ``claude`` 2.1.283: the prompt arrives on stdin,
-``session_id`` is captured from the stream, ``--resume`` appends to the same
-project JSONL, and under the recipe a file write is auto-denied while a file
-read and ``git status --porcelain`` run unattended.
+one-shot path and same-id resume were validated live against ``claude``
+2.1.283: the prompt arrives on stdin, ``session_id`` is captured from the
+stream, and ``--resume`` appends to the same project JSONL.
 
 Shape: headless ``-p`` with newline-delimited ``stream-json`` so the terminal
 ``result`` object (carrying ``session_id``) is readable. The prompt arrives on
@@ -17,23 +15,17 @@ Claude Code stores transcripts as JSONL under ``~/.claude/projects/``; sizing
 goes through chat-mother-forker's ``claude_code`` provider, so this adapter does
 not locate files itself.
 
-Residuals of the read-only recipe, documented by decision:
-
-- R-C1 -- ``--setting-sources project,local`` isolates the *user* scope only;
-  workspace project/local settings still load. That is by design (the workspace
-  owner owns them) but must be stated wherever the recipe is handed out.
-- R-C2 -- ``build_command`` passes no permission flags, so an agent turn that
-  needs approval blocks until the spawn watchdog fires. Grants are structurally
-  the workspace owner's channel (``[harness] extra_args``); operator turns never
-  receive them (cli.py composes only launch + operator extra_args).
+Permission mode: ``auto`` (see ``build_command``), because a non-interactive
+process cannot answer a prompt and would otherwise block until the watchdog.
+Restrict the tool set with ``--allowedTools``/``--disallowedTools``,
+``--setting-sources``, or a repo-defined agent.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-from backseat_harness.providers.base import OperatorLaunch, Provider, SpawnSpec
+from backseat_harness.providers.base import Provider, SpawnSpec
 
 
 class ClaudeProvider(Provider):
@@ -42,7 +34,13 @@ class ClaudeProvider(Provider):
 
     def build_command(self, spec: SpawnSpec) -> list[str]:
         # Bare -p: the prompt is piped on stdin (see providers.base).
-        cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+        # --permission-mode auto: this process cannot answer a prompt, so approve
+        # rather than block until the watchdog. Narrow tools with
+        # --allowedTools/--disallowedTools or a repo-defined agent.
+        cmd = [
+            "claude", "-p", "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "auto",
+        ]
         if spec.resume_native_id:
             cmd += ["--resume", spec.resume_native_id]
         cmd += list(spec.extra_args)
@@ -88,33 +86,6 @@ class ClaudeProvider(Provider):
                         if isinstance(text, str):
                             chunks.append(text)
         return "\n".join(chunks) if chunks else stdout
-
-    def prepare_operator(
-        self, profile_dir: Path, persona: str, verify_commands: list[str]
-    ) -> OperatorLaunch:
-        """Read-only operator expressed purely as CLI flags -- no files.
-
-        Three stacked cuts make it read-only: mutating tools are removed
-        outright (``--disallowedTools Write Edit NotebookEdit PowerShell``),
-        every remaining approval prompt auto-denies (``--permission-prompts
-        none`` -- nothing in the recipe can prompt), and ambient user-scope
-        settings/MCP/allow rules are excluded (``--setting-sources
-        project,local``; user scope only, see the module docstring R-C1).
-        Reads, Glob/Grep, and read-only git run unattended and never prompt.
-
-        ``profile_dir`` and ``persona`` are unused by design: claude needs no
-        settings file there (``env={}`` -- read-only git needs no allow rule).
-        ``verify_commands`` is accepted but never passed through: by convention
-        they are read-only git commands, which need no allow rule either.
-        """
-        return OperatorLaunch(
-            env={},
-            extra_args=(
-                "--permission-prompts", "none",
-                "--disallowedTools", "Write", "Edit", "NotebookEdit", "PowerShell",
-                "--setting-sources", "project,local",
-            ),
-        )
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:
         cmd = ["claude"]

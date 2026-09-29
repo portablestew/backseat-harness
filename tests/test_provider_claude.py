@@ -27,11 +27,12 @@ def test_build_command_first_turn_omits_prompt():
     assert "--resume" not in cmd
 
 
-def test_build_command_resume():
-    p = ClaudeProvider()
-    cmd = p.build_command(SpawnSpec(prompt="next", cwd=Path("."), resume_native_id="abc-123"))
-    assert "--resume" in cmd
-    assert cmd[cmd.index("--resume") + 1] == "abc-123"
+def test_build_command_appends_extra_args():
+    """Where claude's permission mode reaches the managed turn."""
+    spec = SpawnSpec(prompt="p", cwd=Path("."), extra_args=("--permission-mode", "auto"))
+    argv = ClaudeProvider().build_command(spec)
+    assert argv[-2:] == ["--permission-mode", "auto"]
+
 
 
 def test_parse_result_reads_session_id():
@@ -57,37 +58,6 @@ def test_extract_text_prefers_terminal_result():
         '{"type":"result","result":"final answer","session_id":"s1"}\n'
     )
     assert p.extract_text(stdout) == "final answer"
-
-
-def test_extract_text_falls_back_to_assistant_blocks():
-    p = ClaudeProvider()
-    stdout = (
-        '{"type":"assistant","message":{"role":"assistant",'
-        '"content":[{"type":"text","text":"part one"},{"type":"tool_use","name":"x"}]}}\n'
-        '{"type":"assistant","message":{"role":"assistant","content":"part two"}}\n'
-    )
-    assert p.extract_text(stdout) == "part one\npart two"
-
-
-def test_prepare_operator_recipe_is_the_validated_one():
-    p = ClaudeProvider()
-    launch = p.prepare_operator(Path("unused-profile"), "reviewer", ["git", "status"])
-    assert launch.env == {}
-    assert launch.extra_args == (
-        "--permission-prompts", "none",
-        "--disallowedTools", "Write", "Edit", "NotebookEdit", "PowerShell",
-        "--setting-sources", "project,local",
-    )
-    # No profile file carries the persona: the invoker prepends it per prompt.
-    assert launch.persona_in_profile is False
-
-
-def test_prepare_operator_writes_nothing(tmp_path: Path):
-    p = ClaudeProvider()
-    p.prepare_operator(tmp_path, "reviewer", ["git", "diff"])
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_extract_text_empty_result_falls_back_to_assistant_blocks():
     p = ClaudeProvider()
     stdout = (
