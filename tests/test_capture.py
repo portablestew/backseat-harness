@@ -108,10 +108,15 @@ def test_loop_survives_capture_failure(config, task, stub_history, monkeypatch):
     assert not paths.transcript.exists()
 
 
-def test_plan_phase_writes_no_transcript(config, task, stub_history):
-    """The plan phase has no managed turn, so no capture and no transcript line."""
+def test_plan_phase_on_a_fresh_task_writes_no_transcript(config, task, stub_history):
+    """A new task has no session, so there is nothing for the plan phase to capture.
+
+    The plan phase does capture when resuming; on a fresh task the history lookup
+    for the just-minted root UUID comes back empty, so no file is written and the
+    prompt names none.
+    """
     slug, paths = task
-    stub_history["transcript"] = "## USER\ngo\n\n## ASSISTANT\nx"
+    stub_history["transcript"] = ""  # nothing stored: this root has never run
     prompts: list[str] = []
 
     def operator_invoker(prompt: str) -> str:
@@ -122,3 +127,43 @@ def test_plan_phase_writes_no_transcript(config, task, stub_history):
     assert result.status is TaskStatus.BLOCKED
     assert not paths.transcript.exists()
     assert "Full session transcript" not in prompts[0]
+
+
+def test_plan_phase_on_resume_names_the_transcript(config, task, stub_history):
+    """Re-planning gets the same untruncated record reviewing does.
+
+    On a resume the operator is re-deciding the task with no turn to grade, so
+    the session transcript is the only evidence available -- and the file left on
+    disk by the last managed turn (or a takeover) predates whatever advanced the
+    session since, so the plan phase re-captures before the call.
+    """
+    from backseat_harness import storage
+    from backseat_harness.models import Binding, Generation, TaskState
+
+    slug, paths = task
+    storage.save_binding(
+        paths,
+        Binding(
+            root_uuid="root-1",
+            provider="fake",
+            generations=[Generation(n=1, native_id="ses_old")],
+        ),
+    )
+    storage.save_state(paths, TaskState(slug=slug, iteration=1, generation=1))
+    stub_history["transcript"] = (
+        "## USER\n<meta>START SESSION root-1 #1</meta>\ngo\n\n"
+        "## ASSISTANT\nTOOL_RESULT\n> FULL UNTRUNCATED OUTPUT"
+    )
+    prompts: list[str] = []
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"ask_human","notes":"which framework?"}'
+
+    result = run_task(slug, config, FakeProvider(), _runner_ok, operator_invoker)
+    assert result.status is TaskStatus.BLOCKED
+    assert "FULL UNTRUNCATED OUTPUT" in paths.transcript.read_text(encoding="utf-8")
+    assert "Full session transcript" in prompts[0]
+    assert "transcript.md`" in prompts[0]
+    # Redaction still applies: the operator must never see the raw root UUID.
+    assert "root-1" not in prompts[0]

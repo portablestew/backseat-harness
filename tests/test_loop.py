@@ -8,7 +8,13 @@ from conftest import FakeProvider
 from backseat_harness import storage
 from backseat_harness.history import SessionInfo
 from backseat_harness.loop import run_task
-from backseat_harness.models import TaskStatus, VerdictKind
+from backseat_harness.models import (
+    Binding,
+    Generation,
+    TaskState,
+    TaskStatus,
+    VerdictKind,
+)
 from backseat_harness.providers.base import TurnResult
 
 
@@ -23,6 +29,16 @@ def _managed_runner_ok(provider, spec):
         exit_code=0, timed_out=False, duration_s=0.1,
         native_session_id="sess-1", stdout="", stderr="",
     )
+
+
+def _spec_logger(seen):
+    """A runner that records each spawn's extra_args, then behaves normally."""
+
+    def runner(prov, spec):
+        seen.append(spec.extra_args)
+        return _managed_runner_ok(prov, spec)
+
+    return runner
 
 
 def test_loop_completes_on_done_verdict(config, task):
@@ -163,6 +179,61 @@ def test_oversized_session_starts_a_new_generation(config, task, _history):
     assert storage.load_state(paths, slug).generation == 2
 
 
+def test_resume_compacts_on_a_session_the_human_advanced(config, task, _history):
+    """The recorded size goes stale when no managed turn did the updating.
+
+    Only ``_record_native`` refreshes ``transcript_bytes``, and it runs after a
+    managed turn -- so a ``takeover`` the human drove by hand leaves the binding
+    describing the session as it was *before* they touched it. The resumed run
+    must re-read the size and compact, not resume the session it has now outgrown.
+    """
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, compact_threshold_bytes=1000)
+    provider = FakeProvider()
+
+    # What the previous run recorded before the takeover: small, resumable.
+    storage.save_binding(
+        paths,
+        Binding(
+            root_uuid="root-1",
+            provider="fake",
+            generations=[Generation(n=1, native_id="ses_old", transcript_bytes=10)],
+        ),
+    )
+    storage.save_state(paths, TaskState(slug=slug, iteration=1, generation=1))
+
+    # What history says now: the human's own turns pushed it over the threshold.
+    _history["fork"] = "PRIOR TRANSCRIPT"
+    _history["session"] = SessionInfo(
+        key="fake_history:ses_old",
+        native_id="ses_old",
+        size_bytes=5000,
+        mtime=0.0,
+    )
+
+    seen: list[tuple[str, str | None]] = []
+
+    def runner(prov, spec):
+        seen.append((spec.prompt, spec.resume_native_id))
+        return _managed_runner_ok(prov, spec)
+
+    verdicts = iter([
+        '{"verdict":"continue","next_prompt":"keep going"}',
+        '{"verdict":"done"}',
+    ])
+
+    run_task(slug, config, provider, runner, lambda p: next(verdicts))
+
+    # The very first resumed turn already compacts: a fresh session seeded with
+    # the fork and marker #2, not a resume into the bloated ses_old.
+    assert seen[0][1] is None
+    assert "#2" in seen[0][0]
+    assert "PRIOR TRANSCRIPT" in seen[0][0]
+    assert storage.load_binding(paths).current.n == 2
+
+
 def test_managed_model_flag_is_passed(config, task):
     """A dedicated [harness] model is forwarded to the managed turn as --model."""
     from dataclasses import replace
@@ -218,6 +289,1353 @@ def test_managed_flags_keep_declared_order(config, task):
         lambda p: '{"verdict":"done"}', first_prompt="go",
     )
     assert seen["extra_args"] == ("--flag", "x", "--model", "m", "--agent", "a")
+
+
+# --- Per-turn model-slot resolution (docs 2-plan §3) ---
+
+
+def test_active_step_slot_resolves_and_recomputes_each_turn(config, task):
+    """An active step's slot drives the turn's --model, and the checklist is
+    re-read every spawn: turn 1 (no steps) runs the default, turn 2 (s1 active
+    with a slot) runs the slot's model."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config,
+        model="cfg-model",
+        models={"default": "def-model", "thinker": "think-model"},
+    )
+    seen: list[tuple] = []
+
+    verdicts = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "thinker"},
+            }},
+        }),
+        '{"verdict":"done"}',
+    ])
+
+    def runner(prov, spec):
+        seen.append(spec.extra_args)
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner, lambda p: next(verdicts),
+        first_prompt="step 1",
+    )
+
+    assert seen == [
+        ("--model", "def-model"),  # turn 1: no active step -> default binding
+        ("--model", "think-model"),  # turn 2: s1 active with slot 'thinker'
+    ]
+
+
+def test_active_step_slot_overrides_and_extra_args_keep_order(config, task):
+    """Resolution recomputes the whole extra_args tuple: owner flags first, the
+    turn's --model after (E8: the slot append wins over owner's --model), then
+    the agent flag."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config,
+        extra_args=("--flag", "x", "--model", "owner-baseline"),
+        agent="my-builder",
+        model="cfg-model",
+        models={"fast": "fast-model"},
+    )
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+
+    seen = {}
+
+    def runner(prov, spec):
+        seen["extra_args"] = spec.extra_args
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen["extra_args"] == (
+        "--flag", "x", "--model", "owner-baseline", "--model", "fast-model",
+        "--agent", "my-builder",
+    )
+
+
+def test_model_fallback_chain_default_slot_then_config_model(config, task):
+    """No active step: [models].default wins; without it config.model; with
+    neither the flag is omitted entirely."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, model="cfg-model", models={"default": "def-model"})
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "def-model")]
+
+    seen.clear()
+    config = replace(config, models={})  # no default slot -> falls to config.model
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]
+
+    seen.clear()
+    config = replace(config, model=None)  # and without config.model -> no flag
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [()]
+
+
+def test_multi_active_disagreement_picks_first_and_warns(config, task, capsys):
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "first-slot"},
+            "s2": {"status": "active", "model": "second-slot"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(
+        config,
+        model="cfg-model",
+        models={"first-slot": "first-model", "second-slot": "second-model"},
+    )
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    # First active in insertion order wins.
+    assert seen == [("--model", "first-model")]
+    err = capsys.readouterr().err
+    assert "s1: 'first-slot'" in err and "s2: 'second-slot'" in err
+    assert "disagree" in err
+
+
+def test_agreeing_multi_active_runs_that_slot_without_warning(
+    config, task, capsys
+):
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "fast"},
+            "s2": {"status": "active", "model": "fast"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, models={"fast": "fast-model"})
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "fast-model")]
+    assert "disagree" not in capsys.readouterr().err
+
+
+# --- Finding 5: the disagreement reaches the operator prompt too (plan §4) ---
+
+
+def _disagreement(*pairs: tuple[str, str | None]) -> str:
+    """The exact sentence the loop composes for these active-step pairs."""
+    detail = ", ".join(f"{sid}: {model!r}" for sid, model in pairs)
+    return (
+        f"active steps disagree on a model slot ({detail}); using the first "
+        "active step's slot for this turn"
+    )
+
+
+def test_disagreement_reaches_the_operator_prompt(config, task, capsys):
+    """Two active steps naming different slots warn on stderr AND in the
+    operator prompt. The deterministic first-active pick is the harness's
+    tie-break, not an answer: the operator is the only party who can resolve
+    the ambiguity, which is what plan §4 asked for."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "fast"},
+            "s2": {"status": "active", "model": "slow"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(
+        config, model="cfg-model",
+        models={"fast": "fast-model", "slow": "slow-model"},
+    )
+    seen: list[tuple] = []
+    prompts: list[str] = []
+    responses = iter([
+        '{"verdict":"continue","next_prompt":"step 2"}',
+        '{"verdict":"done"}',
+    ])
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), next(responses))[1],
+        first_prompt="go",
+    )
+    # First active still wins the turn, unchanged.
+    assert seen == [("--model", "fast-model"), ("--model", "fast-model")]
+    note = _disagreement(("s1", "fast"), ("s2", "slow"))
+    # stderr is byte-for-byte what it was before the fix.
+    assert f"[warn] task: {note}" in capsys.readouterr().err
+    # And every turn until the checklist agrees -- not one-shot.
+    assert len(prompts) == 2
+    assert all(f"Slot warning: {note}" in p for p in prompts)
+
+
+def test_disagreement_reaches_the_plan_phase_prompt(config, task, capsys):
+    """The default resume path is where an ambiguous checklist is most likely
+    found: two steps left active, the run interrupted. The re-planning operator
+    is the one who can fix it, so the same sentence belongs in its prompt."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "fast"},
+            "s2": {"status": "active", "model": "slow"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(
+        config, model="cfg-model",
+        models={"fast": "fast-model", "slow": "slow-model"},
+    )
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+    )
+    note = _disagreement(("s1", "fast"), ("s2", "slow"))
+    assert "Your task: plan" in prompts[0]
+    assert f"Slot warning: {note}" in prompts[0]
+    assert f"[warn] task: {note}" in capsys.readouterr().err
+
+
+def test_kiro_advisory_and_disagreement_both_reach_the_prompt(config, task, capsys):
+    """The kiro branch overwrote slot_warning wholesale. A turn that is
+    slot-sourced on kiro AND ambiguous must carry both sentences in one prompt:
+    the harness picked one of two models and is saying so, *and* the provider
+    will ignore the flag either way. Losing either would be losing half the
+    truth about the turn."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "fast"},
+            "s2": {"status": "active", "model": "slow"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(
+        config, provider="kiro", model="cfg-model",
+        models={"fast": "fast-model", "slow": "slow-model"},
+    )
+    prompts: list[str] = []
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    kiro = (
+        "provider kiro does not honor --model; step 's1' slot 'fast' will run "
+        "on kiro's default routing anyway"
+    )
+    note = _disagreement(("s1", "fast"), ("s2", "slow"))
+    prompt = prompts[-1]
+    # One line carrying both -- composed, not one replacing the other.
+    assert prompt.count("Slot warning:") == 1
+    assert f"Slot warning: {kiro}; {note}" in prompt
+    # The flag is still composed and the slot-sourced provenance still keys.
+    assert seen == [("--model", "fast-model")]
+    err = capsys.readouterr().err
+    assert "[warn] provider kiro does not honor --model" in err
+    assert f"[warn] task: {note}" in err
+
+
+def test_bad_slot_and_disagreement_both_reach_the_prompt(config, task, capsys):
+    """Two causes on one turn must both survive. The disagreement is collected
+    before the step's own slot is read, so without accumulation exactly one of
+    the two would have been the only thing reported."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {
+            "s1": {"status": "active", "model": "ghost"},
+            "s2": {"status": "active", "model": "fast"},
+        },
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    note = _disagreement(("s1", "ghost"), ("s2", "fast"))
+    bad = (
+        "step 's1' names model slot 'ghost', which no [models] config "
+        "defines; running the default model instead"
+    )
+    prompt = prompts[-1]
+    assert prompt.count("Slot warning:") == 1
+    assert f"Slot warning: {note}; {bad}" in prompt
+    assert seen == [("--model", "cfg-model")]
+    err = capsys.readouterr().err
+    assert f"[warn] task: {note}" in err
+    assert f"[warn] task: {bad}" in err
+
+
+# --- [models].default that binds no model id: never silent (both return sites)
+
+
+def test_unusable_default_binding_composes_harness_model_with_no_active_step(
+    config, task, capsys
+):
+    """The no-active-step return site. An empty [models].default used to hand
+    back '' and compose no --model at all, on a run whose [harness].model was
+    set, with nothing on any channel. Now that model is composed and the
+    deviation is named. load_config already drops such a pair, so this is a
+    Config built directly -- the same door the empty named slot had."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, model="cfg-model", models={"default": ""})
+    prompts: list[str] = []
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]
+    warning = (
+        "[models] default is '', not a model id; using [harness].model "
+        "('cfg-model') instead"
+    )
+    assert f"[warn] config: {warning}" in capsys.readouterr().err
+    assert f"Slot warning: {warning}" in prompts[-1]
+
+
+def test_unusable_default_binding_composes_harness_model_on_the_slot_fallback(
+    config, task, capsys
+):
+    """The same fix on the other return site: an active step naming no slot
+    falls through to the default binding, so the empty [models].default has to
+    be corrected there too, not only where nothing is active."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active"}}, "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"default": ""})
+    prompts: list[str] = []
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]
+    warning = (
+        "[models] default is '', not a model id; using [harness].model "
+        "('cfg-model') instead"
+    )
+    assert f"Slot warning: {warning}" in prompts[-1]
+    assert f"[warn] config: {warning}" in capsys.readouterr().err
+
+
+def test_usable_default_binding_is_composed_and_quiet(config, task, capsys):
+    """The bar for this fix: nothing that came through load_config changes. A
+    real [models].default is composed and silent; a Config with no `default`
+    key falls back to [harness].model and stays silent, exactly as before."""
+    from dataclasses import replace
+
+    slug, _ = task
+    seen: list[tuple] = []
+    prompts: list[str] = []
+
+    def one(config):
+        run_task(
+            slug, config, FakeProvider(), _spec_logger(seen),
+            lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+            first_prompt="go",
+        )
+
+    one(replace(config, model="cfg-model", models={"default": "models-default"}))
+    assert seen == [("--model", "models-default")]
+    assert "Slot warning:" not in prompts[-1]
+    assert "[warn]" not in capsys.readouterr().err
+
+    one(replace(config, model="cfg-model", models={"fast": "fast-model"}))
+    assert seen[-1] == ("--model", "cfg-model")
+    assert "Slot warning:" not in prompts[-1]
+    assert "[warn]" not in capsys.readouterr().err
+
+
+def test_non_string_model_treated_as_absent_with_warning(config, task, capsys):
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": 7}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model")
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]  # default binding, slot ignored
+    assert "'s1'" in capsys.readouterr().err
+
+
+def test_unknown_on_disk_slot_falls_back_with_warning(config, task, capsys):
+    """§5b disposition: default binding + stderr warn; prompt channel is step 6."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "ghost"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]
+    err = capsys.readouterr().err
+    assert "'ghost'" in err and "'s1'" in err
+
+
+def test_slot_with_empty_binding_warns_instead_of_silently_dropping_the_flag(
+    config, task, capsys
+):
+    """A [models] value that is not a model id cannot compose a --model: "" is
+    falsy at the spawn site, so the pair resolves to nothing and the step would
+    silently run the CLI's own default. Naming such a slot falls back loudly on
+    both channels instead. load_config drops these pairs at parse; this pins
+    the resolution half for a Config that reached the loop some other way."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(
+        config, model="cfg-model", models={"fast": "", "thinker": "t-model"},
+    )
+    seen: list[tuple] = []
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    # The default binding is composed -- never an empty --model argument.
+    assert seen == [("--model", "cfg-model")]
+    warning = (
+        "step 's1' names model slot 'fast', whose [models] value is '', "
+        "not a model id; running the default model instead"
+    )
+    assert warning in capsys.readouterr().err
+    assert f"Slot warning: {warning}" in prompts[-1]
+    # A slot that does bind a model is unaffected by its neighbour's.
+    assert "- `thinker`" in prompts[-1]
+
+
+def test_empty_slot_binding_never_reaches_the_prompt_as_usable(config, task, capsys):
+    """End to end through the loader: `fast = ""` is dropped at parse, so the
+    name never becomes vocabulary -- the prompt neither lists it nor lets a
+    verdict set it as a valid slot. A step that still names it is treated
+    exactly like a typo'd slot: warned as unknown, on both channels."""
+    from backseat_harness.config import load_config
+
+    slug, paths = task
+    (config.workspace_root / ".backseat" / "config.toml").write_text(
+        '[harness]\nmodel = "cfg-model"\n[models]\nfast = ""\nkeep = "k-model"\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(config.workspace_root, slug)
+    assert loaded.models == {"keep": "k-model"}
+    capsys.readouterr()  # the parse warning, asserted in test_config
+
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    prompts: list[str] = []
+    seen: list[tuple] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "fast"},
+            }},
+        }),
+        '{"verdict":"done"}',
+    ])
+
+    run_task(
+        slug, loaded, FakeProvider(), _spec_logger(seen),
+        lambda p: (prompts.append(p), next(responses))[1],
+        first_prompt="go",
+    )
+
+    # Not advertised: the prompt cannot route to a name with no model behind it.
+    assert "- `fast`" not in prompts[-1]
+    assert "- `keep`" in prompts[-1]
+    # And naming it is refused at the source, with the surviving slots listed.
+    assert "'fast' on step 's1'" in prompts[1]
+    assert "Valid slots: keep" in prompts[1]
+    # Never silent, and the flag composed is the default binding.
+    assert "which no [models] config defines" in capsys.readouterr().err
+    assert seen == [("--model", "cfg-model")]
+
+
+# --- Kiro v2 warning: stderr only, slot-sourced ids only (docs 2-plan §7) ---
+
+
+def test_kiro_warns_when_slot_supplies_the_model(config, task, capsys):
+    slug, paths = task
+    config = _kiro(config)
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = _models(config, {"fast": "fast-model"})
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "fast-model")]  # the flag is still composed
+    err = capsys.readouterr().err
+    assert "'s1'" in err and "'fast'" in err
+    assert "does not honor --model" in err
+
+
+def test_kiro_stays_quiet_when_model_comes_from_the_fallback(config, task, capsys):
+    """No slot involved -> the kiro warning must not fire (default path)."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, provider="kiro", model="cfg-model")
+    seen: list[tuple] = []
+
+    run_task(
+        slug, config, FakeProvider(), _spec_logger(seen),
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert seen == [("--model", "cfg-model")]
+    assert "does not honor --model" not in capsys.readouterr().err
+
+
+# --- Operator prompt carries slot vocabulary + warnings (docs 2-plan §4) ---
+
+
+def test_operator_prompt_lists_configured_slots(config, task):
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, model="m", models={"fast": "f-model", "thinker": "t-model"})
+    prompts: list[str] = []
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+    assert "## Model slots" in prompts[-1]
+    assert "- `fast`" in prompts[-1]
+    assert "- `thinker`" in prompts[-1]
+    # The default binding bullet renders even though no 'default' key was set.
+    assert "- `default`" in prompts[-1]
+
+
+def test_on_disk_bad_slot_reaches_the_operator_prompt(config, task, capsys):
+    """§5b: the unknown-slot warning goes to stderr AND the operator prompt."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "ghost"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    review_prompt = prompts[-1]
+    assert "## Model slots" in review_prompt
+    assert (
+        "Slot warning: step 's1' names model slot 'ghost', which no [models] "
+        "config defines; running the default model instead"
+    ) in review_prompt
+    # Still warned on stderr, never silent.
+    assert "does not honor" not in capsys.readouterr().err
+
+
+def test_kiro_slot_warning_reaches_the_operator_prompt(config, task, capsys):
+    """§7: the kiro limitation warning lands in the review prompt verbatim."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config, provider="kiro",
+        model="cfg-model", models={"fast": "fast-model"},
+    )
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    review_prompt = prompts[-1]
+    assert (
+        "Slot warning: provider kiro does not honor --model; step 's1' slot "
+        "'fast' will run on kiro's default routing anyway"
+    ) in review_prompt
+    assert "will run on kiro's default routing anyway" in capsys.readouterr().err
+
+
+def test_clean_turn_carries_no_slot_warning(config, task, capsys):
+    """No bad slot, no kiro: the Model slots section renders sans warning."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    assert "## Model slots" in prompts[-1]
+    assert "Slot warning:" not in prompts[-1]
+
+
+# --- Bad slot in the verdict: reject / re-ask once / strip (docs 2-plan §5a) ---
+
+
+def test_bad_slot_in_verdict_rejected_and_reasked_once(config, task):
+    """A verdict naming an unknown slot is rejected wholesale; the operator is
+    re-invoked exactly once with a postscript on the SAME assembled prompt
+    naming the field and the valid slots."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {
+                "s1": {"status": "done", "model": "ghost"},
+            }},
+        }),
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {
+                "s1": {"status": "done", "model": "fast"},
+            }},
+        }),
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.COMPLETE
+    # Reject + one re-ask, no more.
+    assert len(prompts) == 2
+    assert prompts[1].startswith(prompts[0] + "\n\nYour checklist_update set")
+    assert "'ghost' on step 's1'" in prompts[1]
+    assert 'Valid slots: fast (or "default"; omit for the default model).' in prompts[1]
+    assert "Output the JSON object only." in prompts[1]
+    # The clean retry was persisted verbatim, slot intact.
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"]["s1"] == {"status": "done", "model": "fast"}
+
+
+def test_clean_verdict_is_not_reinvoked(config, task):
+    """No slot in the delta, no re-ask: exactly one operator call per turn."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.COMPLETE
+    assert len(prompts) == 1
+    assert "Your checklist_update set" not in prompts[0]
+
+
+def test_reask_still_bad_accepts_strips_and_warns(config, task, capsys):
+    """A re-ask that still names a bad slot is accepted with the model key
+    stripped before merge: the bad key never reaches disk, stderr names the
+    step ids and values dropped."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {
+                "s1": {"status": "done", "model": "ghost"},
+            }},
+        }),
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {
+                "s1": {"status": "done", "model": "phantom"},
+            }},
+        }),
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    # Strike three: accepted anyway (slot hygiene must not couple to turn flow).
+    assert result.status is TaskStatus.COMPLETE
+    assert len(prompts) == 2  # reject + one re-ask, then accept
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"]["s1"] == {"status": "done"}  # model key stripped
+    assert "model" not in data["steps"]["s1"]
+    err = capsys.readouterr().err
+    assert "still named unknown model slot(s)" in err
+    # 'ghost' was rejected outright; only the accepted retry's 'phantom' was dropped.
+    assert "'phantom' on step 's1'" in err
+    assert "model" not in data["steps"]["s1"]
+
+
+def test_stripped_slot_residue_rides_the_next_prompt(config, task, capsys):
+    """The residue warning is carried across turns inside run_task and surfaces
+    once, via the slot_warning channel, in the next operator prompt."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    seen: list[tuple] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "ghost"},
+            }},
+        }),
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 3",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "ghost"},
+            }},
+        }),
+        '{"verdict":"done"}',
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    def runner(prov, spec):
+        seen.append(spec.extra_args)
+        return _managed_runner_ok(prov, spec)
+
+    result = run_task(
+        slug, config, FakeProvider(), runner, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.COMPLETE
+    assert len(prompts) == 3  # review 1, its re-ask, review 2
+    # The first prompt was clean; the residue lands on the next one only.
+    assert "Slot warning:" not in prompts[0]
+    assert (
+        "Slot warning: operator verdict still named unknown model slot(s) "
+        "after 1 re-ask(s), dropping: 'ghost' on step 's1'" in prompts[2]
+    )
+    # Turn 2 ran the stripped step on the default binding (no slot left).
+    assert seen[1] == ("--model", "cfg-model")
+    assert "still named unknown model slot(s)" in capsys.readouterr().err
+
+
+def test_slot_reask_budget_is_separate_from_parse_reask(config, task):
+    """An operator that needs both gets both: the parse re-ask inside op.review
+    keeps its exact contract, and the slot re-ask reuses the ORIGINAL prompt,
+    not the parse-re-asked one."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        "this is prose with no json",  # unparseable -> op.review parse re-ask
+        json.dumps({                    # parses, but names a bad slot
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "ghost"},
+            }},
+        }),
+        json.dumps({                    # clean slot retry -> accepted
+            "verdict": "done",
+            "checklist_update": {"steps": {"s1": {"status": "done"}}},
+        }),
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.COMPLETE
+    assert len(prompts) == 3
+    # Parse re-ask untouched (same base prompt + its one exact suffix).
+    assert prompts[1] == prompts[0] + "\n\nOutput the JSON object only, no prose."
+    # Slot re-ask is a separate budget on the original assembled prompt.
+    assert prompts[2].startswith(prompts[0] + "\n\nYour checklist_update set")
+    assert "Output the JSON object only, no prose." not in prompts[2]
+    assert "'ghost' on step 's1'" in prompts[2]
+
+
+def test_plan_phase_bad_slot_is_rejected_too(config, task):
+    """§5a wraps both call sites: the plan phase is where the operator first
+    writes steps, so a bad slot there is rejected before any persist."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "research the router",
+            "checklist_update": {"steps": {
+                "research": {"title": "Find it", "status": "active", "model": "ghost"},
+            }},
+        }),
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "research the router",
+            "checklist_update": {"steps": {
+                "research": {"title": "Find it", "status": "active", "model": "fast"},
+            }},
+        }),
+        '{"verdict":"done"}',
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(slug, config, FakeProvider(), _managed_runner_ok, operator_invoker)
+
+    assert result.status is TaskStatus.COMPLETE
+    assert "Your task: plan" in prompts[0]
+    assert prompts[1].startswith(prompts[0] + "\n\nYour checklist_update set")
+    assert "'ghost' on step 'research'" in prompts[1]
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"]["research"]["model"] == "fast"
+
+
+def test_plan_phase_warns_on_both_channels_for_an_on_disk_bad_slot(
+    config, task, capsys
+):
+    """§5b in the plan phase: this is the default resume path (first_prompt
+    defaults to None) and its operator is the one whose job is to correct the
+    checklist, so an on-disk bad slot has to reach *this* prompt -- the review
+    phase meeting all three requirements is no help to a run that never gets
+    there. Both channels: a stderr [warn] and a Slot warning line."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "ghost"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({"verdict": "continue", "next_prompt": "go"}),
+        '{"verdict":"done"}',
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(slug, config, FakeProvider(), _managed_runner_ok, operator_invoker)
+
+    assert result.status is TaskStatus.COMPLETE
+    plan_prompt = prompts[0]
+    assert "Your task: plan" in plan_prompt  # this really is the plan phase
+    assert (
+        "Slot warning: step 's1' names model slot 'ghost', which no [models] "
+        "config defines; running the default model instead"
+    ) in plan_prompt
+    assert "which no [models] config defines" in capsys.readouterr().err
+    # One-shot, not carried: the review phase re-resolves from disk instead of
+    # stacking a second copy of the same sentence onto its prompt.
+    assert plan_prompt.count("Slot warning:") == 1
+    assert prompts[1].count("Slot warning:") == 1
+
+
+def test_clean_plan_phase_carries_no_slot_warning(config, task, capsys):
+    """Negative control for the above: a plan phase with a good slot on disk
+    resolves cleanly and must stay quiet on both channels."""
+    from dataclasses import replace
+
+    slug, paths = task
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+    )
+
+    assert "Your task: plan" in prompts[0]
+    assert "Slot warning:" not in prompts[0]
+    assert "names model slot" not in capsys.readouterr().err
+
+
+def test_verdict_naming_default_is_valid_without_a_default_key(config, task, capsys):
+    """Plan §1: naming "default" is the same as omitting the field, so it is
+    accepted even when [models] defines no default key — no re-ask, no strip,
+    and the on-disk step resolves silently to the default binding."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
+    prompts: list[str] = []
+    seen: list[tuple] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "default"},
+            }},
+        }),
+        '{"verdict":"done"}',
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    def runner(prov, spec):
+        seen.append(spec.extra_args)
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner, operator_invoker,
+        first_prompt="go",
+    )
+
+    # No reject/re-ask was fired for the literal default name.
+    assert len(prompts) == 2
+    assert all("Your checklist_update set" not in p for p in prompts)
+    # Merged verbatim, not stripped.
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"]["s1"]["model"] == "default"
+    # Turn 2 resolved through the default binding silently.
+    assert seen[1] == ("--model", "cfg-model")
+    err = capsys.readouterr().err
+    assert "names model slot" not in err
+    assert "not a configured slot" not in err
+
+
+def test_unparseable_reask_synthesizes_problem_without_persisting(config, task):
+    """The re-ask answering garbage follows the loop's standing unparseable
+    convention: PROBLEM is synthesized, nothing is persisted, no residue is
+    staged (nothing was stripped — the bad verdict was discarded whole)."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, models={"fast": "fast-model"}, max_iterations=1)
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {"s1": {"status": "done", "model": "ghost"}}},
+        }),
+        "still no json here",
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 2  # reject + the one re-ask
+    assert result.status is TaskStatus.BLOCKED
+    assert "max_iterations" in result.reason
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"] == {}  # the bad verdict was never merged
+
+
+def test_non_string_slot_in_verdict_is_bad_and_strips(config, task):
+    """§5a literal rule: any present value that is not an existing slot name is
+    bad — a JSON number where a slot belongs is rejected, then stripped."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {"s1": {"status": "done", "model": 7}}},
+        }),
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {"s1": {"status": "done", "model": 7}}},
+        }),
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 2
+    assert "'7' on step 's1'" in prompts[1]
+    data = json.loads(paths.checklist.read_text(encoding="utf-8"))
+    assert data["steps"]["s1"] == {"status": "done"}  # the 7 never hit disk
+
+
+def _models(config, models):
+    from dataclasses import replace
+
+    return replace(config, models=models)
+
+
+def _kiro(config):
+    from dataclasses import replace
+
+    return replace(config, provider="kiro")
+
+
+# --- PROBLEM re-send bounding (docs 2-plan §6) ---
+
+
+def test_problem_repeat_cap_blocks_before_max_iterations(config, task):
+    """A PROBLEM with no next_prompt re-sends the same prompt; the cap ends the
+    run at the Nth, long before max_iterations could."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, max_iterations=50, problem_repeat_cap=3)
+    prompts: list[str] = []
+
+    def runner(prov, spec):
+        prompts.append(spec.prompt)
+        return _managed_runner_ok(prov, spec)
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"problem","next_prompt":null,"notes":"that broke it"}'
+
+    result = run_task(
+        slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go"
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "problem stuck: same prompt resent 3 turns in a row"
+    # Three turns ran, not 50: the cap fired first.
+    assert result.iterations == 3
+    assert "max_iterations" not in result.reason
+    # Every turn re-sent the same prompt, which is what was counted. The cap
+    # keys on the *effective* next prompt, so it is unaffected by the marker the
+    # first turn prepends -- hence endswith rather than equality here.
+    assert len(prompts) == 3
+    assert all(p.endswith("go") for p in prompts)
+    assert prompts[1] == prompts[2]
+    # The blocking verdict is still on disk and ledgered: the cap is a loop
+    # bound, not a refusal to record what the operator said.
+    assert storage.load_state(paths, slug).reason == result.reason
+    assert len(list(storage.read_ledger(paths))) == 3
+
+
+def test_problem_repeat_cap_resets_on_continue(config, task):
+    """Two stuck PROBLEMs, then a continue: the count starts over, so the run
+    survives well past what an unbroken run of PROBLEMs would allow."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, max_iterations=50, problem_repeat_cap=3)
+    prompts: list[str] = []
+
+    def runner(prov, spec):
+        prompts.append(spec.prompt)
+        return _managed_runner_ok(prov, spec)
+
+    responses = iter([
+        '{"verdict":"problem","next_prompt":null}',   # repeat 1
+        '{"verdict":"problem","next_prompt":null}',   # repeat 2
+        '{"verdict":"continue","next_prompt":"new plan"}',  # resets
+        '{"verdict":"problem","next_prompt":null}',   # repeat 1 again
+        '{"verdict":"problem","next_prompt":null}',   # repeat 2 again
+        '{"verdict":"problem","next_prompt":null}',   # repeat 3 -> blocked
+        '{"verdict":"done"}',                          # must never be reached
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go"
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "problem stuck: same prompt resent 3 turns in a row"
+    # Six turns: 2 blocked, the continue reset, 3 more. Had the counter not
+    # reset, the run would have ended at turn 3.
+    assert result.iterations == 6
+    # The continue really did change what was sent, so the later PROBLEMs were
+    # repeats of "new plan", not of the original prompt. Turn 1's spawned text
+    # carries the marker (the cap counts the effective prompt, not that).
+    assert prompts[0].endswith("go")
+    assert prompts[1] == prompts[2] == "go"
+    assert prompts[3] == prompts[4] == prompts[5] == "new plan"
+
+
+def test_problem_repeat_cap_resets_on_a_differing_prompt(config, task):
+    """A PROBLEM that names a *new* prompt is recovery, not repetition: it
+    breaks the chain even though the verdict kind is unchanged."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, max_iterations=50, problem_repeat_cap=3)
+    prompts: list[str] = []
+
+    def runner(prov, spec):
+        prompts.append(spec.prompt)
+        return _managed_runner_ok(prov, spec)
+
+    responses = iter([
+        '{"verdict":"problem","next_prompt":null}',                # repeat 1
+        '{"verdict":"problem","next_prompt":"try this instead"}',  # differs -> reset
+        '{"verdict":"problem","next_prompt":null}',                # repeat 1 again
+        '{"verdict":"problem","next_prompt":null}',                # repeat 2 again
+        '{"verdict":"problem","next_prompt":null}',                # repeat 3
+        '{"verdict":"done"}',                                      # unreachable
+    ])
+
+    def operator_invoker(prompt: str) -> str:
+        return next(responses)
+
+    result = run_task(
+        slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go"
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "problem stuck: same prompt resent 3 turns in a row"
+    # Five turns: one repeat, then the differing PROBLEM reset the count, then
+    # three more. The differing PROBLEM has to come *after* a repeat, or the
+    # counter is already 0 and this proves nothing about resetting.
+    assert result.iterations == 5
+    assert prompts[0].endswith("go")
+    assert prompts[1] == "go"
+    assert prompts[2] == prompts[3] == prompts[4] == "try this instead"
+
+
+def test_problem_repeat_cap_zero_disables_and_max_iterations_governs(config, task):
+    """cap=0 is today's behavior: an unbounded run of identical-prompt PROBLEMs
+    is governed by max_iterations instead."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, max_iterations=4, problem_repeat_cap=0)
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"problem","next_prompt":null}'
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "max_iterations reached"
+    assert result.iterations == 4
+
+
+def test_negative_problem_repeat_cap_warns_and_leaves_max_iterations_governing(
+    config, task, fake_home, capsys
+):
+    """End to end: a typo'd negative cap is loud at config resolution, and the
+    run it produces is still bounded -- by max_iterations, since the cap is off.
+
+    Loaded from real TOML rather than a ``replace``, so the warning and the run
+    behavior are pinned on the same path a typo actually takes.
+    """
+    from dataclasses import replace
+
+    from backseat_harness.config import load_config
+
+    slug, _ = task
+    ws = config.workspace_root
+    (ws / ".backseat" / "config.toml").write_text(
+        "[harness]\nproblem_repeat_cap = -2\nmax_iterations = 4\n", encoding="utf-8"
+    )
+    resolved = replace(load_config(ws, slug, home=fake_home), provider="fake")
+
+    assert resolved.problem_repeat_cap == -2
+    err = capsys.readouterr().err
+    assert "[warn] config: [harness] problem_repeat_cap = -2 is negative" in err
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"problem","next_prompt":null}'
+
+    result = run_task(
+        slug, resolved, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "max_iterations reached"
+    assert result.iterations == 4
+
+
+def test_unparseable_verdicts_are_bounded_by_the_repeat_cap(config, task):
+    """The synthesized PROBLEM for an unparseable verdict re-sends the identical
+    prompt by definition -- exactly the shape the cap names, so the operator
+    answering with prose forever ends the run instead of the max_iterations."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, max_iterations=50, problem_repeat_cap=3)
+
+    def operator_invoker(prompt: str) -> str:
+        return "I would rather not answer in JSON today."
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.reason == "problem stuck: same prompt resent 3 turns in a row"
+    assert result.iterations == 3
+
+
+def test_default_problem_repeat_cap_is_three(config, task):
+    """The cap is on by default -- a task that never configures it still gets
+    the bound rather than today's unbounded re-send."""
+    slug, _ = task
+
+    assert config.problem_repeat_cap == 3
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"problem","next_prompt":null}'
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert result.reason == "problem stuck: same prompt resent 3 turns in a row"
+    assert result.iterations == 3
 
 
 def test_reset_context_abandons_session(config, task):

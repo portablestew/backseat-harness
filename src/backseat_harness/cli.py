@@ -88,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_init(args) -> int:
-    config = load_config(args.workspace)
+    config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     paths.root.mkdir(parents=True, exist_ok=True)
     if not paths.meta.exists():
@@ -104,7 +104,7 @@ def _cmd_init(args) -> int:
 
 
 def _cmd_run(args) -> int:
-    config = load_config(args.workspace)
+    config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     error = _ensure_meta(paths, args.meta)
     if error:
@@ -151,7 +151,7 @@ def _cmd_takeover(args) -> int:
     """
     from backseat_harness import storage
 
-    config = load_config(args.workspace)
+    config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     if not paths.meta.exists():
         _emit(args, {"slug": args.slug, "error": "unknown task"}, f"No task '{args.slug}'")
@@ -191,7 +191,7 @@ def _cmd_takeover(args) -> int:
 def _cmd_status(args) -> int:
     from backseat_harness import storage
 
-    config = load_config(args.workspace)
+    config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     if not paths.state.exists():
         _emit(args, {"slug": args.slug, "status": "unknown"}, f"No state for task '{args.slug}'")

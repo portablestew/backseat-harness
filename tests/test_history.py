@@ -72,3 +72,112 @@ def test_load_full_transcript_returns_load_chat_string(monkeypatch):
         history, "_load", lambda attr: (lambda search, providers=None: "## USER\nrendered")
     )
     assert history.load_full_transcript("root", "opencode") == "## USER\nrendered"
+
+
+# --- Contention: retry, then degrade (never crash a running lane) ---
+
+
+def _stub_lib(monkeypatch, fn):
+    """Point the whole seam at a fake chat-mother-forker entry point."""
+    monkeypatch.setattr(history, "_scoped", lambda provider: ["provider"])
+    monkeypatch.setattr(history, "_load", lambda attr: fn)
+
+
+def _no_sleep(monkeypatch) -> list:
+    """Record requested delays instead of actually waiting."""
+    slept: list = []
+    monkeypatch.setattr(history.time, "sleep", slept.append)
+    return slept
+
+
+class _Ref:
+    """Minimal stand-in for chat-mother-forker's ChatRef."""
+
+    def __init__(self):
+        self.key = "opencode:ses_1"
+        self.session = "ses_1"
+        self.size_bytes = 4096
+        self.mtime = 1.0
+        self.project = None
+
+
+def test_contended_read_is_retried_and_still_answers(monkeypatch, capsys):
+    """Two transient failures then success: the caller never learns there was one.
+
+    This is the real shape of the failure -- a read-only opencode connection
+    racing the live CLI's writer over a WAL database, which surfaces as
+    ``sqlite3.OperationalError: disk I/O error``.
+    """
+    calls = []
+
+    def flaky(search, providers=None, limit=None):
+        calls.append(limit)
+        if len(calls) < 3:
+            raise OSError("disk I/O error")
+        return [_Ref()]
+
+    _stub_lib(monkeypatch, flaky)
+    slept = _no_sleep(monkeypatch)
+
+    info = history.find_session("root", "opencode")
+
+    assert info.native_id == "ses_1"
+    assert info.size_bytes == 4096
+    assert len(calls) == 3
+    # One second between attempts, and only between them.
+    assert slept == [history.RETRY_DELAY_S, history.RETRY_DELAY_S]
+    assert capsys.readouterr().err.count("retrying") == 2
+
+
+def test_gives_up_after_the_attempt_budget_and_falls_back(monkeypatch, capsys):
+    """A store that stays unreadable degrades to 'no session', loudly."""
+    def always_fails(search, providers=None, limit=None):
+        raise OSError("disk I/O error")
+
+    _stub_lib(monkeypatch, always_fails)
+    slept = _no_sleep(monkeypatch)
+
+    assert history.find_session("root", "opencode") is None
+    assert len(slept) == history.RETRY_ATTEMPTS - 1  # no sleep after the last try
+    err = capsys.readouterr().err
+    assert "after 3 attempts" in err
+    assert "disk I/O error" in err
+
+
+def test_fork_and_transcript_degrade_to_empty(monkeypatch, capsys):
+    """The two rendering reads fall back to "", each already documented for it.
+
+    An empty fork means the compaction preamble is skipped and the operator
+    reviews without its transcript -- a weak turn, not a dead lane.
+    """
+    def always_fails(search, providers=None, limit=None):
+        raise OSError("disk I/O error")
+
+    _stub_lib(monkeypatch, always_fails)
+    _no_sleep(monkeypatch)
+
+    assert history.fork_session("root", "opencode") == ""
+    assert history.load_full_transcript("root", "opencode") == ""
+    assert "continuing without it" in capsys.readouterr().err
+
+
+def test_history_error_is_raised_not_retried(monkeypatch, capsys):
+    """A misconfigured provider is a config bug, not contention: fail at once.
+
+    Retrying it would spend two wasted seconds and then hand the caller a
+    fallback that looks like "no session yet" -- a lane that can never compact,
+    with the real cause buried under three warnings.
+    """
+    calls = []
+
+    def misconfigured(search, providers=None, limit=None):
+        calls.append(limit)
+        raise history.HistoryError("chat-mother-forker has no provider named 'nope'")
+
+    _stub_lib(monkeypatch, misconfigured)
+    slept = _no_sleep(monkeypatch)
+
+    with pytest.raises(history.HistoryError, match="no provider named"):
+        history.find_session("root", "opencode")
+    assert len(calls) == 1
+    assert slept == []

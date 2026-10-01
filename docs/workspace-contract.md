@@ -2,8 +2,10 @@
 
 This is the stable on-disk seam between backseat-harness and anything that wants
 to orchestrate it (a workspace-templates tool, CI, a human running `tail -f`).
-The harness is the **only writer** to these files. Every file is plain JSON /
-TOML / Markdown so a parent workflow can read state without importing the loop.
+The harness is the **only writer** to these files — with one exception:
+`config.toml`, at every layer, is read-only input the harness never writes. Every
+file is plain JSON / TOML / Markdown so a parent workflow can read state without
+importing the loop.
 
 All files carry a `"v"` schema version (currently `1`). Unknown top-level
 sections are ignored, not rejected.
@@ -14,6 +16,7 @@ sections are ignored, not rejected.
   tasks/
     <task-slug>/             # one lane = one meta-prompt goal
       meta.md                # the meta-prompt (free text)
+      config.toml            # optional per-task overrides (highest config layer)
       checklist.json         # durable, append-only-in-spirit progress map
       binding.json           # root_uuid -> generation chain (recoverable cache)
       ledger.jsonl           # append-only, one line per completed iteration
@@ -28,6 +31,17 @@ for v0.1, but `task_dir` is a parameter from day one so it stays cheap to add.
 
 ## config.toml
 
+Config is layered, lowest precedence first:
+
+1. `~/.backseat/config.toml` (user)
+2. `<workspace>/.backseat/config.toml` (workspace)
+3. `<workspace>/.backseat/tasks/<slug>/config.toml` (task; loaded when a command
+   names a slug)
+
+Each layer overrides the ones below it. Arrays (`extra_args`, `verify_commands`)
+are **replaced wholesale**, never concatenated. A task layer may override
+anything, `[operator]` included. Every layer is read-only to the harness.
+
 ```toml
 [harness]
 provider = "opencode"          # managed-agent CLI (opencode | claude | kiro)
@@ -39,6 +53,12 @@ compact_threshold_bytes = 1000000
 max_iterations = 50
 max_wall_clock_s = 86400
 max_generations = 20
+problem_repeat_cap = 3        # consecutive identical-prompt PROBLEMs before
+                              # BLOCKED as stuck; 0 = disabled (max_iterations)
+
+[models]                     # per-step model slots: slot-name = "model-id"
+fast = "..."                 # a step's `model` field names one of these keys
+default = "..."              # reserved: the binding for a step naming no slot
 
 [operator]
 provider = "opencode"          # operator CLI (may differ / be stronger)
@@ -48,7 +68,25 @@ extra_args = []                # optional, as above
 verify_commands = []           # optional: exact commands the operator may run itself
 ```
 
-The whole file is optional; code defaults apply to anything omitted.
+Every layer is optional; code defaults fill anything no layer sets.
+
+`[models]` is the per-step model vocabulary, and it is the one table that does
+not replace wholesale: a task layer rebinds one slot name and keeps the rest.
+Scalars and arrays are overridden per field.
+
+A key is a slot by virtue of existing — there is no fixed vocabulary — and its
+value is an opaque model id, passed verbatim to the managed CLI as
+`--model <id>`. `default` is the single reserved name, and it is what a step
+resolves to when it names no slot (or names the literal `"default"`, which is
+the same thing). A checklist step routes itself by setting `model` to one of
+these keys; see `checklist.json` below.
+
+A pair whose name or id is not a non-empty string is dropped at load, with a
+stderr warning naming the pair. That is deliberate, and it is the one rule here
+that is never silent: an empty id would otherwise be a slot the operator is
+offered in its prompt vocabulary which can produce no `--model` at all, so the
+step would quietly run the CLI's own default under a name that promised
+otherwise.
 
 Every turn runs auto-approved: a non-interactive process cannot answer a prompt,
 so the harness approves rather than block (opencode/claude) or silently deny
@@ -91,7 +129,9 @@ harness validates and merges it. Rules:
 
 - **Additive / no deletes.** `null` values are stripped before merge.
 - **Field whitelist** per step: `title`, `status`, `notes`, `evidence`,
-  `updated_at`. Unknown fields are dropped.
+  `updated_at`, `model`. Unknown fields are dropped. `model` is a pass-through
+  slot *name*, not a model id: it is resolved against `[models]` every turn
+  (never at merge), and stored here with no semantics of its own.
 - **Free status.** A step's `status` may be set to any of `pending`, `active`,
   `blocked`, or `done` at any time -- there is no forward-only ordering, so the
   operator can move a step back to redo it. Invalid values are ignored.
@@ -141,6 +181,13 @@ size, refreshed after each turn. The unit is provider-dependent — summed SQLit
 row bytes for opencode, file bytes for a JSONL-backed CLI — so compare it against
 `compact_threshold_bytes`, never across providers.
 
+Every chat-history read is retried (3 attempts, 1s apart) and then degraded, never
+fatal: the store belongs to the live managed CLI, which writes it while the harness
+reads it. Exhausting the attempts warns on stderr and yields "nothing there" — the
+size stands, the fork is empty, capture is skipped — so one contended read cannot
+end a lane. A misconfigured `history_provider` is the exception: it raises
+`HistoryError` immediately.
+
 ## state.json
 
 ```json
@@ -172,7 +219,10 @@ verdict queues none).
 ## transcript.md
 
 The full managed session, rendered by chat-mother-forker's `load_chat` and
-written **by the harness** after each managed turn. Unlike the compaction fork
+written **by the harness** after each managed turn, and again before a plan-phase
+operator call (a resume), so a re-planning operator gets the same record a
+reviewing one does — the file on disk would otherwise predate whatever advanced
+the session since, such as a takeover. Unlike the compaction fork
 (middle-truncated) and unlike `docs/` (managed-agent written), this is the
 complete, untruncated record — tool-call results included — so the operator can
 inspect what actually happened rather than an elided summary. One file,
@@ -180,7 +230,9 @@ overwritten each turn; compaction forks a fresh session per generation, so it
 tracks the current generation's work. The task's root UUID is redacted (the
 generation ordinal stays), so if the operator quotes the file its own stored
 session can't hijack the task's marker search. Best-effort: if history is
-unavailable, capture is skipped and the run continues.
+unavailable, capture is skipped and the run continues — including on a fresh
+task, where the just-minted root UUID has no session to capture, so the file is
+neither written nor named in the prompt.
 
 ## docs/
 

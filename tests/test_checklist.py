@@ -1,6 +1,8 @@
 """Checklist merge protocol: additive, whitelisted, free-status, no deletes."""
 
-from backseat_harness.checklist import Checklist, all_done, merge_update
+import json
+
+from backseat_harness.checklist import Checklist, all_done, merge_update, save_checklist
 
 
 def test_upsert_new_step():
@@ -12,6 +14,29 @@ def test_upsert_new_step():
 def test_unknown_fields_dropped():
     result = merge_update(Checklist(), {"steps": {"s1": {"status": "pending", "danger": "x"}}})
     assert "danger" not in result.steps["s1"]
+
+
+def test_model_slot_survives_merge_and_roundtrip(tmp_path):
+    delta = {"steps": {"s1": {"title": "Probe", "status": "active", "model": "thinker"}}}
+    result = merge_update(Checklist(), delta)
+    assert result.steps["s1"]["model"] == "thinker"
+    # Round-trips through the on-disk JSON form unmolested.
+    path = tmp_path / "checklist.json"
+    save_checklist(path, result)
+    assert json.loads(path.read_text(encoding="utf-8"))["steps"]["s1"]["model"] == "thinker"
+    reloaded = Checklist.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    assert reloaded.steps["s1"]["model"] == "thinker"
+
+
+def test_model_null_and_non_string_stripped():
+    # nulls are stripped like every other field (deletes are forbidden, so a
+    # slot is re-pointed, never removed); the value is loop-owned pass-through,
+    # so a non-string is merged verbatim like any other whitelisted field.
+    base = merge_update(Checklist(), {"steps": {"s1": {"model": "thinker", "status": "active"}}})
+    result = merge_update(base, {"steps": {"s1": {"model": None}}})
+    assert result.steps["s1"]["model"] == "thinker"  # null did not clear the slot
+    result2 = merge_update(Checklist(), {"steps": {"s1": {"model": 7}}})
+    assert result2.steps["s1"]["model"] == 7  # no semantics here; loop validates
 
 
 def test_null_values_stripped_not_deleting():

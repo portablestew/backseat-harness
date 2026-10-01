@@ -47,6 +47,25 @@ def workspace(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def fake_home(tmp_path: Path) -> Path:
+    """A throwaway home dir, distinct from the workspace, for the user layer."""
+    return tmp_path / "home"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_user_config(fake_home: Path, monkeypatch):
+    """Keep the suite from ever reading a real ``~/.backseat/config.toml``.
+
+    The loader resolves its default home through ``config._default_home``; pin
+    that seam per test so direct ``load_config`` calls and ``main([...])`` CLI
+    calls alike stay hermetic.
+    """
+    from backseat_harness import config as config_mod
+
+    monkeypatch.setattr(config_mod, "_default_home", lambda: fake_home)
+
+
+@pytest.fixture
 def config(workspace: Path) -> Config:
     return Config(workspace_root=workspace, provider="fake")
 

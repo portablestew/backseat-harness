@@ -54,7 +54,9 @@ Key decisions (see `docs/workspace-contract.md` for the full contract):
 - **History, not files.** Transcript size and fork rendering both come from
   chat-mother-forker, scoped to the managed CLI's own storage. The harness never
   stats a transcript file — opencode keeps sessions in SQLite, so there is no
-  file to stat.
+  file to stat. That store belongs to the *live* CLI, so reads are retried
+  (3 attempts, 1s apart) and a store that stays unreadable warns and degrades
+  rather than ending the run.
 - **Verdict on stdout.** The operator returns a JSON envelope
   (`verdict`, `next_prompt`, `checklist_update`, `notes`). The harness is the
   only writer to disk.
@@ -125,6 +127,16 @@ backseat-harness list
 
 Run everything against a specific workspace with `-C /path/to/workspace`.
 
+### Configuration
+
+Config resolves in three optional layers, higher layers overriding lower ones:
+`~/.backseat/config.toml` (user), `.backseat/config.toml` (workspace), and
+`.backseat/tasks/<slug>/config.toml` (task — loaded by `init`/`run`/`takeover`/
+`status`; `list` reads only the user and workspace layers). Arrays (`extra_args`,
+`verify_commands`) are **replaced wholesale**, never concatenated. A task layer
+may override anything, `[operator]` included. Every layer is read-only to the
+harness; code defaults fill anything no layer sets.
+
 ## Use as a library
 
 ```python
@@ -133,7 +145,8 @@ from backseat_harness.loop import run_task
 from backseat_harness.providers import get_provider
 from backseat_harness.spawn import run_turn
 
-config = load_config("/path/to/workspace")
+config = load_config("/path/to/workspace")                     # user + workspace layers
+config = load_config("/path/to/workspace", "hello-endpoint")   # + the task layer
 provider = get_provider(config.provider)
 
 result = run_task(

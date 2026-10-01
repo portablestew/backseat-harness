@@ -135,6 +135,69 @@ def test_verify_commands_listed_when_configured():
     assert "`pytest -q`" in build_prompt(inputs)
 
 
+# --- Model slots section + slot warning (docs 2-plan §4) ---
+
+
+def test_model_slots_rendered_with_default_binding_bullet():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+        model_slots=("default", "thinker"),
+    )
+    prompt = build_prompt(inputs)
+    assert "## Model slots" in prompt
+    assert "- `default`" in prompt
+    assert "- `thinker`" in prompt
+    # 'default' renders once: the binding bullet, not duplicated from the keys.
+    assert prompt.count("- `default`") == 1
+    assert 'omit `model` for the default' in prompt
+
+
+def test_model_slots_configured_key_skips_default_duplicate():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+        model_slots=("default", "fast", "thinker"),
+    )
+    prompt = build_prompt(inputs)
+    assert "- `fast`" in prompt and "- `thinker`" in prompt
+
+
+def test_model_slots_empty_renders_single_line():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+    )
+    prompt = build_prompt(inputs)
+    assert "## Model slots" in prompt  # the section itself always renders
+    assert 'No model slots are configured; steps must not set "model".' in prompt
+    assert "- `default`" not in prompt
+
+
+def test_slot_warning_reaches_the_prompt_verbatim():
+    warning = (
+        "step 's1' names model slot 'ghost', which no [models] config "
+        "defines; running the default model instead"
+    )
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+        model_slots=("fast",), slot_warning=warning,
+    )
+    prompt = build_prompt(inputs)
+    assert "Slot warning:" in prompt
+    assert warning in prompt
+
+
+def test_response_format_documents_the_model_field():
+    inputs = ReviewInputs(
+        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1,
+    )
+    prompt = build_prompt(inputs)
+    assert '"model": "optional slot name from the Model slots section' in prompt
+
+
 def test_persona_ships_with_package():
     from backseat_harness.operator import load_persona
 

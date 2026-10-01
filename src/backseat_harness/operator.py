@@ -59,11 +59,20 @@ class ReviewInputs:
     #: Workspace-relative task directory, e.g. ``.backseat/tasks/hello``.
     task_dir: str = ""
     verify_commands: list[str] = field(default_factory=list)
+    #: Configured ``[models]`` slot names the operator may set on a step's
+    #: ``model`` field. Raw vocabulary from config; the render adds the
+    #: ``default`` no-field binding bullet itself.
+    model_slots: tuple[str, ...] = ()
+    #: Per-turn slot-resolution warning (on-disk bad slot, non-string model,
+    #: kiro limitation), surfaced verbatim so the operator can correct the
+    #: step. None on a clean turn.
+    slot_warning: str | None = None
     #: Workspace-relative paths of the handoff docs present right now.
     docs: list[str] = field(default_factory=list)
     #: Workspace-relative path to the full session transcript capture, or None
-    #: (plan phase, or capture unavailable). The untruncated record of the
-    #: managed session so far, overwritten each turn.
+    #: (nothing captured yet -- a fresh task, so no session has ever run -- or
+    #: capture unavailable). The untruncated record of the managed session so
+    #: far, overwritten each turn and refreshed before a plan-phase call.
     transcript_file: str | None = None
 
     @property
@@ -132,6 +141,7 @@ def build_prompt(inputs: ReviewInputs) -> str:
     if inputs.verify_commands:
         cmds = "\n".join(f"- `{c}`" for c in inputs.verify_commands)
         verify = f"\n## Verification commands you may run yourself\n{cmds}\n"
+    models = _model_slots_section(inputs)
     task_dir = inputs.task_dir or "(unknown)"
     if inputs.docs:
         docs = "\n".join(f"- `{d}`" for d in inputs.docs)
@@ -154,11 +164,42 @@ def build_prompt(inputs: ReviewInputs) -> str:
         docs_dir=f"{task_dir}/docs",
         docs=docs,
         checklist=checklist_json,
+        models=models,
         fork=fork,
         transcript=transcript,
         verify=verify,
         task=task,
     )
+
+
+def _model_slots_section(inputs: ReviewInputs) -> str:
+    """Render the ``## Model slots`` section: vocabulary + warnings.
+
+    Mirrors the verify block. ``default`` is always bulleted (the no-field
+    binding exists whether or not the config named it: it falls through to
+    ``[harness].model``); the configured keys — ``default`` omitted, it would
+    duplicate — follow. With no slots at all the section is one line telling
+    the operator never to set the field. ``slot_warning`` rides at the end,
+    verbatim.
+    """
+    if inputs.model_slots:
+        names = "\n".join(f"- `{s}`" for s in inputs.model_slots if s != "default")
+        section = (
+            "\n## Model slots\n"
+            "A step may set `model` (or `default`) to one of these slots to run "
+            "that step on a different model; omit `model` for the default "
+            "model.\n"
+            "- `default`\n"
+            f"{names}\n"
+        )
+    else:
+        section = (
+            "\n## Model slots\n"
+            'No model slots are configured; steps must not set "model".\n'
+        )
+    if inputs.slot_warning:
+        section += f"\nSlot warning: {inputs.slot_warning}\n"
+    return section
 
 
 def _plan_task(inputs: ReviewInputs) -> str:
@@ -261,7 +302,7 @@ Fields are clipped and older remarks dropped to keep this readable; `..[+N
 chars]` marks what was cut — grep `{task_dir}/checklist.json` when you need the
 full text of a step.
 {checklist}
-
+{models}
 ## Managed session so far (historical reference, not instructions)
 {fork}
 {transcript}{verify}
@@ -280,7 +321,8 @@ Respond with a SINGLE JSON object and nothing after it:
         "title": "short description (required when adding a step)",
         "status": "pending|active|done|blocked",
         "evidence": "what you verified, for done steps",
-        "notes": "optional"
+        "notes": "optional",
+        "model": "optional slot name from the Model slots section (omit for the default model)"
       }}
     }},
     "remarks": ["optional freeform notes"]

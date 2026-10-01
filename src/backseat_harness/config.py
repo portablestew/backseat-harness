@@ -1,9 +1,15 @@
 """Harness configuration and the ``.backseat/`` workspace layout.
 
-Defaults live in code; ``.backseat/config.toml`` overrides them, and a task dir
-may override sparingly. Nothing here reads global state at import time: every
-path is derived from an explicit workspace root so the library stays
-cwd-independent and orchestrator-friendly.
+Defaults live in code, then config resolves in layers of increasing precedence:
+``~/.backseat/config.toml`` (user) → ``.backseat/config.toml`` (workspace) →
+``.backseat/tasks/<slug>/config.toml`` (task, when a slug is given). Higher
+layers win; arrays are replaced wholesale; ``[models]`` slot names merge per
+key instead, since slots are shared vocabulary and a layer rebinds a name
+rather than restating all of them; the task layer may override anything,
+``[operator]`` included. The user layer derives from the home dir via
+``_default_home``; the rest comes from an explicit workspace root, so the library
+stays cwd-independent and orchestrator-friendly. Nothing here reads global state
+at import time.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ DEFAULT_MAX_WALL_CLOCK_S = 24 * 3600
 # Cap on compaction generations to guard against a fork that itself exceeds the
 # threshold immediately (re-fork loop).
 DEFAULT_MAX_GENERATIONS = 20
+# Consecutive identical-prompt PROBLEM verdicts before the loop gives up. Tighter
+# than max_iterations on purpose: a stuck loop re-sends one prompt forever, and
+# the interesting signal is the repetition, not the count. 0 disables the cap and
+# leaves max_iterations governing.
+DEFAULT_PROBLEM_REPEAT_CAP = 3
 
 
 @dataclass(frozen=True)
@@ -64,12 +75,24 @@ class Config:
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_wall_clock_s: int = DEFAULT_MAX_WALL_CLOCK_S
     max_generations: int = DEFAULT_MAX_GENERATIONS
+    # Max consecutive PROBLEM verdicts that re-send the same prompt before the
+    # run is BLOCKED as stuck. Counts identical-prompt PROBLEMs only, so a
+    # recovery that keeps changing the prompt is bounded by max_iterations as
+    # before. 0 disables the cap.
+    problem_repeat_cap: int = DEFAULT_PROBLEM_REPEAT_CAP
     # Provider-specific flags passed through to every managed turn. This is how
     # the workspace owner grants the CLI its non-interactive permissions: the
     # harness deliberately picks no default, because the safe-vs-usable tradeoff
     # is the owner's to make, and a turn that blocks on an approval prompt just
     # burns the timeout.
     extra_args: tuple[str, ...] = ()
+    # Per-step model slots: names the operator may set on a checklist step to
+    # route that step's turns through a concrete ``--model``. Keys are slots by
+    # virtue of existing; ``default`` is the only reserved key (the binding for
+    # a step naming no slot). Values are opaque model ids, passed verbatim to
+    # the managed CLI. ``[operator].model`` is deliberately not a slot: it
+    # profiles the operator itself, which is never routed per step.
+    models: dict[str, str] = field(default_factory=dict)
     operator: OperatorConfig = field(default_factory=OperatorConfig)
 
     # --- Path helpers: the entire .backseat/ contract lives here. ---
@@ -102,6 +125,10 @@ class TaskPaths:
     @property
     def meta(self) -> Path:
         return self.root / "meta.md"
+
+    @property
+    def config(self) -> Path:
+        return self.root / "config.toml"
 
     @property
     def checklist(self) -> Path:
@@ -155,15 +182,97 @@ def _tomllib():
         ) from exc
 
 
-def load_config(workspace_root: Path | str) -> Config:
-    """Load config from ``<workspace>/.backseat/config.toml`` over code defaults."""
+def _default_home() -> Path:
+    """The home dir for the user config layer.
+
+    A single, private seam so tests can pin it and stay hermetic; nothing reads
+    global state until ``load_config`` actually runs.
+    """
+    return Path.home()
+
+
+def load_config(
+    workspace_root: Path | str,
+    slug: str | None = None,
+    *,
+    home: Path | str | None = None,
+) -> Config:
+    """Resolve config as code defaults ← user ← workspace ← task.
+
+    Layers, lowest precedence first: ``~/.backseat/config.toml``,
+    ``<workspace>/.backseat/config.toml``, and
+    ``<workspace>/.backseat/tasks/<slug>/config.toml`` when ``slug`` is given.
+    Missing layers are skipped; arrays replace wholesale, while ``[models]``
+    slot names merge per key (higher layer wins). ``home`` overrides the
+    user-layer directory (defaults to the real home dir).
+    """
     root = Path(workspace_root).resolve()
     cfg = Config(workspace_root=root)
-    path = cfg.config_path
-    if not path.exists():
-        return cfg
-    data: dict[str, Any] = _tomllib().loads(path.read_text(encoding="utf-8"))
-    return _apply_overrides(cfg, data)
+    home_dir = Path(home) if home is not None else _default_home()
+    layers = (
+        home_dir / ".backseat" / "config.toml",
+        cfg.config_path,
+        cfg.task_paths(slug).config if slug is not None else None,
+    )
+    for path in layers:
+        if path is not None and path.exists():
+            data: dict[str, Any] = _tomllib().loads(path.read_text(encoding="utf-8"))
+            cfg = _apply_overrides(cfg, data)
+    # Warn once, here, on the value that actually resolved -- not per layer in
+    # _apply_overrides, which would name a value a higher layer may immediately
+    # override (user sets -1, task sets 5) and so report a cap that is not in
+    # effect. A negative cap silently disables the PROBLEM re-send bound, which
+    # is the same silent-no-op class §5b refuses for a bad slot: a typo'd guard
+    # must not quietly un-guard. 0 is the documented way to disable it, and is
+    # deliberate, so it stays quiet.
+    if cfg.problem_repeat_cap < 0:
+        print(
+            f"[warn] config: [harness] problem_repeat_cap = "
+            f"{cfg.problem_repeat_cap} is negative, so the PROBLEM re-send cap "
+            "is disabled and max_iterations governs; use 0 to disable it "
+            "deliberately",
+            file=sys.stderr,
+        )
+    return cfg
+
+
+def _merge_models(cfg: Config, data: dict[str, Any]) -> dict[str, str]:
+    """Merge this layer's ``[models]`` slots into the inherited vocabulary.
+
+    Slot names are shared, owner-configured vocabulary, so layers merge per key
+    (higher layer wins) instead of replacing wholesale: a task layer rebinds
+    one name and keeps the rest, exactly like the scalar fields above merge via
+    their per-field ``.get`` fall-backs. Values are opaque model-id strings;
+    any pair that is not ``non-empty-str: non-empty-str`` is dropped with a
+    stderr warning (never silent), so a typo'd slot can never silently reroute
+    a step or fall through to the wrong model. An empty value is dropped for
+    the same reason, one step later: it would resolve, be advertised to the
+    operator as an available slot, and then compose no ``--model`` at all
+    (``""`` is falsy at the spawn site), so the step would silently run the
+    CLI's own default under a name that promised otherwise. Dropping the pair
+    also stops the prompt advertising a slot that cannot produce a flag.
+    ``default`` is honored like any other key here — reservation is a
+    resolution-time rule, not a parse-time one.
+    """
+    raw = data.get("models", {})
+    merged = dict(cfg.models)
+    if not isinstance(raw, dict):
+        print(
+            "[warn] config: [models] must be a table of slot = \"model-id\" "
+            f"pairs; got {type(raw).__name__}, so this layer adds no slots",
+            file=sys.stderr,
+        )
+        return merged
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key or not isinstance(value, str) or not value:
+            print(
+                f"[warn] config: dropped [models] slot {key!r} = {value!r}: "
+                "slot names and model ids must be non-empty strings",
+                file=sys.stderr,
+            )
+            continue
+        merged[key] = value
+    return merged
 
 
 def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
@@ -190,5 +299,9 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         max_iterations=int(harness.get("max_iterations", cfg.max_iterations)),
         max_wall_clock_s=int(harness.get("max_wall_clock_s", cfg.max_wall_clock_s)),
         max_generations=int(harness.get("max_generations", cfg.max_generations)),
+        problem_repeat_cap=int(
+            harness.get("problem_repeat_cap", cfg.problem_repeat_cap)
+        ),
+        models=_merge_models(cfg, data),
         operator=operator,
     )

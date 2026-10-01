@@ -22,8 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Allowed per-step fields. Anything else in a delta is ignored.
-STEP_FIELDS = {"title", "status", "notes", "evidence", "updated_at"}
+# Allowed per-step fields. Anything else in a delta is ignored. ``model`` is a
+# pure pass-through: it names a model *slot* for the harness to resolve against
+# the ``[models]`` config (loop-side, per docs 2-plan §2/§3); this module stores
+# and merges it without any semantics of its own.
+STEP_FIELDS = {"title", "status", "notes", "evidence", "updated_at", "model"}
 
 # Valid per-step statuses. There is no ordering: the operator may move a step
 # to any of these freely, including back to redo it.

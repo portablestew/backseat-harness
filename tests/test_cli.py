@@ -234,3 +234,80 @@ def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
     finally:
         monkeypatch.setattr(cli, "get_provider", real_get)
     assert seen["argv"][-2:] == ["--agent", "my-reviewer"]
+
+
+def test_run_sees_task_layer(tmp_path, monkeypatch):
+    """`run` resolves provider from the task-level config.toml, not the workspace's."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    ws = tmp_path
+    (ws / ".backseat").mkdir()
+    (ws / ".backseat" / "config.toml").write_text(
+        '[harness]\nprovider = "opencode"\n', encoding="utf-8"
+    )
+    task = ws / ".backseat" / "tasks" / "t"
+    task.mkdir(parents=True)
+    (task / "config.toml").write_text('[harness]\nprovider = "claude"\n', encoding="utf-8")
+
+    seen = {}
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
+
+    def fake_run_task(**kwargs):
+        seen["config"] = kwargs["config"]
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    rc = main(["-C", str(ws), "run", "t", "Goal"])
+    assert rc == 0
+    assert seen["config"].provider == "claude"
+
+
+def test_cli_call_sites_pass_slug(tmp_path, monkeypatch, capsys):
+    """Every command but `list` threads its slug into `load_config`."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness import config as config_mod
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    calls = []
+    real = config_mod.load_config
+
+    def spy(workspace, slug=None, **kwargs):
+        calls.append((str(workspace), slug))
+        return real(workspace, slug, **kwargs)
+
+    monkeypatch.setattr(cli, "load_config", spy)
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
+    monkeypatch.setattr(
+        cli,
+        "run_task",
+        lambda **kwargs: TaskResult(slug="u", status=TaskStatus.COMPLETE, iterations=1),
+    )
+
+    ws = str(tmp_path)
+    main(["-C", ws, "init", "t"])
+    main(["-C", ws, "run", "u", "Goal"])
+    main(["-C", ws, "takeover", "ghost"])
+    main(["-C", ws, "status", "ghost"])
+    main(["-C", ws, "list"])
+    capsys.readouterr()
+
+    assert calls == [(ws, "t"), (ws, "u"), (ws, "ghost"), (ws, "ghost"), (ws, None)]
+
+
+def test_list_ignores_task_config(tmp_path, capsys):
+    """`list` never parses a task config: a malformed one cannot break it."""
+    task = tmp_path / ".backseat" / "tasks" / "t"
+    task.mkdir(parents=True)
+    (task / "config.toml").write_text("this is not valid toml = = =\n", encoding="utf-8")
+
+    rc = main(["-C", str(tmp_path), "list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "t" in out
