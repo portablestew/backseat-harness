@@ -752,55 +752,6 @@ def test_disagreement_reaches_the_plan_phase_prompt(config, task, capsys):
     assert f"[warn] task: {note}" in capsys.readouterr().err
 
 
-def test_kiro_advisory_and_disagreement_both_reach_the_prompt(config, task, capsys):
-    """The kiro branch overwrote slot_warning wholesale. A turn that is
-    slot-sourced on kiro AND ambiguous must carry both sentences in one prompt:
-    the harness picked one of two models and is saying so, *and* what kiro still
-    cannot tell anyone about the turn -- that no field attests which model
-    served it. Losing either would be losing half the truth about the turn."""
-    from dataclasses import replace
-
-    slug, paths = task
-    paths.checklist.write_text(json.dumps({
-        "steps": {
-            "s1": {"status": "active", "model": "fast"},
-            "s2": {"status": "active", "model": "slow"},
-        },
-        "remarks": [],
-    }), encoding="utf-8")
-    config = replace(
-        config, provider="kiro", model="cfg-model",
-        models={"fast": "fast-model", "slow": "slow-model"},
-    )
-    prompts: list[str] = []
-    seen: list[tuple] = []
-
-    run_task(
-        slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    kiro = (
-        "provider kiro exposes no per-turn serving-model field; step 's1' slot "
-        "'fast' requests 'fast-model' and kiro's own records carry only the request"
-    )
-    note = _disagreement(("s1", "fast"), ("s2", "slow"))
-    prompt = prompts[-1]
-    # One line carrying both -- composed, not one replacing the other.
-    assert prompt.count("Slot warning:") == 1
-    assert f"Slot warning: {kiro}; {note}" in prompt
-    # The flag is still composed and the slot-sourced provenance still keys.
-    assert seen == [("--model", "fast-model")]
-    err = capsys.readouterr().err
-    assert "[warn] provider kiro exposes no per-turn serving-model field" in err
-    assert f"[warn] task: {note}" in err
-    # Nothing on either channel may claim the flag is ignored: 2.26.1 applies
-    # it, and the advisory is about the missing attestation field only.
-    for retired in _RETIRED_KIRO_CLAIM:
-        assert retired not in err
-        assert retired not in prompt
-
-
 def test_bad_slot_and_disagreement_both_reach_the_prompt(config, task, capsys):
     """Two causes on one turn must both survive. The disagreement is collected
     before the step's own slot is read, so without accumulation exactly one of
@@ -1059,59 +1010,9 @@ def test_empty_slot_binding_never_reaches_the_prompt_as_usable(config, task, cap
 # --- kiro: never falsely accused, never silently refused ---------------------
 # On kiro-cli 2.26.1 the CLI applies --model on fresh and resumed turns
 # (docs 1, "Re-test on kiro-cli 2.26.1"), so the old "does not honor --model"
-# advisory asserted something measured false. What survives: the residual the
-# measurement supports (kiro exposes no per-turn serving-model field), and the
-# refusal that is real -- an id the catalog does not have, which kiro quotes
-# back and the harness has to name on both channels.
-
-
-def test_kiro_warns_when_slot_supplies_the_model(config, task, capsys):
-    """Accepted-id branch: a slot-sourced kiro turn states only what is left to
-    state -- no attestation field -- and names the slot and the id asked for."""
-    slug, paths = task
-    config = _kiro(config)
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "fast"}},
-        "remarks": [],
-    }), encoding="utf-8")
-    config = _models(config, {"fast": "fast-model"})
-    seen: list[tuple] = []
-    prompts: list[str] = []
-
-    run_task(
-        slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    assert seen == [("--model", "fast-model")]  # the flag is still composed
-    err = capsys.readouterr().err
-    assert "'s1'" in err and "'fast'" in err
-    assert "'fast-model'" in err
-    assert "exposes no per-turn serving-model field" in err
-    # Nothing that claims the flag is ignored -- on either channel.
-    for retired in _RETIRED_KIRO_CLAIM:
-        assert retired not in err
-        assert retired not in prompts[-1]
-
-
-def test_kiro_stays_quiet_when_model_comes_from_the_fallback(config, task, capsys):
-    """No slot involved -> the advisory must not fire (default path), and still
-    nothing on stderr may claim the flag is ignored."""
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, provider="kiro", model="cfg-model")
-    seen: list[tuple] = []
-
-    run_task(
-        slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: '{"verdict":"done"}', first_prompt="go",
-    )
-    assert seen == [("--model", "cfg-model")]
-    err = capsys.readouterr().err
-    assert "exposes no per-turn serving-model field" not in err
-    for retired in _RETIRED_KIRO_CLAIM:
-        assert retired not in err
+# advisory asserted something measured false. What survives is the refusal
+# that is real -- an id the catalog does not have, which kiro quotes back and
+# the harness has to name on both channels.
 
 
 def test_kiro_rejected_id_is_loud_naming_slot_and_id(config, task, capsys):
@@ -1160,7 +1061,7 @@ def test_kiro_rejected_id_is_loud_naming_slot_and_id(config, task, capsys):
         assert retired not in err
     review = prompts[-1]
     assert review.count("Slot warning:") == 1
-    assert loud in review  # both causes on one line: advisory, then refusal
+    assert loud in review  # the complaint lands in the review prompt verbatim
     for retired in _RETIRED_KIRO_CLAIM:
         assert retired not in review
 
@@ -1256,8 +1157,6 @@ def test_kiro_rejected_id_names_the_default_binding_when_no_slot_supplied(
     )
     err = capsys.readouterr().err
     assert f"[warn] {loud}" in err
-    # No slot sourced the id, so the per-turn advisory does not fire either.
-    assert "exposes no per-turn serving-model field" not in err
     assert loud in prompts[-1]
 
 
@@ -1335,40 +1234,6 @@ def test_on_disk_bad_slot_reaches_the_operator_prompt(config, task, capsys):
     ) in review_prompt
     # Still warned on stderr, never silent.
     assert "does not honor" not in capsys.readouterr().err
-
-
-def test_kiro_slot_warning_reaches_the_operator_prompt(config, task, capsys):
-    """The kiro advisory lands in the review prompt verbatim -- residual only:
-    what kiro does not expose, not a claim about the flag."""
-    from dataclasses import replace
-
-    slug, paths = task
-    config = replace(
-        config, provider="kiro",
-        model="cfg-model", models={"fast": "fast-model"},
-    )
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "fast"}},
-        "remarks": [],
-    }), encoding="utf-8")
-    prompts: list[str] = []
-
-    run_task(
-        slug, config, FakeProvider(), _managed_runner_ok,
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    review_prompt = prompts[-1]
-    assert (
-        "Slot warning: provider kiro exposes no per-turn serving-model field; "
-        "step 's1' slot 'fast' requests 'fast-model' and kiro's own records "
-        "carry only the request"
-    ) in review_prompt
-    err = capsys.readouterr().err
-    assert "exposes no per-turn serving-model field" in err
-    for retired in _RETIRED_KIRO_CLAIM:
-        assert retired not in review_prompt
-        assert retired not in err
 
 
 def test_clean_turn_carries_no_slot_warning(config, task, capsys):

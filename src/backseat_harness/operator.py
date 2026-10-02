@@ -59,8 +59,8 @@ class ReviewInputs:
     #: ``default`` no-field binding bullet itself.
     model_slots: tuple[str, ...] = ()
     #: Per-turn slot-resolution warning (on-disk bad slot, non-string model,
-    #: kiro limitation), surfaced verbatim so the operator can correct the
-    #: step. None on a clean turn.
+    #: active-step disagreement, unusable ``[models].default``), surfaced
+    #: verbatim so the operator can correct the step. None on a clean turn.
     slot_warning: str | None = None
     #: Workspace-relative paths of the handoff docs present right now.
     docs: list[str] = field(default_factory=list)

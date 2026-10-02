@@ -13,9 +13,8 @@ defend against. Measured 2026-09-30 (``docs/1-research-model-switch.md``,
   and the sidecar's per-turn ``user_turn_metadatas[].model`` records the
   requested id -- where 2.24.1/2.25.0 rejected the flag with
   ``[warn] failed to set model '<id>': Method not found`` and ran the turn on
-  ``auto``. The adapter therefore no longer has a "the flag is ignored" story
-  to tell; what kiro still exposes is no field attesting which model *served*
-  a turn (the ACP stream and the sidecar carry the request only).
+  ``auto``. The adapter passes the flag through and is otherwise
+  fire-and-forget: no claim is made about which model served a turn.
 * An id the catalog does not have is refused outright on both paths:
   ``runError`` at stage ``prompt`` whose message names the id, exit 1, empty
   stderr. ``rejected_model_id`` reads that back so the loop can surface the

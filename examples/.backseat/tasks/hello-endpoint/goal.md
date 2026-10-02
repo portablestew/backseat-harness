@@ -1,4 +1,4 @@
-# Meta-prompt: hello-endpoint
+# Goal-prompt: hello-endpoint
 
 Add a `GET /hello` endpoint to the existing web service that returns
 `{"message": "hello"}` as JSON with a 200 status. Include a test that exercises

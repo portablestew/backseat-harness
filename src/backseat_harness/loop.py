@@ -352,10 +352,7 @@ def run_task(
         # on-disk bad slot has to reach this prompt too, on both channels.
         # Same fresh disk read the turn loop uses; the model is discarded
         # (nothing is spawned here) and the review phase re-resolves, so the
-        # warning is one-shot rather than carried across the boundary. The kiro
-        # advisory below is deliberately not applied here: it is a standing
-        # caveat about kiro's missing serving-model field, it quotes the id a
-        # slot resolved, and this phase composes no flag and runs no turn.
+        # warning is one-shot rather than carried across the boundary.
         _plan_model, _plan_slot_source, plan_warning = _resolve_turn_model(
             checklist_mod.load_checklist(paths.checklist), config
         )
@@ -438,35 +435,6 @@ def run_task(
         turn_model, slot_source, slot_warning = _resolve_turn_model(
             checklist_mod.load_checklist(paths.checklist), config
         )
-        if slot_source is not None and config.provider == "kiro":
-            kiro_sid, kiro_slot = slot_source
-            # Composed, not overwritten: a slot-sourced turn can also carry a
-            # warning of its own (a disagreement, an unusable [models].default),
-            # and both reach the prompt together.
-            #
-            # What this advisory says changed with the CLI. On 2.26.1 kiro
-            # applies --model on fresh and resumed turns (docs 1, "Re-test on
-            # kiro-cli 2.26.1"), so the line this used to print -- "provider
-            # kiro does not honor --model ... will run on kiro's default
-            # routing anyway" -- stated as fact something measured false on
-            # the installed version, on every slot-sourced kiro turn. The one
-            # thing kiro still does not expose is any field saying which model
-            # *served* the turn: the ACP stream carries no model, and the
-            # sidecar records the request (`user_turn_metadatas[].model`), not
-            # an attestation. That residual, and nothing else, is claimed
-            # here -- on stderr and in the operator prompt alike. The failure
-            # that is real (an id kiro does not have) is caught after the
-            # spawn, where kiro quotes the id back.
-            kiro_warning = (
-                f"provider kiro exposes no per-turn serving-model field; step "
-                f"'{kiro_sid}' slot '{kiro_slot}' requests {turn_model!r} and "
-                f"kiro's own records carry only the request"
-            )
-            print(f"[warn] {kiro_warning}", file=sys.stderr)
-            slot_warning = (
-                f"{kiro_warning}; {slot_warning}" if slot_warning else kiro_warning
-            )
-
         # --- Spawn + wait (turn end == process exit). ---
         turn_log = logs.call_log(paths, state.iteration, logs.ROLE_MANAGED)
         spec = SpawnSpec(
@@ -496,7 +464,7 @@ def run_task(
         # unnamed nonzero exit; fresh and resumed turns emit the same event, so
         # one check covers both paths (docs/12-kiro-loud-path-live.md). Warnings
         # collected before the spawn stay in ``slot_warning`` too: the review
-        # prompt carries the advisory and this complaint on one line.
+        # prompt carries them and this complaint on one line.
         rejected = provider.rejected_model_id(result.stdout, result.stderr)
         if rejected is not None:
             rejection = _model_rejection_warning(
@@ -603,9 +571,9 @@ def _resolve_turn_model(
 
     Returns ``(model_id, slot_source, slot_warning)``. ``slot_source`` is the
     ``(step_id, slot)`` pair when a step's named slot produced ``model_id``,
-    and ``None`` for the default/config.model fallback — the kiro warning keys
-    on that provenance, exactly when a slot (rather than the run-wide baseline)
-    supplied the id. A step naming the literal ``default`` counts as the
+    and ``None`` for the default/config.model fallback — the rejection warning
+    quotes that provenance back, naming the binding that asked for the id kiro
+    refused. A step naming the literal ``default`` counts as the
     fallback (plan §1: naming it == omitting the field): no slot_source, no
     unknown-slot warning.
 
@@ -657,8 +625,7 @@ def _resolve_turn_model(
     if isinstance(raw, str) and raw != "default":
         # On-disk unknown slot: fall back loudly, never silently. A literal
         # "default" is not unknown — plan §1: naming it == omitting the field,
-        # so it resolves through the same fallback with no slot_source (and
-        # therefore no kiro warning either).
+        # so it resolves through the same fallback with no slot_source.
         bound = config.models.get(raw)
         if isinstance(bound, str) and bound:
             # A clean slot can still arrive on a warned turn (a disagreement
@@ -669,9 +636,9 @@ def _resolve_turn_model(
             # A slot that exists but binds nothing usable (an empty id). Parsing
             # already drops such pairs, so this needs a Config built some other
             # way — but the failure it causes is the silent one: returning it
-            # would compose no --model (falsy at the spawn site) while
-            # slot_source claimed a slot supplied the model, and the prompt
-            # would still advertise the name. Same shape as unknown, named.
+            # would compose no --model (falsy at the spawn site) while the
+            # prompt would still advertise the name. Same shape as unknown,
+            # named.
             warning = (
                 f"step '{sid}' names model slot '{raw}', whose [models] value "
                 f"is {bound!r}, not a model id; running the default model instead"
