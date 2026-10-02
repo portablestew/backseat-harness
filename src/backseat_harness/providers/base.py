@@ -40,6 +40,10 @@ class SpawnSpec:
     timeout_s: int = 3600
     # Extra provider-specific flags the workspace owner may inject.
     extra_args: tuple[str, ...] = ()
+    # Where this turn's output goes as it is produced (see spawn.run_turn and
+    # logs.py). None captures the streams in memory instead, which is what the
+    # tests and any caller without a task lane do.
+    log_path: Path | None = None
 
 
 @dataclass(frozen=True)

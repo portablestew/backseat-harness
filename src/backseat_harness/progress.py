@@ -16,6 +16,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
+from contextlib import contextmanager
 from typing import TextIO
 
 # Hard cap on how much of a note/prompt we show. The whole line -- prefix,
@@ -97,3 +99,70 @@ def next_prompt(prompt: str | None, *, stream: TextIO | None = None) -> None:
     if not prompt:
         return
     _emit(stream or sys.stderr, "prompt", "  prompt:", prompt)
+
+
+# --- Debug mode: what the loop is doing, and for how long. ---
+
+#: Off by default. A run prints one line per event (above) and is otherwise
+#: silent, which is the right density for watching a task; the debug channel is
+#: for the question the event lines cannot answer -- what is it doing right now,
+#: and how long has it been not answering. Every provider call is an expected
+#: silence bounded by a configured ceiling, so those print as one announce line
+#: and the log path; everything else is a harness step that is normally fast and
+#: becomes the suspect the moment it isn't.
+_DEBUG = False
+
+#: Style for debug lines, applied only when writing to a TTY. Dim rather than a
+#: fourth channel color, so debug stays legible next to the three event lines.
+_DEBUG_STYLE = "\033[2;37m"  # faint grey
+
+
+def set_debug(enabled: bool) -> None:
+    """Turn the debug step channel on or off for this process."""
+    global _DEBUG
+    _DEBUG = enabled
+
+
+def debug_enabled() -> bool:
+    return _DEBUG
+
+
+def _debug_line(prefix: str, text: str, stream: TextIO) -> None:
+    line = f"{prefix} {text}"
+    if _use_color(stream):
+        line = f"{_DEBUG_STYLE}{line}{_RESET}"
+    print(line, file=stream, flush=True)
+
+
+def debug_note(text: str, *, stream: TextIO | None = None) -> None:
+    """One un-timed debug line, for a step with no meaningful duration.
+
+    Used for the things a caller announces rather than performs: which provider
+    is about to be called, at what ceiling, writing to which log. Those are the
+    lines that answer "is it stuck in the provider or in the harness?" -- the
+    provider call is an expected silence bounded by a configured timeout, so it
+    is the one place in a run that is allowed to print nothing for minutes.
+    """
+    if not _DEBUG:
+        return
+    _debug_line("[dbg]", text, stream or sys.stderr)
+
+
+@contextmanager
+def step(what: str, *, stream: TextIO | None = None):
+    """Time one loop step: announce it, then report how long it took.
+
+    The elapsed figure is what makes a log readable after the fact: a run that
+    stalled shows one step with a large number, not a uniform gap. Prints
+    nothing unless debug is on, so the default output is unchanged.
+    """
+    if not _DEBUG:
+        yield
+        return
+    out = stream or sys.stderr
+    _debug_line("[dbg]", f"-> {what}", out)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        _debug_line("[dbg]", f"<- {what} ({time.monotonic() - started:.1f}s)", out)

@@ -95,6 +95,64 @@ def test_an_orphaned_grandchild_cannot_outlive_the_deadline(tmp_path):
     assert elapsed < 20, f"blocked {elapsed:.1f}s on a pipe held by a survivor"
 
 
+def test_a_log_file_leaves_the_deadline_nothing_to_wait_on(tmp_path):
+    """The descriptor form of the same teardown, and it is strictly better.
+
+    Both tests above are about a survivor holding an inherited *pipe*. Handing
+    the child the log file as a descriptor removes the pipe from the picture
+    entirely: a survivor can keep appending to the file, but there is no handle
+    for this process to block on, so the deadline holds regardless of what
+    ``_kill_tree`` managed to reach. That is why the loop logs this way and not
+    through a pipe.
+    """
+    program = (
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(45)'])\n"
+        "time.sleep(45)\n"
+    )
+    start = time.monotonic()
+    call = spawn.run_with_timeout(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        input="",
+        timeout_s=1,
+        grace_s=2,
+        log_path=tmp_path / "call.log",
+    )
+    elapsed = time.monotonic() - start
+
+    assert call.timed_out is True
+    assert elapsed <= 1 + 2 + 1, f"waited {elapsed:.1f}s against a 3s bound"
+    # And the partial output survived the kill rather than dying in a buffer.
+    assert (tmp_path / "call.log").exists()
+
+
+def test_a_killed_call_keeps_the_output_it_managed_to_flush(tmp_path):
+    """Partial output is the whole reason a timed-out turn still resumes.
+
+    Whatever the child wrote to the descriptor before it was killed is on disk,
+    so the session id can still be read out of it -- the same property that made
+    ``run_turn`` keep parsing the id from a timed-out call.
+    """
+    log = tmp_path / "call.log"
+    call = spawn.run_with_timeout(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; print('ses_from_partial'); sys.stdout.flush();"
+            " time.sleep(30)",
+        ],
+        cwd=tmp_path,
+        input="",
+        timeout_s=1,
+        grace_s=2,
+        log_path=log,
+    )
+
+    assert call.timed_out is True
+    assert "ses_from_partial" in log.read_text(encoding="utf-8", errors="replace")
+
+
 def test_a_pipe_holder_outside_the_tree_cannot_outlive_the_grace_budget(tmp_path):
     """Scenario B: the direct child exits *before* the deadline, so the tree
     kill walks a dead target and never reaches the grandchild it orphaned --
@@ -102,6 +160,11 @@ def test_a_pipe_holder_outside_the_tree_cannot_outlive_the_grace_budget(tmp_path
     means waiting for the survivor (measured 45.12s against a claimed 6s
     ceiling), so the teardown must burn at most the one shared grace budget
     and abandon the close to its background thread instead.
+
+    This is the pipe path specifically. The loop no longer takes it -- see
+    ``test_a_log_file_leaves_the_deadline_nothing_to_wait_on`` -- but the
+    no-``log_path`` form stays available to any caller without a task lane, so
+    the bound it buys still has to hold.
     """
     program = (
         "import subprocess, sys\n"

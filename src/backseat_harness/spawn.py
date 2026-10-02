@@ -17,6 +17,7 @@ import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import NamedTuple
 
 from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, TurnResult
@@ -127,6 +128,7 @@ def run_with_timeout(
     input: str,
     timeout_s: int,
     grace_s: int = DEFAULT_KILL_GRACE_S,
+    log_path: Path | None = None,
 ) -> CompletedCall:
     """Run a command to completion, to a deadline, or to neither.
 
@@ -139,6 +141,16 @@ def run_with_timeout(
     budget's end rather than waited on to EOF. Text mode throughout, so
     prompts and transcripts containing non-ASCII do not fall back to the ANSI
     code page.
+
+    ``log_path`` hands the child's stdout and stderr to that file as a
+    descriptor instead of draining them, and ``stdout``/``stderr`` then come
+    back empty for the caller to read off disk. Beyond keeping the stream on
+    disk while the call runs -- a hung turn is tailable rather than lost --
+    this is a *better* teardown than the pipe: a survivor of the tree kill has
+    no pipe to hold open, so nothing in this process can ever wait on it, which
+    is the entire reason for the two-phase teardown above. stderr goes to the
+    same file so one call's two streams stay in the order produced. Read the
+    file back with ``errors="replace"``; see logs.py.
     """
     # Platform by platform: on Windows `taskkill /T` walks parentage, so the
     # tree is reachable with or without a new process group -- the flag buys
@@ -152,43 +164,66 @@ def run_with_timeout(
         if os.name == "nt"
         else {"start_new_session": True}
     )
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        **group_kwargs,
-    )
+    log_file = None
+    if log_path is None:
+        out_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    else:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Binary: the child writes bytes straight to the descriptor. Reading it
+        # back as text is the caller's job, which is where errors="replace" is
+        # applied -- see logs.py.
+        log_file = log_path.open("wb")
+        out_kwargs = {"stdout": log_file, "stderr": subprocess.STDOUT}
     try:
-        stdout, stderr = proc.communicate(input, timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
-        partial_out, partial_err = _as_text(exc.stdout), _as_text(exc.stderr)
-        # One budget for everything below: kill, drain, close, wait. Giving
-        # each step its own grace would let the chain reach timeout_s +
-        # 2 * grace_s before _close_pipes is even reached, and the close used
-        # to be unbounded on top of that; a shared deadline keeps the entire
-        # teardown inside timeout_s + grace_s.
-        deadline = time.monotonic() + grace_s
-
-        def budget() -> float:
-            return deadline - time.monotonic()
-
-        _kill_tree(proc, budget())
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **out_kwargs,
+            **group_kwargs,
+        )
         try:
-            stdout, stderr = proc.communicate(timeout=max(budget(), 0.0))
-        except subprocess.TimeoutExpired:
-            _close_pipes(proc, budget())
+            stdout, stderr = proc.communicate(input, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            partial_out, partial_err = _as_text(exc.stdout), _as_text(exc.stderr)
+            # One budget for everything below: kill, drain, close, wait. Giving
+            # each step its own grace would let the chain reach timeout_s +
+            # 2 * grace_s before _close_pipes is even reached, and the close used
+            # to be unbounded on top of that; a shared deadline keeps the entire
+            # teardown inside timeout_s + grace_s.
+            deadline = time.monotonic() + grace_s
+
+            def budget() -> float:
+                return deadline - time.monotonic()
+
+            _kill_tree(proc, budget())
             try:
-                proc.wait(timeout=max(budget(), 0.0))
+                stdout, stderr = proc.communicate(timeout=max(budget(), 0.0))
             except subprocess.TimeoutExpired:
-                pass
-            stdout, stderr = partial_out, partial_err
-        return CompletedCall(-1, stdout, stderr, True)
-    return CompletedCall(proc.returncode, stdout, stderr, False)
+                _close_pipes(proc, budget())
+                try:
+                    proc.wait(timeout=max(budget(), 0.0))
+                except subprocess.TimeoutExpired:
+                    pass
+                stdout, stderr = partial_out, partial_err
+            return CompletedCall(-1, _as_text(stdout), _as_text(stderr), True)
+        # Normalized: with a log file there are no pipes, so communicate returns
+        # None, and CompletedCall promises str. One shape for every consumer --
+        # a caller must not have to know whether this call was logged.
+        return CompletedCall(
+            proc.returncode, _as_text(stdout), _as_text(stderr), False
+        )
+    finally:
+        # Released only after the child is reaped: a survivor of the tree kill
+        # holds its own descriptor, and this one is ours to close. Any error
+        # here (a full disk, a read-only mount) propagates -- the task dir is
+        # already load-bearing for _persist, so a run cannot get far without it,
+        # and dying at the provider call names the real cause.
+        if log_file is not None:
+            log_file.close()
 
 
 def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
@@ -198,23 +233,57 @@ def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
     non-interactive permission flags in ``spec.extra_args`` are what let a turn
     actually finish instead of blocking on an approval prompt; the watchdog is
     the backstop.
+
+    With ``spec.log_path`` the CLI's output goes straight to that file and is
+    read back here, so the turn's event stream is on disk for as long as the
+    turn runs and the session id is parsed from the same text either way.
     """
     cmd = resolve_argv(provider.build_command(spec))
     start = time.monotonic()
-    call = run_with_timeout(cmd, cwd=spec.cwd, input=spec.prompt, timeout_s=spec.timeout_s)
+    call = run_with_timeout(
+        cmd,
+        cwd=spec.cwd,
+        input=spec.prompt,
+        timeout_s=spec.timeout_s,
+        log_path=spec.log_path,
+    )
     duration = time.monotonic() - start
+    stdout, stderr = _read_log(spec.log_path, call)
     # Still try for the session id even after a timeout: a timed-out turn did
     # real work, and the next turn needs to resume the same session.
     exit_code = -1 if call.timed_out else call.returncode
-    native = provider.parse_result(exit_code, call.stdout, call.stderr)
+    native = provider.parse_result(exit_code, stdout, stderr)
     return TurnResult(
         exit_code=exit_code,
         timed_out=call.timed_out,
         duration_s=duration,
         native_session_id=native,
-        stdout=call.stdout,
-        stderr=call.stderr,
+        stdout=stdout,
+        stderr=stderr,
     )
+
+
+def _read_log(log_path: Path | None, call: CompletedCall) -> tuple[str, str]:
+    """The call's output as text: off the log file, or whatever was captured.
+
+    ``errors="replace"`` matches the encoding the stream was launched with, so a
+    multibyte character cut at a write boundary degrades here exactly as it
+    would have on the pipe -- and a call killed mid-write keeps everything it
+    managed to flush, which is the whole reason the partial output matters.
+    A log that cannot be read yields empty text rather than raising: the
+    session-id fallback is a marker search through history, and the loop must
+    survive a diagnostic artifact it cannot produce.
+    """
+    if log_path is None:
+        return call.stdout, call.stderr
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ""
+    # stderr was merged into the same file (stderr=subprocess.STDOUT), so both
+    # halves report the whole stream; that is what the adapters' parsers expect
+    # to scan, and it is the stream that actually carries the events.
+    return text, text
 
 
 def run_interactive(provider: Provider, native_session_id: str | None, cwd) -> int:

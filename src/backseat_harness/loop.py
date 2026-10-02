@@ -27,7 +27,7 @@ from typing import Any
 from backseat_harness import capture as capture_mod
 from backseat_harness import checklist as checklist_mod
 from backseat_harness import compact as compact_mod
-from backseat_harness import history, progress, storage
+from backseat_harness import history, logs, progress, storage
 from backseat_harness import marker as marker_mod
 from backseat_harness import operator as op
 from backseat_harness.config import Config, TaskPaths
@@ -149,6 +149,10 @@ def run_task(
     state = storage.load_state(paths, slug)
     state.status = TaskStatus.CONTINUE
     state.reason = ""
+    # Named before the first slow step, which is a chat-history lookup: on a
+    # resumed lane that is the first thing the process does, and without this
+    # line a run that stalls in it looks identical to one that never started.
+    progress.debug_note(f"task {slug}: starting, provider {provider.name}")
     binding = _refresh_size(
         storage.load_binding(paths) or _new_binding(config.provider), provider
     )
@@ -208,7 +212,18 @@ def run_task(
                     " Re-send the complete JSON response."
                     " Output the JSON object only, no prose."
                 )
+            # One log per attempt, named before the call so a hung operator is
+            # tailable, and redacted after it so the verdict is parsed from the
+            # text exactly as emitted (see logs.redact_file).
+            op_log = logs.call_log(paths, state.iteration, logs.ROLE_OPERATOR, attempts)
+            logs.set_current(op_log)
+            progress.debug_note(
+                f"calling operator (attempt {attempts}/{budget}, "
+                f"{config.operator.timeout_s}s ceiling)"
+            )
             text = operator_invoker(prompt)
+            logs.redact_file(op_log, binding.root_uuid)
+            logs.set_current(None)
             verdict = op.parse_verdict(text)
             if verdict is None:
                 # Three faults, three corrections. An empty reply licenses the
@@ -317,7 +332,8 @@ def run_task(
             checklist_mod.load_checklist(paths.checklist), config
         )
         verdict = call_operator(None, prior, slot_warning=plan_warning)
-        _persist(paths, state, binding, verdict, None, phase="plan")
+        with progress.step("persist plan verdict"):
+            _persist(paths, state, binding, verdict, None, phase="plan")
         _report(verdict)
         last_verdict = verdict.kind
         terminal = _terminal(paths, state, verdict)
@@ -357,7 +373,14 @@ def run_task(
             pending_reset = False
         elif gen and compact_mod.should_compact(transcript_bytes, config):
             if compact_mod.can_compact_again(gen.n, config):
-                fork_text = compact_mod.render_fork(binding.root_uuid, provider.history_provider)
+                # Rendered inside the step because this is the one fork whose
+                # text is large enough to matter (the ~1MB session that tripped
+                # the threshold), and it happens immediately after the iteration
+                # header, so an untimed read here looks like a hung loop.
+                with progress.step(f"render compaction fork (gen {gen.n + 1})"):
+                    fork_text = compact_mod.render_fork(
+                        binding.root_uuid, provider.history_provider
+                    )
                 # New generation: fresh session, marker with incremented #n.
                 binding = next_generation(binding, gen.n + 1)
                 state.generation = gen.n + 1
@@ -406,6 +429,7 @@ def run_task(
             )
 
         # --- Spawn + wait (turn end == process exit). ---
+        turn_log = logs.call_log(paths, state.iteration, logs.ROLE_MANAGED)
         spec = SpawnSpec(
             prompt=prompt,
             cwd=config.workspace_root,
@@ -419,8 +443,14 @@ def run_task(
                 + (("--model", turn_model) if turn_model else ())
                 + (("--agent", config.agent) if config.agent else ())
             ),
+            log_path=turn_log,
+        )
+        progress.debug_note(
+            f"calling managed provider {provider.name} "
+            f"(timeout {config.turn_timeout_s}s, log {turn_log})"
         )
         result = managed_runner(provider, spec)
+        logs.redact_file(turn_log, binding.root_uuid)
         # The refusal that can be named exactly, caught where it happens. kiro
         # quotes the id back in its runError, so the binding that asked for it
         # can be quoted to the operator instead of the turn just ending as an
@@ -437,7 +467,8 @@ def run_task(
             slot_warning = (
                 f"{slot_warning}; {rejection}" if slot_warning else rejection
             )
-        binding = _record_native(binding, result, provider)
+        with progress.step(f"record native session id (iter {state.iteration})"):
+            binding = _record_native(binding, result, provider)
         outcome = TurnOutcome(
             exit_code=result.exit_code,
             timed_out=result.timed_out,
@@ -458,7 +489,8 @@ def run_task(
                 f"{slot_residue}; {slot_warning}" if slot_warning else slot_residue
             )
         verdict = call_operator(outcome, transcript_file, slot_warning=review_warning)
-        _persist(paths, state, binding, verdict, result, phase="review")
+        with progress.step("persist review verdict"):
+            _persist(paths, state, binding, verdict, result, phase="review")
         _report(verdict)
         last_verdict = verdict.kind
 
@@ -703,11 +735,16 @@ def _capture_transcript(
     chat-mother-forker, which can be unavailable or empty (e.g. the very first
     turn before anything is stored). Any failure is swallowed and returns None
     so an inspection artifact never takes down the run itself.
+
+    Timed as one step: this renders the *complete* session, untruncated, so on a
+    resumed lane it is one of the longest things the loop does while holding no
+    provider call.
     """
     try:
-        text = capture_mod.capture(
-            binding.root_uuid, provider.history_provider, binding.root_uuid
-        )
+        with progress.step("capture managed transcript"):
+            text = capture_mod.capture(
+                binding.root_uuid, provider.history_provider, binding.root_uuid
+            )
     except Exception:  # noqa: BLE001 - capture is non-critical; never fail the loop
         return None
     if not text:
@@ -722,11 +759,15 @@ def _operator_fork(binding: Binding, provider: Provider) -> str:
     """Render the managed session for the operator, marker redacted.
 
     Redaction keeps the operator's own stored session from matching the task's
-    marker search (see marker.redact).
+    marker search (see marker.redact). Timed because it renders the whole
+    session, middle-truncated, on every operator call -- plan and review alike --
+    so it is one of the two reads that can hold a run quiet before a provider
+    is even launched.
     """
     if binding.current is None:
         return ""
-    fork = compact_mod.render_fork(binding.root_uuid, provider.history_provider)
+    with progress.step("render managed fork for operator"):
+        fork = compact_mod.render_fork(binding.root_uuid, provider.history_provider)
     return marker_mod.redact(fork, binding.root_uuid)
 
 

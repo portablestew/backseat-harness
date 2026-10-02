@@ -22,6 +22,7 @@ sections are ignored, not rejected.
       ledger.jsonl           # append-only, one line per completed iteration
       state.json             # mutable status/iteration/generation
       transcript.md          # full managed session, redacted, rewritten each turn
+      logs/                  # one file per provider call (managed turns, operator attempts)
       docs/                  # managed-agent handoff docs (research, plan, reviews)
 ```
 
@@ -267,6 +268,58 @@ output). The harness creates the directory and lists its files in every
 operator prompt, but never writes inside it. It is the only place under
 `.backseat/` the managed agent is asked to write; that is a prompt-level
 convention, not an enforced permission.
+
+## logs/
+
+One file per provider call, written **always** — not a debug aid, but the
+durable record of what each CLI actually emitted.
+
+```
+logs/iter-0007.managed.log      # one managed turn
+logs/iter-0007.operator.1.log   # one operator attempt
+logs/iter-0007.operator.2.log   # a re-ask keeps the answer that came back unusable
+```
+
+Zero-padded so `ls` sorts chronologically, and unique per call so a process that
+outlives its deadline can only append to a file the harness has moved on from.
+Nothing prunes them yet; a retention policy is additive later and the naming is
+already the input it would need.
+
+**The child's stdout and stderr *are* the file**, handed to the process as a
+descriptor with stderr merged in, rather than drained through a pipe. Three
+things follow, and all three are the point:
+
+- The kernel writes each line as the child emits it, so `tail -f` on a log
+  shows a call that is still running — including one that has hung. That is the
+  question a tailed log exists to answer, and a log assembled at the end of the
+  call cannot answer it.
+- Ordering between the two streams is real rather than reconstructed after the
+  fact.
+- A survivor of the deadline's tree kill has no pipe to hold open, so nothing in
+  the harness can wait on it. That is the same failure the whole two-phase
+  teardown exists to prevent (see `spawn.run_with_timeout`), reached here by not
+  creating the problem.
+
+Every provider already runs in a machine-readable mode (opencode `--format
+json`, claude and kiro `--output-format stream-json`) with no TTY attached, so
+the log is newline-delimited JSON with no spinner or box-drawing to strip — the
+raw event stream, re-parseable later. This is **not** the transcript: the log is
+what the CLI emitted this call, including the output of a turn killed mid-write,
+where `transcript.md` is rendered from the store afterwards and may be missing.
+
+The task's root UUID is redacted from each log once the call returns, for the
+same reason `transcript.md` is: an operator that reads a log file and quotes it
+would make its own stored session match the task's marker search, where the
+newest match wins and points sizing and compaction at the operator instead of
+the managed agent. Redaction runs *after* the caller parses what it needed, so
+it can never touch a verdict. The generation ordinal stays visible.
+
+`--debug` does not gate these files — it gates the stderr step channel, which
+announces each loop step and how long it took (the chat-history reads, the
+compaction fork, transcript capture, each persist). That channel exists because
+the event lines cannot answer "what is it doing right now": the provider calls
+are expected silences bounded by a configured ceiling, and everything else is a
+harness step that is normally fast and becomes the suspect the moment it isn't.
 
 ## Verdict envelope (operator -> harness, on stdout)
 

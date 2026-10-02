@@ -5,6 +5,8 @@ import json
 import pytest
 from conftest import FakeProvider
 
+from backseat_harness import logs as logs_mod
+from backseat_harness import marker as marker_mod
 from backseat_harness import storage
 from backseat_harness.history import SessionInfo
 from backseat_harness.loop import OperatorReply, run_task
@@ -2160,3 +2162,122 @@ def test_loop_creates_docs_dir_and_lists_docs(config, task):
     run_task(slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go")
     assert paths.docs.is_dir()
     assert "docs/1-research.md`" in prompts[-1]
+
+
+# --- Provider call logs -------------------------------------------------
+
+
+def test_each_managed_turn_gets_its_own_log_named_for_the_iteration(
+    config, task, stub_history
+):
+    """One file per call, named before the call so a hung turn is tailable."""
+    slug, paths = task
+    seen: list[object] = []
+
+    def runner(prov, spec):
+        seen.append(spec.log_path)
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+
+    assert len(seen) == 1
+    log = seen[0]
+    assert log.name == "iter-0001.managed.log"
+    assert log.parent == paths.logs
+
+
+def test_a_turn_log_is_written_by_the_runner_and_redacted_afterwards(
+    config, task, stub_history
+):
+    """The log is written by the provider call and redacted once it is done.
+
+    The UUID must never reach disk, but the session id has to be parsed out of
+    the raw text first -- so redaction runs after the turn, not before it.
+    """
+    slug, paths = task
+    root_uuid = None
+
+    def runner(prov, spec):
+        # Stand in for the CLI writing its event stream to the descriptor.
+        spec.log_path.write_text(
+            '{"sessionID":"ses_from_log"}\n' f"text {root_uuid}\n", encoding="utf-8"
+        )
+        return TurnResult(
+            exit_code=0, timed_out=False, duration_s=0.1,
+            native_session_id="ses_from_log", stdout="", stderr="",
+        )
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"done"}'
+
+    # Learn the lane's root uuid from the marker the loop puts on the prompt.
+    def capture_prompt(prov, spec):
+        nonlocal root_uuid
+        root_uuid = marker_mod.parse_marker(spec.prompt)[0]
+        return runner(prov, spec)
+
+    run_task(slug, config, FakeProvider(), capture_prompt, operator_invoker, first_prompt="go")
+
+    text = (paths.logs / "iter-0001.managed.log").read_text(encoding="utf-8")
+    assert root_uuid not in text
+    assert marker_mod.REDACTED_ROOT in text
+    assert "ses_from_log" in text  # the id parsed fine; only the UUID went away
+
+
+def test_every_operator_attempt_keeps_its_own_log(config, task, stub_history):
+    """A re-asked verdict must leave the unusable answer on disk.
+
+    Overwriting would destroy the one artifact that explains *why* the harness
+    re-asked, which is the whole reason the operator's output is kept at all.
+    """
+    slug, paths = task
+    # One iteration only: the operator here never produces a verdict, so the
+    # loop would otherwise keep re-asking across iterations and this test would
+    # be asserting on a second iteration's files too.
+    from dataclasses import replace as dataclass_replace
+
+    config = dataclass_replace(config, max_iterations=1)
+    attempted: list[object] = []
+
+    def operator_invoker(prompt: str) -> str:
+        path = logs_mod.current()
+        attempted.append(path)
+        path.write_text("no verdict here", encoding="utf-8")
+        return "still no verdict here"
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert [p.name for p in attempted] == [
+        "iter-0001.operator.1.log",
+        "iter-0001.operator.2.log",
+        "iter-0001.operator.3.log",
+    ]
+    # Default budget is three invocations, so three files, none clobbered.
+    for path in attempted:
+        assert path.read_text(encoding="utf-8") == "no verdict here"
+
+
+def test_the_loop_releases_the_declared_log_after_each_operator_call(
+    config, task, stub_history
+):
+    """A stale declaration would send an unrelated call's output to a log that
+    is already finished -- and, worse, name an iteration that never ran."""
+    slug, _ = task
+    held: list[object] = []
+
+    def operator_invoker(prompt: str) -> str:
+        held.append(logs_mod.current())
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+    assert held[0] is not None
+    assert logs_mod.current() is None

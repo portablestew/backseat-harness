@@ -340,3 +340,81 @@ def test_list_ignores_task_config(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "t" in out
+
+
+# --- --debug ------------------------------------------------------------
+
+
+def test_debug_gates_the_step_channel_only(tmp_path):
+    """The flag is about what the launching terminal shows, never about whether
+    the logs exist: provider call logs are written either way, being the durable
+    record rather than a diagnostic aid.
+    """
+    import backseat_harness.progress as progress_mod
+
+    assert progress_mod.debug_enabled() is False
+
+    main(["-C", str(tmp_path), "--debug", "list"])
+    assert progress_mod.debug_enabled() is True
+
+    main(["-C", str(tmp_path), "list"])
+    assert progress_mod.debug_enabled() is False
+
+
+def test_a_debug_run_announces_and_times_its_steps(tmp_path, capsys, monkeypatch):
+    """The elapsed figure is what makes the channel readable after the fact: a
+    run that stalled shows one step with a big number, not a uniform gap.
+
+    Driven through the real loop so the steps under test are the ones a run
+    actually reaches -- the history read at startup being the first, and the one
+    that most often explains a stalled start.
+    """
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness.loop import run_task as real_run_task
+    from backseat_harness.providers.base import TurnResult
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+
+    def cli_loop(**kwargs):
+        """The real loop, with the two spawns faked."""
+        kwargs["managed_runner"] = lambda prov, spec: TurnResult(
+            exit_code=0, timed_out=False, duration_s=0.1,
+            native_session_id="sess-1", stdout="", stderr="",
+        )
+        kwargs["operator_invoker"] = lambda p: '{"verdict":"done"}'
+        return real_run_task(**kwargs)
+
+    monkeypatch.setattr(cli, "run_task", cli_loop)
+    monkeypatch.setattr(
+        "backseat_harness.history.find_session", lambda search, provider: None
+    )
+    monkeypatch.setattr(
+        "backseat_harness.history.fork_session", lambda search, provider: ""
+    )
+    monkeypatch.setattr(
+        "backseat_harness.history.load_full_transcript", lambda search, provider: ""
+    )
+
+    main(["-C", str(tmp_path), "init", "d", "Do it."])
+    capsys.readouterr()
+    rc = main(["-C", str(tmp_path), "--debug", "run", "d"])
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if line.startswith("[dbg]")]
+
+    assert lines, "a debug run says something even before its first slow step"
+    # The run names itself before it starts reading anything: without that first
+    # line, a run stalled in a chat-history lookup looks like one that never
+    # started.
+    assert "starting" in lines[0]
+    # Each step announces, then reports how long it took -- the elapsed figure is
+    # what makes a stalled run readable afterwards as one large number rather
+    # than a uniform gap.
+    assert any(line.startswith("[dbg] ->") for line in lines)
+    assert any(line.startswith("[dbg] <-") and "s)" in line for line in lines)
+    # The provider call is an expected silence bounded by a configured ceiling,
+    # so it announces its ceiling and where its output is going.
+    assert any("calling operator" in line and "1800s ceiling" in line for line in lines)

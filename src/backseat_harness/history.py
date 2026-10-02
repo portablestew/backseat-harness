@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from backseat_harness import progress
+
 # chat-mother-forker returns this (rather than raising) when nothing matched.
 _NO_MATCH_PREFIX = "No conversation found"
 
@@ -66,9 +68,15 @@ def _retrying(what: str, fallback: Any):
     def decorate(read):
         @functools.wraps(read)
         def call(*args, **kwargs):
+            # Timed here rather than at the four call sites: this module is
+            # already the single door every caller comes through, so one
+            # wrapper covers the size lookup, both fork renderings, turn capture,
+            # and the retry sleeps between attempts -- which is why a stalled run
+            # can name the read it is stuck in instead of going quiet.
             for attempt in range(1, RETRY_ATTEMPTS + 1):
                 try:
-                    return read(*args, **kwargs)
+                    with progress.step(what):
+                        return read(*args, **kwargs)
                 except HistoryError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - any store failure retries

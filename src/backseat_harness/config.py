@@ -178,6 +178,16 @@ class TaskPaths:
         return self.root / "docs"
 
     @property
+    def logs(self) -> Path:
+        """One log file per provider call: managed turns and operator attempts.
+
+        The child's stdout *is* the file, handed to it as a descriptor, so a
+        call that is still running -- or has hung -- is tailable while it
+        happens. Written by the harness, read by whoever is diagnosing a run.
+        """
+        return self.root / "logs"
+
+    @property
     def transcript(self) -> Path:
         """Full session transcript the harness overwrites after each managed turn.
 

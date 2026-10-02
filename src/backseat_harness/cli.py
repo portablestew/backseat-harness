@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 
-from backseat_harness import __version__, spawn
+from backseat_harness import __version__, logs, progress, spawn
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
 from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.operator import load_persona
@@ -24,6 +24,7 @@ from backseat_harness.spawn import run_turn
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    progress.set_debug(getattr(args, "debug", False))
     if not getattr(args, "func", None):
         parser.print_help()
         return 2
@@ -40,6 +41,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="workspace root containing .backseat/ (default: cwd)",
     )
     p.add_argument("--format", choices=["text", "json"], default="text")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="log each loop step with its elapsed time on stderr (provider call "
+        "logs are always written to the task's logs/ dir)",
+    )
     sub = p.add_subparsers(dest="command")
 
     init = sub.add_parser("init", help="scaffold a task lane under .backseat/tasks/")
@@ -258,6 +265,12 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
     (``OperatorReply``), so the loop tells a killed call from silence instead
     of inferring a kill from the emptiness. The loop owns what happens next;
     this layer only launches.
+
+    The output goes to this call's log file, declared by the loop immediately
+    before the call (``logs.set_current``), so an operator that hangs is
+    tailable, and the verdict is parsed out of that file. That is the same text
+    the CLI emitted, read a moment later rather than off a pipe; the loop
+    redacts the file afterwards, after parsing. See logs.py.
     """
     provider: Provider = get_provider(op_config.provider)
     persona = load_persona()
@@ -282,6 +295,7 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
             cwd=config.workspace_root,
             input=prompt,
             timeout_s=op_config.timeout_s,
+            log_path=logs.current(),
         )
         if call.timed_out:
             print(
@@ -292,9 +306,34 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
             return OperatorReply("", timed_out=True)
         # The operator's verdict JSON is inside its reply, so pull the assistant
         # text out of the event stream rather than handing back raw events.
-        return provider.extract_text(call.stdout or "")
+        # Read off disk with the same substitution the stream was launched
+        # with, so a character cut at a write boundary degrades rather than
+        # raising -- which matters here, where an unreadable reply costs a whole
+        # operator call out of the retry budget.
+        return provider.extract_text(_read_output(logs.current(), call))
 
     return invoke
+
+
+def _read_output(log_path, call) -> str:
+    """The finished call's output text.
+
+    Off the log file when the loop declared one; otherwise whatever the spawn
+    captured in memory, so an invoker built by a frontend that never declares a
+    log still works.
+
+    ``errors="replace"`` matches the encoding the stream was launched with, so
+    a multibyte character cut at a write boundary degrades exactly as it would
+    have on the pipe. A log that cannot be read yields "", which the loop already
+    treats as an unusable reply and answers with a re-ask -- an artifact the
+    harness cannot produce must not end the run.
+    """
+    if log_path is None:
+        return call.stdout or ""
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _emit(args, payload: dict, text: str) -> None:
