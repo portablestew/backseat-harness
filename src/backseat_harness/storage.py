@@ -1,32 +1,74 @@
 """Read/write helpers for the ``.backseat/tasks/<slug>/`` files.
 
 The harness is the sole writer. Writes are atomic (temp file + replace) so a
-crash mid-write cannot leave a half-written state.json or binding.json. The
-ledger is append-only JSONL: one line per completed iteration.
+crash mid-write cannot leave a half-written state.json or binding.json, and the
+replace is retried because these files sit inside the watched workspace, where a
+concurrent reader can briefly deny the swap. The ledger is append-only JSONL: one
+line per completed iteration.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 from backseat_harness.config import TaskPaths
 from backseat_harness.models import Binding, LedgerEntry, TaskState
 
+#: A contended write gets this many attempts, ``RETRY_DELAY_S`` apart. On Windows
+#: ``os.replace`` is ``MoveFileEx``, which fails with ERROR_ACCESS_DENIED
+#: (WinError 5) when the destination is open in another process that did not share
+#: delete -- an editor, a file watcher, an indexer, or a virus scanner reacting to
+#: the write we just made. These files live inside the workspace, so something is
+#: nearly always watching them, and ``_persist`` writes ``state.json`` and then
+#: ``_finish`` writes it again with nothing in between: the second write lands
+#: exactly in the window where that watcher still holds the first result open.
+#: A losing race is a blip, not a verdict, and is worth a couple of seconds of
+#: waiting rather than a crashed run -- the same reasoning, and deliberately the
+#: same constants, as ``history._retrying``.
+RETRY_ATTEMPTS = 3
+RETRY_DELAY_S = 1.0
 
-def _atomic_write(path: Path, text: str) -> None:
+
+def atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, retrying a Windows-contended replace.
+
+    Exhausting the attempts re-raises the original error. A write that cannot
+    land is reported, never swallowed: losing one silently would leave the lane
+    claiming a commit that never reached disk, which is the one outcome worse
+    than stopping.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            if attempt == RETRY_ATTEMPTS:
+                raise
+            print(
+                f"[warn] task: write {path.name} failed ({exc}); retrying in "
+                f"{RETRY_DELAY_S:g}s (attempt {attempt}/{RETRY_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(RETRY_DELAY_S)
+        finally:
+            # Gone once the replace succeeds, so the unlink is a no-op there. On a
+            # failed attempt it clears our own temp file -- and it can hit the very
+            # scanner that blocked the replace, which must not displace the error
+            # we are about to raise.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def load_state(paths: TaskPaths, slug: str) -> TaskState:
@@ -36,7 +78,7 @@ def load_state(paths: TaskPaths, slug: str) -> TaskState:
 
 
 def save_state(paths: TaskPaths, state: TaskState) -> None:
-    _atomic_write(paths.state, json.dumps(state.touch().to_dict(), indent=2) + "\n")
+    atomic_write(paths.state, json.dumps(state.touch().to_dict(), indent=2) + "\n")
 
 
 def load_binding(paths: TaskPaths) -> Binding | None:
@@ -46,7 +88,7 @@ def load_binding(paths: TaskPaths) -> Binding | None:
 
 
 def save_binding(paths: TaskPaths, binding: Binding) -> None:
-    _atomic_write(paths.binding, json.dumps(binding.to_dict(), indent=2) + "\n")
+    atomic_write(paths.binding, json.dumps(binding.to_dict(), indent=2) + "\n")
 
 
 def append_ledger(paths: TaskPaths, entry: LedgerEntry) -> None:

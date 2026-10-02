@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backseat_harness import storage
+
 # Allowed per-step fields. Anything else in a delta is ignored. ``model`` is a
 # pure pass-through: it names a model *slot* for the harness to resolve against
 # the ``[models]`` config (loop-side, per docs 2-plan §2/§3); this module stores
@@ -106,10 +108,18 @@ def load_checklist(path: Path) -> Checklist:
 
 
 def save_checklist(path: Path, checklist: Checklist) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(checklist.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    """Write the checklist through the same atomic, retried door as state/binding.
+
+    This is the *first* write in ``loop._persist``'s crash-safe ordering, so a
+    torn file here costs the most of any: ``load_checklist`` parses JSON
+    unconditionally, and a truncated tail raises rather than degrading, which
+    bricks the lane on the next read. ``ensure_ascii=False`` is kept -- the
+    operator writes non-ASCII titles and remarks -- and a bare ``write_text``
+    would also have left this the one write in the run that neither survives a
+    partial write nor retries a contended swap.
+    """
+    storage.atomic_write(
+        path, json.dumps(checklist.to_dict(), indent=2, ensure_ascii=False) + "\n"
     )
 
 

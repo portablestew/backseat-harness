@@ -1,3 +1,8 @@
+import os
+from pathlib import Path
+
+import pytest
+
 from backseat_harness import storage
 from backseat_harness.models import Binding, Generation, LedgerEntry, TaskState, VerdictKind
 
@@ -111,3 +116,63 @@ def test_ledger_reads_back_without_the_derived_field(config):
     )
     entries = list(storage.read_ledger(paths))
     assert [e.iteration for e in entries] == [1]
+
+
+def test_atomic_write_retries_a_contended_replace(config, monkeypatch, capsys):
+    """WinError 5 on the swap is a losing race, not a verdict: wait it out."""
+    real_replace = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) == 1:
+            raise PermissionError(5, "Access is denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", flaky)
+    monkeypatch.setattr(storage.time, "sleep", lambda _s: None)
+
+    paths = config.task_paths("t1")
+    storage.save_state(paths, TaskState(slug="t1", iteration=7))
+
+    assert len(calls) == 2
+    assert storage.load_state(paths, "t1").iteration == 7
+    assert "retrying" in capsys.readouterr().err
+
+
+def test_atomic_write_gives_up_and_reraises(config, monkeypatch, capsys):
+    """Exhausting the attempts reports the failure; it never swallows it."""
+    monkeypatch.setattr(
+        storage.os,
+        "replace",
+        lambda src, dst: (_ for _ in ()).throw(PermissionError(5, "denied", str(dst))),
+    )
+    monkeypatch.setattr(storage.time, "sleep", lambda _s: None)
+
+    paths = config.task_paths("t1")
+    with pytest.raises(PermissionError):
+        storage.save_state(paths, TaskState(slug="t1", iteration=7))
+
+    assert not paths.state.exists()
+    assert list(paths.root.glob("*.tmp")) == []
+
+
+def test_atomic_write_leaves_no_temp_file_behind(config, monkeypatch):
+    """Each attempt cleans up its own temp file, so a retry cannot strand one."""
+    real_replace = os.replace
+    seen = []
+
+    def flaky(src, dst):
+        seen.append(src)
+        if len(seen) == 1:
+            raise PermissionError(5, "denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", flaky)
+    monkeypatch.setattr(storage.time, "sleep", lambda _s: None)
+
+    paths = config.task_paths("t1")
+    storage.save_state(paths, TaskState(slug="t1", iteration=1))
+
+    assert not Path(seen[0]).exists()
+    assert list(paths.root.glob("*.tmp")) == []

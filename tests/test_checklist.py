@@ -1,6 +1,9 @@
 """Checklist merge protocol: additive, whitelisted, free-status, no deletes."""
 
 import json
+import os
+
+import pytest
 
 from backseat_harness.checklist import Checklist, all_done, merge_update, save_checklist
 
@@ -98,3 +101,63 @@ def test_cancelled_satisfies_the_completion_gate():
     for open_status in ("active", "pending"):
         steps = {"s1": {"status": "cancelled"}, "s2": {"status": open_status}}
         assert not all_done(Checklist(steps=steps))
+
+
+def test_save_checklist_is_atomic_and_retries_a_contended_swap(tmp_path, monkeypatch):
+    """The checklist rides the same door as state/binding: no torn file, no
+    crashed run on a losing replace race."""
+    from backseat_harness import storage
+
+    real_replace = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) == 1:
+            raise PermissionError(5, "Access is denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", flaky)
+    monkeypatch.setattr(storage.time, "sleep", lambda _s: None)
+
+    path = tmp_path / "checklist.json"
+    result = merge_update(Checklist(), {"steps": {"s1": {"title": "First", "status": "active"}}})
+    save_checklist(path, result)
+
+    assert len(calls) == 2
+    assert Checklist.from_dict(json.loads(path.read_text(encoding="utf-8"))).steps
+    # The failed attempt's temp file is cleaned up rather than stranded.
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_save_checklist_never_leaves_a_half_written_file(tmp_path, monkeypatch):
+    """A write that fails outright must leave the previous checklist intact --
+    ``load_checklist`` parses unconditionally, so a truncated tail would raise."""
+    from backseat_harness import storage
+
+    path = tmp_path / "checklist.json"
+    save_checklist(path, merge_update(Checklist(), {"steps": {"s1": {"status": "active"}}}))
+    before = path.read_text(encoding="utf-8")
+
+    def boom(src, dst):
+        raise PermissionError(5, "Access is denied", str(dst))
+
+    monkeypatch.setattr(storage.os, "replace", boom)
+    monkeypatch.setattr(storage.time, "sleep", lambda _s: None)
+
+    with pytest.raises(PermissionError):
+        save_checklist(path, merge_update(Checklist(), {"steps": {"s2": {"status": "done"}}}))
+
+    assert path.read_text(encoding="utf-8") == before
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_save_checklist_keeps_non_ascii_unescaped(tmp_path):
+    """``ensure_ascii=False`` survives the switch: the operator writes titles and
+    remarks that are not ASCII, and they stay readable on disk."""
+    path = tmp_path / "checklist.json"
+    delta = {"steps": {"s1": {"title": "café — naïve", "status": "active"}}}
+    save_checklist(path, merge_update(Checklist(), delta))
+
+    assert "café — naïve" in path.read_text(encoding="utf-8")
+    assert json.loads(path.read_text(encoding="utf-8"))["steps"]["s1"]["title"] == "café — naïve"
