@@ -64,7 +64,7 @@ def read_ledger(paths: TaskPaths) -> Iterator[LedgerEntry]:
             yield LedgerEntry.from_dict(json.loads(line))
 
 
-def read_meta(paths: TaskPaths) -> str:
-    if not paths.meta.exists():
-        raise FileNotFoundError(f"missing meta-prompt: {paths.meta}")
-    return paths.meta.read_text(encoding="utf-8")
+def read_goal(paths: TaskPaths) -> str:
+    if not paths.goal.exists():
+        raise FileNotFoundError(f"missing goal-prompt: {paths.goal}")
+    return paths.goal.read_text(encoding="utf-8")

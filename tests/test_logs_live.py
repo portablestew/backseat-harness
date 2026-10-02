@@ -62,7 +62,7 @@ def _lane(tmp_path, slug="live"):
 
     paths = TaskPaths(tmp_path / ".backseat" / "tasks" / slug)
     paths.root.mkdir(parents=True)
-    paths.meta.write_text("Prove the log path.\n", encoding="utf-8")
+    paths.goal.write_text("Prove the log path.\n", encoding="utf-8")
     paths.checklist.write_text('{"steps": {}, "remarks": []}', encoding="utf-8")
     config = Config(workspace_root=tmp_path, provider="streaming")
     return slug, paths, config

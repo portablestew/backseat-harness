@@ -10,8 +10,8 @@ their status but can *never* erase history:
   deletes; we forbid deletes).
 * Per-step fields are whitelisted; unknown fields are dropped.
 * Status may be set to any valid value (``pending``, ``active``, ``blocked``,
-  ``done``); there is no forward-only ordering, so the operator can move a step
-  back to redo it. Invalid statuses are ignored.
+  ``done``, ``cancelled``); there is no forward-only ordering, so the operator
+  can move a step back to redo it. Invalid statuses are ignored.
 * A freeform ``remarks`` channel appends narrative without touching structure.
 """
 
@@ -29,9 +29,18 @@ from typing import Any
 STEP_FIELDS = {"title", "status", "notes", "evidence", "updated_at", "model"}
 
 # Valid per-step statuses. There is no ordering: the operator may move a step
-# to any of these freely, including back to redo it.
-STEP_STATUSES = {"pending", "active", "blocked", "done"}
+# to any of these freely, including back to redo it. ``cancelled`` is the
+# vocabulary for work the owner decided against -- a brief that de-scopes a step
+# needs somewhere to put it, and the alternatives were both wrong: ``done`` is a
+# lie that corrupts the completion gate, and ``pending`` forever leaves the lane
+# waiting on work nobody wants.
+STEP_STATUSES = {"pending", "active", "blocked", "done", "cancelled"}
 DEFAULT_STATUS = "pending"
+
+#: Statuses that need no further work. ``cancelled`` counts because a step the
+#: owner declined is finished, not outstanding -- otherwise a de-scoped step
+#: keeps the lane open forever.
+TERMINAL_STATUSES = frozenset({"done", "cancelled"})
 
 
 @dataclass
@@ -105,7 +114,15 @@ def save_checklist(path: Path, checklist: Checklist) -> None:
 
 
 def all_done(checklist: Checklist) -> bool:
-    """True when there is at least one step and every step is done."""
+    """True when there is at least one step and none is still outstanding.
+
+    ``cancelled`` satisfies the gate alongside ``done``: the owner declining a
+    step settles it. A lane whose every step was cancelled is therefore
+    complete, which is the honest reading -- the work is finished and the answer
+    is "don't build it". The operator is still the one who set those statuses,
+    and this is the same trust the gate already extends to an all-``done``
+    checklist completing the lane on a non-``done`` verdict.
+    """
     if not checklist.steps:
         return False
-    return all(s.get("status") == "done" for s in checklist.steps.values())
+    return all(s.get("status") in TERMINAL_STATUSES for s in checklist.steps.values())

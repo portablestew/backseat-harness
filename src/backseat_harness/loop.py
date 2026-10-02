@@ -139,14 +139,32 @@ def run_task(
     managed_runner: ManagedRunner,
     operator_invoker: OperatorInvoker,
     first_prompt: str | None = None,
+    owner_brief: str | None = None,
 ) -> TaskResult:
     """Drive a single task lane to a terminal state.
 
     ``first_prompt`` is an optional override for the first managed turn. Without
     it, the operator plans first and writes that prompt itself.
+
+    ``owner_brief`` is the task owner's own words for this run, supplied when a
+    lane that already has a goal-prompt is resumed with a second argument (see
+    ``cli._cmd_run``). It reaches the plan-phase operator prompt and nothing
+    else, so it is one-shot without any persisted state to expire: the operator
+    bakes it into the checklist and the first prompt, and the run ends carrying
+    it. The ``ask_human`` question it usually answers rides alongside it,
+    captured from ``state.reason`` below -- the operator is invoked fresh and
+    has no memory of having asked.
     """
     paths = config.task_paths(slug)
     state = storage.load_state(paths, slug)
+    # Read the escalated question before the status flip clears it, and only when
+    # this run can actually carry it: --prompt skips the operator entirely, so a
+    # brief paired with it is rejected upstream and nothing would ever read these.
+    pending_question = (
+        state.reason
+        if owner_brief and first_prompt is None and state.status is not TaskStatus.COMPLETE
+        else ""
+    )
     state.status = TaskStatus.CONTINUE
     state.reason = ""
     # Named before the first slow step, which is a chat-history lookup: on a
@@ -156,7 +174,7 @@ def run_task(
     binding = _refresh_size(
         storage.load_binding(paths) or _new_binding(config.provider), provider
     )
-    meta = storage.read_meta(paths)
+    goal = storage.read_goal(paths)
     task_dir = paths.root.relative_to(config.workspace_root).as_posix()
     paths.docs.mkdir(parents=True, exist_ok=True)
     # The managed turn's flags are composed per spawn below (docs 2-plan §3):
@@ -174,7 +192,7 @@ def run_task(
     ) -> Verdict:
         nonlocal slot_residue
         inputs = op.ReviewInputs(
-            meta_prompt=meta,
+            goal_prompt=goal,
             checklist=checklist_mod.load_checklist(paths.checklist),
             managed_fork=_operator_fork(binding, provider),
             outcome=outcome,
@@ -185,6 +203,11 @@ def run_task(
             slot_warning=slot_warning,
             docs=_list_docs(paths, config.workspace_root),
             transcript_file=transcript_file,
+            # Both are one-shot by construction: only the plan-phase call that
+            # opens the run can carry them, and a review call is built from the
+            # same closure with `outcome` set, so neither can leak forward.
+            owner_brief=owner_brief if outcome is None else None,
+            pending_question=pending_question if outcome is None else None,
         )
         # One budget for every unusable reply, whatever made it unusable. An
         # unparsable envelope and a bad model slot are the same failure to the
@@ -304,6 +327,11 @@ def run_task(
     pending_prompt = first_prompt
     pending_reset = False
     last_verdict: VerdictKind | None = None
+    # Turns this run may still spend. Run-scoped like `started`, and deliberately
+    # not state.iteration: that one counts the lane's whole life and names its
+    # logs, so budgeting against it would hand a resumed lane whatever was left
+    # of an earlier run's cap instead of a fresh one.
+    turns_this_run = 0
     # Consecutive PROBLEM verdicts that re-sent the prompt just sent (docs 2-plan
     # §6). Reset by any continue, and by a PROBLEM that changes the prompt.
     problem_repeats = 0
@@ -344,8 +372,18 @@ def run_task(
 
     while True:
         # --- Budget guards (cheap, forward-only). ---
-        if state.iteration >= config.max_iterations:
-            return _finish(paths, state, TaskStatus.BLOCKED, last_verdict, "max_iterations reached")
+        if turns_this_run >= config.max_iterations:
+            # Names both counts: state.iteration is the lane total TaskResult
+            # reports, so "blocked after 45 iterations" against a 30-turn run
+            # budget reads as a contradiction unless the run's own count is here.
+            return _finish(
+                paths,
+                state,
+                TaskStatus.BLOCKED,
+                last_verdict,
+                f"max_iterations reached after {config.max_iterations} turns this run "
+                f"({state.iteration} total)",
+            )
         if time.monotonic() - started >= config.max_wall_clock_s:
             return _finish(paths, state, TaskStatus.BLOCKED, last_verdict, "max_wall_clock reached")
         if pending_prompt is None:
@@ -353,6 +391,7 @@ def run_task(
                 paths, state, TaskStatus.BLOCKED, last_verdict, "no prompt to send"
             )
 
+        turns_this_run += 1
         state.iteration += 1
         progress.iteration_start(state.iteration, state.generation, "review")
 

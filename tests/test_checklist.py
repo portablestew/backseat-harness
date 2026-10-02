@@ -74,3 +74,27 @@ def test_all_done():
     assert not all_done(Checklist())  # empty is not done
     assert not all_done(Checklist(steps={"s1": {"status": "active"}}))
     assert all_done(Checklist(steps={"s1": {"status": "done"}, "s2": {"status": "done"}}))
+
+
+def test_cancelled_is_a_valid_status():
+    result = merge_update(Checklist(), {"steps": {"s1": {"status": "cancelled"}}})
+    assert result.steps["s1"]["status"] == "cancelled"
+
+
+def test_cancelled_can_be_revived():
+    """No forward-only ordering, so a declined step can come back."""
+    base = merge_update(Checklist(), {"steps": {"s1": {"status": "cancelled"}}})
+    result = merge_update(base, {"steps": {"s1": {"status": "active"}}})
+    assert result.steps["s1"]["status"] == "active"
+
+
+def test_cancelled_satisfies_the_completion_gate():
+    """The owner declining a step settles it; it is not outstanding work."""
+    done_and_cancelled = {"s1": {"status": "done"}, "s2": {"status": "cancelled"}}
+    assert all_done(Checklist(steps=done_and_cancelled))
+    # A lane whose every step was declined is finished; the answer is "don't build it".
+    assert all_done(Checklist(steps={"s1": {"status": "cancelled"}}))
+    # But one still-open step keeps it open, cancelled or not.
+    for open_status in ("active", "pending"):
+        steps = {"s1": {"status": "cancelled"}, "s2": {"status": open_status}}
+        assert not all_done(Checklist(steps=steps))

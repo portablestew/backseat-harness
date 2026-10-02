@@ -120,6 +120,104 @@ def test_loop_pauses_on_ask_human(config, task):
     assert result.iterations == 1
 
 
+def test_owner_brief_and_its_question_reach_the_plan_prompt(config, task):
+    """A blocked lane's question, and the owner's answer, ride the same prompt.
+
+    The question comes from state.reason, which run_task overwrites on entry, so
+    this is the only place the capture can be wrong: lose it and the operator is
+    handed an answer to a question it has no memory of asking.
+    """
+    slug, paths = task
+    storage.save_state(
+        paths,
+        TaskState(
+            slug=slug, status=TaskStatus.BLOCKED, iteration=45,
+            reason="D1: split the retry budget, or keep it shared?",
+        ),
+    )
+    prompts: list[str] = []
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        owner_brief="Keep it shared.",
+    )
+    plan = prompts[0]
+    assert "D1: split the retry budget, or keep it shared?" in plan
+    assert "Keep it shared." in plan
+    assert plan.index("D1: split") < plan.index("Keep it shared.")
+    # The run cleared the recorded question, so a lane left `continue` is honest.
+    state = storage.load_state(paths, slug)
+    assert state.reason == ""
+    assert state.status is TaskStatus.COMPLETE
+
+
+def test_owner_brief_reaches_only_the_plan_phase(config, task):
+    """One-shot by construction: a review call must not re-read the brief."""
+    slug, paths = task
+    prompts: list[str] = []
+    calls = {"n": 0}
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"verdict":"continue","next_prompt":"go"}'
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        owner_brief="Sweep the docs too.",
+    )
+    assert len(prompts) == 2
+    assert "Sweep the docs too." in prompts[0]
+    assert "Sweep the docs too." not in prompts[1]
+
+
+def test_no_note_carries_no_question(config, task):
+    """A bare resume of a blocked lane has no answer, so nothing is injected."""
+    slug, paths = task
+    storage.save_state(
+        paths,
+        TaskState(slug=slug, status=TaskStatus.BLOCKED, reason="which db?"),
+    )
+    prompts: list[str] = []
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"done"}'
+
+    run_task(slug, config, FakeProvider(), _managed_runner_ok, operator_invoker)
+    assert "which db?" not in prompts[0]
+    assert "Brief from the task owner" not in prompts[0]
+
+
+def test_note_is_not_captured_for_a_prompt_override(config, task):
+    """--prompt skips the plan phase, so nothing could carry the brief to a review."""
+    slug, paths = task
+    storage.save_state(
+        paths,
+        TaskState(slug=slug, status=TaskStatus.BLOCKED, reason="which db?"),
+    )
+    prompts: list[str] = []
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="do the thing",
+    )
+    # The review after the turn still runs, and carries neither field.
+    assert len(prompts) == 1
+    assert "which db?" not in prompts[0]
+    assert "Brief from the task owner" not in prompts[0]
+
+
 def test_loop_stops_at_max_iterations(config, task):
     from dataclasses import replace
 
@@ -136,7 +234,51 @@ def test_loop_stops_at_max_iterations(config, task):
     assert result.status is TaskStatus.BLOCKED
     assert "max_iterations" in result.reason
     assert result.iterations == 3
-    assert storage.load_state(paths, slug).reason == "max_iterations reached"
+    assert (
+        storage.load_state(paths, slug).reason
+        == "max_iterations reached after 3 turns this run (3 total)"
+    )
+
+
+def test_max_iterations_is_a_run_budget_not_a_lane_total(config, task):
+    """A lane that already spent turns gets this run's whole budget.
+
+    The regression this pins: budgeting off the durable counter handed a resumed
+    lane only what was left of an earlier run's cap, so a lane sitting at 45 of
+    the old 50-turn cap got five turns and then a permanent BLOCKED that no brief
+    could argue its way past.
+    """
+    from dataclasses import replace
+
+    slug, paths = task
+    storage.save_state(paths, TaskState(slug=slug, iteration=45))
+    config = replace(config, max_iterations=2)
+    prompts: list[str] = []
+    seen: list[object] = []
+
+    def runner(prov, spec):
+        seen.append(spec.log_path)
+        return _managed_runner_ok(prov, spec)
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"verdict":"continue","next_prompt":"again"}'
+
+    result = run_task(
+        slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go"
+    )
+
+    assert result.status is TaskStatus.BLOCKED
+    # Two turns spent this run, on top of the 45 the lane already had.
+    assert result.iterations == 47
+    assert result.reason == "max_iterations reached after 2 turns this run (47 total)"
+    # The run-local count never reaches the log names: they come off the durable
+    # counter, so this run's files land after the earlier lane's instead of
+    # overwriting iter-0001 the way a reset counter would.
+    assert [p.name for p in seen] == [
+        "iter-0046.managed.log",
+        "iter-0047.managed.log",
+    ]
 
 
 def test_first_turn_applies_marker(config, task):
@@ -356,6 +498,55 @@ def test_active_step_slot_resolves_and_recomputes_each_turn(config, task):
         ("--model", "def-model"),  # turn 1: no active step -> default binding
         ("--model", "think-model"),  # turn 2: s1 active with slot 'thinker'
     ]
+
+
+def test_cancelled_step_does_not_drive_the_model_slot(config, task):
+    """A cancelled step is not active, so it cannot supply the turn's model."""
+    import json as _json
+    from dataclasses import replace as _replace
+
+    slug, paths = task
+    cfg = _replace(config, models={"code": "anthropic/claude-opus-4-1"})
+    paths.checklist.write_text(
+        _json.dumps(
+            {
+                "steps": {"1-old": {"status": "cancelled", "model": "code"}},
+                "remarks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    specs = []
+
+    def runner(provider, spec):
+        specs.append(spec)
+        return _managed_runner_ok(provider, spec)
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"done"}'
+
+    run_task(slug, cfg, FakeProvider(), runner, operator_invoker, first_prompt="go")
+    assert "--model" not in specs[0].extra_args
+
+
+def test_all_cancelled_checklist_completes_the_lane(config, task):
+    """A lane whose every step was declined is finished, not left open."""
+    import json as _json
+
+    slug, paths = task
+    paths.checklist.write_text(
+        _json.dumps({"steps": {"1-x": {"status": "cancelled"}}}), encoding="utf-8"
+    )
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"continue","next_prompt":"go"}'
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+    assert result.status is TaskStatus.COMPLETE
+    assert result.iterations == 1
 
 
 def test_active_step_slot_overrides_and_extra_args_keep_order(config, task):
@@ -1946,7 +2137,7 @@ def test_problem_repeat_cap_zero_disables_and_max_iterations_governs(config, tas
     )
 
     assert result.status is TaskStatus.BLOCKED
-    assert result.reason == "max_iterations reached"
+    assert result.reason == "max_iterations reached after 4 turns this run (4 total)"
     assert result.iterations == 4
 
 
@@ -1983,7 +2174,7 @@ def test_negative_problem_repeat_cap_warns_and_leaves_max_iterations_governing(
     )
 
     assert result.status is TaskStatus.BLOCKED
-    assert result.reason == "max_iterations reached"
+    assert result.reason == "max_iterations reached after 4 turns this run (4 total)"
     assert result.iterations == 4
 
 

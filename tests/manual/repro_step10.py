@@ -58,7 +58,7 @@ def _lane(ws: Path, slug: str, steps: dict, **cfg_kwargs) -> tuple[Config, str, 
     config = replace(Config(workspace_root=ws), **cfg_kwargs)
     paths = config.task_paths(slug)
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.meta.write_text("Prove the per-step model slot behaviors.\n", encoding="utf-8")
+    paths.goal.write_text("Prove the per-step model slot behaviors.\n", encoding="utf-8")
     paths.checklist.write_text(
         json.dumps({"steps": steps, "remarks": []}), encoding="utf-8"
     )

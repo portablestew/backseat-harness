@@ -32,8 +32,10 @@ turn_timeout_s = 3600
 # comparable against a file-backed CLI's numbers.
 compact_threshold_bytes = 1000000
 
-# Loop budget guards.
-max_iterations = 50
+# Loop budget guards. max_iterations and max_wall_clock_s are scoped to one `run`
+# call, not to the lane's whole life: a resumed lane gets a fresh budget, and
+# state.json's iteration keeps counting up across runs.
+max_iterations = 30
 max_wall_clock_s = 86400
 max_generations = 20
 

@@ -32,7 +32,7 @@ def test_prompt_opens_with_operator_meta_tag():
     """Every operator prompt starts with the UUID-free operator session tag."""
     plan = build_prompt(
         ReviewInputs(
-            meta_prompt="Goal", checklist=Checklist(), managed_fork="",
+            goal_prompt="Goal", checklist=Checklist(), managed_fork="",
             outcome=None, iteration=0, task_dir=".backseat/tasks/demo",
         )
     )
@@ -40,7 +40,7 @@ def test_prompt_opens_with_operator_meta_tag():
 
     review = build_prompt(
         ReviewInputs(
-            meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+            goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
             outcome=_outcome(), iteration=1, task_dir=".backseat/tasks/demo",
         )
     )
@@ -49,7 +49,7 @@ def test_prompt_opens_with_operator_meta_tag():
 
 def test_prompt_meta_tag_omits_unknown_slug():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
     )
     assert build_prompt(inputs).startswith("<meta>OPERATOR SESSION review</meta>\n\n")
@@ -57,7 +57,7 @@ def test_prompt_meta_tag_omits_unknown_slug():
 
 def test_build_prompt_includes_problem_hint():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(exit_code=1), iteration=2,
     )
     prompt = build_prompt(inputs)
@@ -67,7 +67,7 @@ def test_build_prompt_includes_problem_hint():
 
 def test_build_prompt_no_hint_on_clean_exit():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
     )
     assert "abnormally" not in build_prompt(inputs)
@@ -87,7 +87,7 @@ def test_parse_takes_last_verdict_object():
 
 def test_plan_prompt_for_empty_checklist_asks_for_titled_steps():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="",
         outcome=None, iteration=0, task_dir=".backseat/tasks/demo",
     )
     prompt = build_prompt(inputs)
@@ -101,7 +101,7 @@ def test_plan_prompt_for_empty_checklist_asks_for_titled_steps():
 def test_plan_prompt_with_existing_checklist_replans():
     cl = Checklist(steps={"a": {"title": "A", "status": "active"}})
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=cl, managed_fork="fork",
+        goal_prompt="Goal", checklist=cl, managed_fork="fork",
         outcome=None, iteration=3,
     )
     prompt = build_prompt(inputs)
@@ -111,7 +111,7 @@ def test_plan_prompt_with_existing_checklist_replans():
 
 def test_verify_commands_listed_when_configured():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1, verify_commands=["pytest -q"],
     )
     assert "`pytest -q`" in build_prompt(inputs)
@@ -122,7 +122,7 @@ def test_verify_commands_listed_when_configured():
 
 def test_model_slots_rendered_with_default_binding_bullet():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
         model_slots=("default", "thinker"),
     )
@@ -137,7 +137,7 @@ def test_model_slots_rendered_with_default_binding_bullet():
 
 def test_model_slots_configured_key_skips_default_duplicate():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
         model_slots=("default", "fast", "thinker"),
     )
@@ -147,7 +147,7 @@ def test_model_slots_configured_key_skips_default_duplicate():
 
 def test_model_slots_empty_renders_single_line():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
     )
     prompt = build_prompt(inputs)
@@ -162,7 +162,7 @@ def test_slot_warning_reaches_the_prompt_verbatim():
         "defines; running the default model instead"
     )
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
         model_slots=("fast",), slot_warning=warning,
     )
@@ -173,7 +173,7 @@ def test_slot_warning_reaches_the_prompt_verbatim():
 
 def test_response_format_documents_the_model_field():
     inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
         outcome=_outcome(), iteration=1,
     )
     prompt = build_prompt(inputs)
@@ -194,7 +194,7 @@ def test_prompt_lists_handoff_docs():
     from backseat_harness.operator import ReviewInputs, build_prompt
 
     base = dict(
-        meta_prompt="goal", checklist=Checklist(), managed_fork="", outcome=None,
+        goal_prompt="goal", checklist=Checklist(), managed_fork="", outcome=None,
         iteration=0, task_dir=".backseat/tasks/t",
     )
     empty = build_prompt(ReviewInputs(**base))
@@ -278,3 +278,61 @@ def test_only_recent_remarks_are_inlined_and_older_ones_point_at_the_file():
     assert "remark-9" not in out
     assert "..[10 earlier remarks omitted" in out
     assert "checklist.json" in out
+
+
+def test_prompt_renders_the_owner_brief_with_precedence():
+    """A brief is the human speaking now, and the prompt says so out loud."""
+    inputs = ReviewInputs(
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="",
+        outcome=None, iteration=0, task_dir=".backseat/tasks/t",
+        owner_brief="Keep the shared budget.",
+    )
+    out = build_prompt(inputs)
+    assert "## Brief from the task owner" in out
+    assert "Keep the shared budget." in out
+    assert "it wins" in out
+    # The plan instruction tells the operator to act on it, not just read it.
+    assert "brief above is new input from this run" in out
+
+
+def test_prompt_pairs_the_question_with_the_answer():
+    """The operator has no memory of asking, so the question rides the prompt."""
+    inputs = ReviewInputs(
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="",
+        outcome=None, iteration=45, task_dir=".backseat/tasks/t",
+        owner_brief="Keep the shared budget.",
+        pending_question="D1: split the retry budget, or keep it shared?",
+    )
+    out = build_prompt(inputs)
+    assert "## Your question, and the owner's answer" in out
+    assert "### Your question" in out
+    assert "D1: split the retry budget, or keep it shared?" in out
+    assert "### Their answer" in out
+    assert "Keep the shared budget." in out
+    assert "close the step you left blocked" in out
+    # The question precedes the answer, so the answer is legible as an answer.
+    assert out.index("D1: split") < out.index("Keep the shared budget.")
+
+
+def test_prompt_omits_the_note_section_when_there_is_no_note():
+    inputs = ReviewInputs(
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="",
+        outcome=None, iteration=0, task_dir=".backseat/tasks/t",
+    )
+    out = build_prompt(inputs)
+    assert "Brief from the task owner" not in out
+    assert "the owner's answer" not in out
+
+
+def test_prompt_never_clips_the_question_or_the_note():
+    """The question is 1,129 chars in practice; clipping it defeats the point."""
+    long_question = "Which model id? " * 200
+    long_brief = "Use anthropic. " * 200
+    inputs = ReviewInputs(
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="",
+        outcome=None, iteration=45, task_dir=".backseat/tasks/t",
+        owner_brief=long_brief, pending_question=long_question,
+    )
+    out = build_prompt(inputs)
+    assert long_question.strip() in out
+    assert long_brief.strip() in out

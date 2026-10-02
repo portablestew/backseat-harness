@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -237,6 +238,13 @@ class LedgerEntry:
     def to_dict(self) -> dict[str, Any]:
         return {
             "at": self.at,
+            # Derived, never read back: `at` stays the float so sorting and
+            # arithmetic on the audit trail are unaffected, and this is what a
+            # human reads. Written local-time with an offset rather than UTC so
+            # the wall-clock in a log line matches the one in the terminal.
+            "at_local": datetime.fromtimestamp(self.at).astimezone().isoformat(
+                timespec="seconds"
+            ),
             "phase": self.phase,
             "iteration": self.iteration,
             "generation": self.generation,

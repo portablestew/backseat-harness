@@ -74,3 +74,40 @@ def test_load_missing_returns_defaults(config):
     assert storage.load_binding(paths) is None
     state = storage.load_state(paths, "missing")
     assert state.iteration == 0
+
+
+def test_ledger_entry_carries_a_readable_timestamp(config):
+    """Every entry gets `at` (epoch, for sorting) and `at_local` (for a human)."""
+    import datetime
+    import json
+
+    paths = config.task_paths("t1")
+    storage.append_ledger(
+        paths,
+        LedgerEntry(
+            iteration=1, generation=1, verdict=VerdictKind.CONTINUE,
+            exit_code=0, timed_out=False, duration_s=1.0, at=1_750_000_000.0,
+        ),
+    )
+    row = json.loads(paths.ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert row["at"] == 1_750_000_000.0
+    assert "at_local" in row
+    # Derived from `at`, local time with an offset, second resolution.
+    local = datetime.datetime.fromisoformat(row["at_local"])
+    assert local.utcoffset() is not None
+    assert abs(local.timestamp() - 1_750_000_000.0) < 1.0
+    assert len(row["at_local"]) == len("2025-06-15T09:46:40-07:00")
+
+
+def test_ledger_reads_back_without_the_derived_field(config):
+    """`at_local` is write-only: a row written before it existed still loads."""
+    paths = config.task_paths("t1")
+    paths.ledger.parent.mkdir(parents=True, exist_ok=True)
+    paths.ledger.write_text(
+        '{"at": 1750000000.0, "iteration": 1, "generation": 1, '
+        '"verdict": "continue", "exit_code": 0, "timed_out": false, '
+        '"duration_s": 1.0}\n',
+        encoding="utf-8",
+    )
+    entries = list(storage.read_ledger(paths))
+    assert [e.iteration for e in entries] == [1]

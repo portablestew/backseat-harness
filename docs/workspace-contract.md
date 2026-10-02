@@ -14,8 +14,8 @@ sections are ignored, not rejected.
 .backseat/
   config.toml                # harness defaults, provider prefs, budgets
   tasks/
-    <task-slug>/             # one lane = one meta-prompt goal
-      meta.md                # the meta-prompt (free text)
+    <task-slug>/             # one lane = one goal
+      goal.md                # the goal-prompt (free text)
       config.toml            # optional per-task overrides (highest config layer)
       checklist.json         # durable, append-only-in-spirit progress map
       binding.json           # root_uuid -> generation chain (recoverable cache)
@@ -29,6 +29,17 @@ sections are ignored, not rejected.
 A task slug must be filesystem-safe. Lanes are independent: separate session
 chain, checklist, binding, and ledger. Multi-lane parallelism is out of scope
 for v0.1, but `task_dir` is a parameter from day one so it stays cheap to add.
+
+`run <slug> [GOAL|BRIEF]` reads its second argument two ways, and nothing on
+disk records which reading applied. With `goal.md` missing or empty it is the
+goal, written once and never rewritten. With `goal.md` populated it is a
+**brief**: the task owner's words for that run alone, handed to the operator on
+the plan-phase call and to nothing else, so it leaves no file behind and the
+next run does not see it. A brief outranks the goal-prompt where they conflict.
+Text equal to the goal-prompt is ignored rather than injected. A lane that is
+`blocked` or `complete` refuses a bare `run`; `-p` is exempt because it skips
+the operator, and a brief paired with `-p` is refused because that leaves the
+brief nowhere to go.
 
 ## config.toml
 
@@ -51,8 +62,8 @@ agent = "..."                  # optional: named provider agent for managed turn
 extra_args = []                # flags per managed turn; where you grant perms
 turn_timeout_s = 3600          # hard per-turn ceiling for a managed turn
 compact_threshold_bytes = 1000000
-max_iterations = 50
-max_wall_clock_s = 86400
+max_iterations = 30             # managed turns per run (not per lane)
+max_wall_clock_s = 86400        # per run
 max_generations = 20
 problem_repeat_cap = 3        # consecutive identical-prompt PROBLEMs before
                                # BLOCKED as stuck; 0 = disabled (max_iterations)
@@ -159,8 +170,10 @@ harness validates and merges it. Rules:
   slot *name*, not a model id: it is resolved against `[models]` every turn
   (never at merge), and stored here with no semantics of its own.
 - **Free status.** A step's `status` may be set to any of `pending`, `active`,
-  `blocked`, or `done` at any time -- there is no forward-only ordering, so the
-  operator can move a step back to redo it. Invalid values are ignored.
+  `blocked`, `done`, or `cancelled` at any time -- there is no forward-only
+  ordering, so the operator can move a step back to redo it, including out of
+  `cancelled`. Invalid values are ignored. `done` and `cancelled` both satisfy
+  the completion gate: a step the owner declined is settled, not outstanding.
 - **`remarks`** is a freeform append-only log channel.
 
 ```json
@@ -228,18 +241,28 @@ end a lane. A misconfigured `history_provider` is the exception: it raises
 }
 ```
 
+`iteration` is the lane's lifetime count of managed turns, and it only ever goes
+up: it names the log files and stamps the ledger, so it is not the run budget.
+`max_iterations` bounds one `run` call's turns instead, counted in memory — a
+resumed or taken-over lane starts each run with the full budget. A run that
+exhausts it records both counts in `reason`
+(`max_iterations reached after 30 turns this run (47 total)`), since the two
+differ for any lane past its first run.
+
 ## ledger.jsonl
 
 Append-only, one JSON object per operator decision. It is written **last**
 (after checklist + binding + state), so its final line marks the last
 fully-committed step — the anchor for crash recovery. `phase` is `"plan"` for a
 decision made with no managed turn (a new or resumed run; `iteration` is the
-number of turns so far) and `"review"` after a managed turn. `next_prompt` is
+lane's turn count so far) and `"review"` after a managed turn. `next_prompt` is
 the exact prompt the operator queued for the next turn (`null` when the
-verdict queues none).
+verdict queues none). Every line carries both `at` (epoch float, for sorting)
+and `at_local` (ISO-8601 with offset, derived on write and never read back, so
+a reader never has to convert a timestamp by hand).
 
 ```json
-{"at": 1750003600.0, "phase": "review", "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next", "next_prompt": "Add a test for GET /hello ..."}
+{"at": 1750003600.0, "at_local": "2025-06-15T09:46:40-07:00", "phase": "review", "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next", "next_prompt": "Add a test for GET /hello ..."}
 ```
 
 ## transcript.md

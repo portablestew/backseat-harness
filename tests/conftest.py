@@ -92,10 +92,10 @@ def stub_history(monkeypatch):
 
 @pytest.fixture
 def task(config: Config):
-    """Create a task lane with a meta-prompt and empty checklist."""
+    """Create a task lane with a goal-prompt and empty checklist."""
     slug = "demo"
     paths = config.task_paths(slug)
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.meta.write_text("Build a thing.\n", encoding="utf-8")
+    paths.goal.write_text("Build a thing.\n", encoding="utf-8")
     paths.checklist.write_text(json.dumps({"steps": {}, "remarks": []}), encoding="utf-8")
     return slug, paths

@@ -15,7 +15,7 @@ a black box.
 ## How it works
 
 ```
-your meta-prompt (goal)
+your goal-prompt (the goal)
    │
    ▼
 ┌─────────────────────────── loop (one task lane) ───────────────────────────┐
@@ -24,7 +24,7 @@ your meta-prompt (goal)
 │    → (if transcript > ~1MB) start a new generation seeded with a chat-fork   │
 │  spawn managed agent, non-interactive, one shot                              │
 │    → wait for process exit          ← turn is over                           │
-│  fresh operator reviews: meta-prompt + checklist + chat-fork + outcome       │
+│  fresh operator reviews: goal-prompt + checklist + chat-fork + outcome       │
 │    → emits a JSON verdict on stdout                                          │
 │  harness applies verdict: merge checklist, update binding, append ledger     │
 │    → continue | done | ask_human | problem                                   │
@@ -113,17 +113,31 @@ backseat-harness run hello-endpoint "Add a GET /hello endpoint returning JSON."
 # resume later (the operator re-assesses and picks the next step; nothing else to pass)
 backseat-harness run hello-endpoint
 
+# add your own words to a run: the second argument on a lane that already has a
+# goal is a brief from you, not a new goal. It rides the operator's plan-phase
+# prompt, outranks the goal where they conflict, and ends with the run.
+backseat-harness run hello-endpoint "Skip the caching step for now."
+
+# answer an ask_human pause. This is the normal way: the operator asked, the
+# operator is told, and the question is reprinted above your answer.
+backseat-harness run hello-endpoint "Use SQLite; no external service."
+
+# or drive the session yourself, then auto-resume
+backseat-harness takeover hello-endpoint
+
 # optional: scaffold without running, or force the first managed prompt
 backseat-harness init hello-endpoint "..."
 backseat-harness run hello-endpoint -p "Start by locating the router."
-
-# answer an ask_human pause by driving the session yourself, then auto-resume
-backseat-harness takeover hello-endpoint
 
 # check progress (add --format json for machine-readable output)
 backseat-harness status hello-endpoint
 backseat-harness list
 ```
+
+A lane that is `blocked` or `complete` refuses a bare `run`: it prints the
+pending question in full and tells you the brief-argument form to resume it with.
+Repeating the goal-prompt verbatim is ignored rather than injected, so a wrapper
+that forwards its config cannot spam the operator with your own brief.
 
 Run everything against a specific workspace with `-C /path/to/workspace`.
 
@@ -156,6 +170,7 @@ result = run_task(
     managed_runner=run_turn,          # or inject your own
     operator_invoker=my_operator_invoker, # str prompt -> str final message
     first_prompt=None,                # None: the operator plans first
+    owner_brief=None,                  # or the task owner's words for this run
 )
 print(result.status, result.iterations)
 ```
@@ -163,12 +178,25 @@ print(result.status, result.iterations)
 The managed runner and system invoker are injected, so the loop is fully
 deterministic and testable without a live CLI.
 
-## Human takeover
+## Human takeover and briefs
 
 When the operator hits something only you can settle — an ambiguous goal, a
 product call, a credential — it returns the `ask_human` verdict and the loop
-blocks the lane (`status` shows `blocked`, with the question as the reason). Answer it by
-taking the wheel:
+blocks the lane (`status` shows `blocked`, with the question as the reason).
+
+**Usually you answer with a brief**, because the operator is the party that asked:
+
+```bash
+backseat-harness run hello-endpoint "Use SQLite; no external service."
+```
+
+The operator is re-invoked to re-plan, and its prompt carries your question
+first and your answer under it — it has no memory of having asked, and an
+answer with nothing attached is not answerable. You may also add a brief to a
+lane that is merely `continue`, or to a `complete` one to open more work.
+
+**Take over the wheel** when the conversation belongs to the agent itself rather
+than to the operator:
 
 ```bash
 backseat-harness takeover hello-endpoint
@@ -178,9 +206,15 @@ This opens the managed session in the CLI's own interactive UI (for opencode,
 the TUI at the current generation's session), attached to your terminal. Drive
 the conversation as far as you need to remove the ambiguity, then quit. The
 harness is blocked on that process; when it exits, the operator re-plans from
-the session you just advanced and the loop continues. Because your input lands
-as the managed agent's own conversation history, the operator sees it as
-context on the next turn — no separate answer channel needed.
+the session you just advanced and the loop continues. Your input lands as the
+managed agent's own conversation history, so the operator sees it as context on
+the next turn. The pending question is printed before the handoff.
+
+The two are not interchangeable. A brief never reaches the managed agent; a
+takeover never speaks to the operator directly. So a question about the agent's
+own work takes a takeover, and a decision the operator escalated — a product
+call, a config choice, a ruling on a finding — takes a brief, because the managed
+agent has no standing to answer it.
 
 `--no-resume` hands off without running the loop afterward, for when you just
 want to poke at the session. And the session is an ordinary CLI session, so you

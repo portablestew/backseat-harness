@@ -247,7 +247,7 @@ def main(argv: list[str]) -> int:
     )
     paths = config.task_paths("live-kiro-v2")
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.meta.write_text(
+    paths.goal.write_text(
         "Prove the harness surfaces kiro's --model outcome on both channels (see verdict).\n",
         encoding="utf-8",
     )

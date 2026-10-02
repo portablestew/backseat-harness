@@ -38,7 +38,7 @@ the managed agent's job.
 
 Every prompt you write reaches the agent as a user message and acts with a user's
 authority. Say exactly what you mean. The human who owns the task is not in the
-conversation; their intent is the meta-prompt, and you reach them only by
+conversation; their intent is the goal-prompt, and you reach them only by
 escalating (`ask_human`).
 
 Invoked fresh each decision, no memory of earlier ones, and **only your final
@@ -107,7 +107,7 @@ Standing rules for the review:
 - **Your tools are read-only checks**: reading files, searching, and the git
   inspection commands you're allowed. Running the app or tests, exploring an
   unfamiliar codebase, researching a library — the agent's job.
-- **The task directory (`<task_dir>`) already exists**, holding the meta-prompt,
+- **The task directory (`<task_dir>`) already exists**, holding the goal-prompt,
   checklist, and ledger. It is gitignored, so a search that skips ignored paths may
   miss it. Read it by path.
 

@@ -1,9 +1,17 @@
 """Thin CLI wrapper over the loop library.
 
-Subcommands: init (scaffold a task lane), run (drive a task), status, list.
-Every command supports ``--format json`` so a parent workflow can wait on the
-process and parse machine-readable output. The CLI wires real subprocess
+Subcommands: init (scaffold a task lane), run (drive a task), takeover, status,
+list. Every command supports ``--format json`` so a parent workflow can wait on
+the process and parse machine-readable output. The CLI wires real subprocess
 runners for the managed and operator agents; the loop itself stays injectable.
+
+``run <slug> [GOAL|BRIEF]`` reads its second argument two ways. On a lane with no
+goal-prompt yet it is the goal, and it is required. On a lane that already has
+one it is a brief from the task owner for this run only: it rides the
+plan-phase operator prompt, outranks the goal-prompt where they conflict, and
+ends with the run. That is how an ``ask_human`` pause gets answered without a
+separate verb -- and it is why a lane that is blocked or complete refuses a bare
+resume.
 """
 
 from __future__ import annotations
@@ -12,9 +20,10 @@ import argparse
 import json
 import sys
 
-from backseat_harness import __version__, logs, progress, spawn
+from backseat_harness import __version__, logs, progress, spawn, storage
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
 from backseat_harness.loop import OperatorReply, run_task
+from backseat_harness.models import TaskStatus
 from backseat_harness.operator import load_persona
 from backseat_harness.providers import get_provider
 from backseat_harness.providers.base import Provider, SpawnSpec
@@ -51,18 +60,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="scaffold a task lane under .backseat/tasks/")
     init.add_argument("slug", help="task slug (filesystem-safe)")
-    init.add_argument("meta", nargs="?", help="meta-prompt text; omit to create an empty meta.md")
+    init.add_argument(
+        "goal", nargs="?", help="goal-prompt text; omit to create an empty goal.md"
+    )
     init.set_defaults(func=_cmd_init)
 
     run = sub.add_parser(
         "run",
-        help="drive a task lane (creates it when a meta-prompt is given for a new slug)",
+        help="drive a task lane (creates it when a goal-prompt is given for a new slug)",
     )
     run.add_argument("slug")
     run.add_argument(
-        "meta",
+        "goal",
         nargs="?",
-        help="meta-prompt (the goal); required the first time a task is run",
+        metavar="GOAL|BRIEF",
+        help="the goal-prompt when the lane has none yet; on a lane that already "
+        "has one, a brief from you added to this run's operator prompt. Required "
+        "for a new task, and for one that is blocked or complete",
     )
     run.add_argument(
         "-p",
@@ -97,8 +111,8 @@ def _cmd_init(args) -> int:
     config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     paths.root.mkdir(parents=True, exist_ok=True)
-    if not paths.meta.exists():
-        paths.meta.write_text((args.meta or "") + "\n", encoding="utf-8")
+    if not paths.goal.exists():
+        paths.goal.write_text((args.goal or "") + "\n", encoding="utf-8")
     if not paths.checklist.exists():
         paths.checklist.write_text('{\n  "steps": {},\n  "remarks": []\n}\n', encoding="utf-8")
     _emit(
@@ -112,10 +126,31 @@ def _cmd_init(args) -> int:
 def _cmd_run(args) -> int:
     config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
-    error = _ensure_meta(paths, args.meta)
+    error, brief = _ensure_goal(paths, args.goal)
     if error:
         _emit(args, {"slug": args.slug, "error": error}, error)
         return 2
+    if brief and args.prompt:
+        error = (
+            "a brief needs the operator, and --prompt skips it; drop --prompt, "
+            "or put the instruction in --prompt itself"
+        )
+        _emit(args, {"slug": args.slug, "error": error}, error)
+        return 2
+    if not brief and not args.prompt:
+        # No brief means "just carry on", which is only true of a lane already
+        # carrying on. Anything else -- blocked on a question, or finished --
+        # needs the owner to say something, and resuming anyway is how a
+        # pending question gets silently dropped on the floor.
+        #
+        # --prompt is exempt: it is the explicit "skip the operator" override,
+        # so it is already the owner saying what happens next. Gating it would
+        # remove the only way to drive a blocked lane with the operator out of
+        # the loop entirely.
+        block = _resume_block(paths, args.slug)
+        if block is not None:
+            _emit(args, {"slug": args.slug, "error": block}, block)
+            return 2
 
     provider = get_provider(config.provider)
     managed_runner = run_turn
@@ -128,9 +163,33 @@ def _cmd_run(args) -> int:
         managed_runner=managed_runner,
         operator_invoker=operator_invoker,
         first_prompt=args.prompt,
+        owner_brief=brief,
     )
     _emit(args, result.to_dict(), _result_line(result))
     return 0 if result.status.value in {"complete", "blocked"} else 1
+
+
+def _resume_block(paths: TaskPaths, slug: str) -> str | None:
+    """Why a bare ``run <slug>`` may not proceed, or None when it may.
+
+    A lane is resumable only while it is ``continue``. ``blocked`` and
+    ``complete`` both need the owner's word first, and the message says so with
+    the exact command -- the question is quoted whole, because it is addressed
+    to the person reading the terminal and ``progress`` truncated it to 110
+    characters on the way out.
+    """
+    if not paths.state.exists():
+        return None
+    state = storage.load_state(paths, slug)
+    if state.status is TaskStatus.CONTINUE:
+        return None
+    quoted = " ".join(state.reason.split()) or "(no reason recorded)"
+    return (
+        f"task '{slug}' is {state.status.value}, not continue, so it needs a "
+        f"brief from you rather than a bare resume.\n"
+        f"  reason: {quoted}\n"
+        f"  resume it with: backseat-harness run {slug} \"<your answer or new instruction>\""
+    )
 
 
 def _result_line(result) -> str:
@@ -138,8 +197,9 @@ def _result_line(result) -> str:
 
     On ``complete`` the reason is the operator's last note, already echoed by
     the stderr progress line, so it is omitted. ``blocked`` keeps it (the
-    question for the human, which progress truncated, or the budget guard like
-    "max_iterations reached" that is not printed anywhere else).
+    question for the human, which progress truncated, or the budget guard, whose
+    reason carries this run's turn count alongside the lane total because the two
+    differ once a lane has been run more than once).
     """
     line = f"{result.slug}: {result.status.value} after {result.iterations} iterations"
     if result.status.value != "complete" and result.reason:
@@ -150,18 +210,29 @@ def _result_line(result) -> str:
 def _cmd_takeover(args) -> int:
     """Human takeover: drive the managed session by hand, then resume the loop.
 
-    This is how you answer an ``ask_human`` pause. The harness blocks on the
-    interactive CLI; when you quit, the operator re-plans from the session you
-    just advanced (unless --no-resume), so your clarifications land as the
-    managed agent's own history rather than as harness text.
-    """
-    from backseat_harness import storage
+    Complements ``run <slug> "brief"``, and the two are not interchangeable.
+    Takeover mutates the *managed* session: the owner talks to the agent itself
+    and the operator re-plans from the history that produced. A brief mutates the
+    *operator's* brief and never reaches the agent. So a question about the
+    agent's own work takes a takeover, while a decision the operator escalated
+    -- a product call, a config choice, a ruling on a finding -- takes a brief,
+    because the operator is the party that asked and the managed agent has no
+    standing to answer.
 
+    The pending question is printed before the handoff. The owner is about to be
+    dropped into a chat window with an agent that has no idea a question is
+    outstanding, and ``progress`` truncated that question to 110 characters on
+    the way out; here it is whole.
+    """
     config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
-    if not paths.meta.exists():
+    if not paths.goal.exists():
         _emit(args, {"slug": args.slug, "error": "unknown task"}, f"No task '{args.slug}'")
         return 2
+    if paths.state.exists():
+        state = storage.load_state(paths, args.slug)
+        if state.status is TaskStatus.BLOCKED and state.reason:
+            print(f"This lane is blocked on a question from the operator:\n  {state.reason}")
 
     provider = get_provider(config.provider)
     binding = storage.load_binding(paths)
@@ -195,8 +266,6 @@ def _cmd_takeover(args) -> int:
 
 
 def _cmd_status(args) -> int:
-    from backseat_harness import storage
-
     config = load_config(args.workspace, args.slug)
     paths = config.task_paths(args.slug)
     if not paths.state.exists():
@@ -223,31 +292,42 @@ def _cmd_list(args) -> int:
     return 0
 
 
-def _ensure_meta(paths: TaskPaths, meta: str | None) -> str | None:
-    """Create the task lane from the meta-prompt argument if needed.
+def _ensure_goal(paths: TaskPaths, text: str | None) -> tuple[str | None, str | None]:
+    """Resolve the ``run``/``init`` positional into ``(error, brief)``.
 
-    Returns an error or None. A lane's goal is fixed once written: a different
-    meta-prompt for an existing lane is an error rather than a silent rewrite
-    (edit meta.md deliberately).
-    """
-    if paths.meta.exists():
-        existing = paths.meta.read_text(encoding="utf-8").strip()
-        if meta is not None and meta.strip() != existing:
-            return (
-                f"task already has a different meta-prompt at {paths.meta}; "
-                "edit that file or drop the meta-prompt argument"
-            )
+The discriminator is whether ``goal.md`` has content, not whether this is the
+first ``run``: a lane scaffolded by ``init`` has an empty ``goal.md`` and
+still needs its goal, and a lane that has one is offering the slot as a brief
+from the owner. A lane whose goal is the empty string and whose argument
+differs is therefore a *goal*, not a brief, so the emptiness check has to
+come first: `init` leaves the file empty, and testing a new lane's argument
+against it for a difference first refuses the goal outright and then
+dead-ends the alternative it suggests.
+
+Text equal to the goal is ignored, not injected. Passing the goal back is
+the shape of a wrapper that forwards its configuration blindly, and the
+owner repeating their own brief back at the operator is noise, not signal.
+"""
+    if paths.goal.exists():
+        existing = paths.goal.read_text(encoding="utf-8").strip()
         if not existing:
-            return (
-                f"meta-prompt at {paths.meta} is empty; write the goal there "
-                "or pass it as the second argument"
-            )
-        return None
-    if not meta or not meta.strip():
-        return f"new task: pass the goal as the second argument (no {paths.meta} yet)"
+            # Scaffolded but never given a goal: the argument is the goal.
+            if not text or not text.strip():
+                return (
+                    f"goal-prompt at {paths.goal} is empty; write the goal there "
+                    "or pass it as the second argument",
+                    None,
+                )
+            paths.goal.write_text(text.strip() + "\n", encoding="utf-8")
+            return None, None
+        if text is None or not text.strip() or text.strip() == existing:
+            return None, None
+        return None, text.strip()
+    if not text or not text.strip():
+        return f"new task: pass the goal as the second argument (no {paths.goal} yet)", None
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.meta.write_text(meta.strip() + "\n", encoding="utf-8")
-    return None
+    paths.goal.write_text(text.strip() + "\n", encoding="utf-8")
+    return None, None
 
 
 def _make_operator_invoker(config: Config, op_config: OperatorConfig):

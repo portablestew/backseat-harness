@@ -40,8 +40,11 @@ DEFAULT_OPERATOR_TIMEOUT_S = 1800
 # ~1MB transcript ~= 250-300k tokens: the preemptive compaction trigger.
 DEFAULT_COMPACT_THRESHOLD_BYTES = 1_000_000
 
-# Loop budget guards so the harness can never pink-sky into infinity.
-DEFAULT_MAX_ITERATIONS = 50
+# Loop budget guards, all scoped to one run_task call so no single invocation can
+# pink-sky into infinity: a lane is bounded per run, and the owner's next `run` is
+# a fresh budget. 30 rather than 50 to keep chunks small and let progress arrive in
+# more, shorter runs instead of one long unattended one.
+DEFAULT_MAX_ITERATIONS = 30
 DEFAULT_MAX_WALL_CLOCK_S = 24 * 3600
 # Cap on compaction generations to guard against a fork that itself exceeds the
 # threshold immediately (re-fork loop).
@@ -94,6 +97,9 @@ class Config:
     agent: str | None = None
     turn_timeout_s: int = DEFAULT_TURN_TIMEOUT_S
     compact_threshold_bytes: int = DEFAULT_COMPACT_THRESHOLD_BYTES
+    # Managed turns one run_task call may spend. Per run, not per lane:
+    # TaskState.iteration keeps counting across runs for the ledger and the log
+    # names, and this bounds a fresh budget against it.
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_wall_clock_s: int = DEFAULT_MAX_WALL_CLOCK_S
     max_generations: int = DEFAULT_MAX_GENERATIONS
@@ -149,8 +155,9 @@ class TaskPaths:
     root: Path
 
     @property
-    def meta(self) -> Path:
-        return self.root / "meta.md"
+    def goal(self) -> Path:
+        """The task's goal-prompt: what the owner asked for, fixed once written."""
+        return self.root / "goal.md"
 
     @property
     def config(self) -> Path:

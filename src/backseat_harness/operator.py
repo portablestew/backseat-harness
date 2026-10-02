@@ -44,7 +44,7 @@ def load_persona() -> str:
 
 @dataclass(frozen=True)
 class ReviewInputs:
-    meta_prompt: str
+    goal_prompt: str
     checklist: Checklist
     #: Transcript of the managed session, with the task's marker redacted.
     managed_fork: str
@@ -69,6 +69,18 @@ class ReviewInputs:
     #: capture unavailable). The untruncated record of the managed session so
     #: far, overwritten each turn and refreshed before a plan-phase call.
     transcript_file: str | None = None
+    #: The task owner's own words for this run, from ``run <slug> "<text>"`` on
+    #: a lane that already has a goal-prompt. Set only for the plan-phase call
+    #: that opens the run, so it is one-shot by construction: the brief reaches
+    #: the operator that re-plans, gets baked into the checklist and the first
+    #: prompt, and the run ends carrying it. None when the run was started
+    #: without one.
+    owner_brief: str | None = None
+    #: The question the operator escalated with, when the lane was left blocked
+    #: by an ``ask_human``. Captured from ``state.reason`` before the run
+    #: overwrites it, and rendered beside the brief: an answer with no question
+    #: attached is not answerable, and the operator has no memory of asking.
+    pending_question: str | None = None
 
     @property
     def is_planning(self) -> bool:
@@ -169,7 +181,8 @@ def build_prompt(inputs: ReviewInputs) -> str:
     else:
         transcript = ""
     return f"{head}\n\n" + _TEMPLATE.format(
-        meta_prompt=inputs.meta_prompt.strip(),
+        goal_prompt=inputs.goal_prompt.strip(),
+        owner_brief=_owner_brief_section(inputs),
         task_dir=task_dir,
         docs_dir=f"{task_dir}/docs",
         docs=docs,
@@ -179,6 +192,42 @@ def build_prompt(inputs: ReviewInputs) -> str:
         transcript=transcript,
         verify=verify,
         task=task,
+    )
+
+
+def _owner_brief_section(inputs: ReviewInputs) -> str:
+    """Render the task owner's brief for this run, and the question it answers.
+
+    Two shapes, one rule. With a ``pending_question`` the owner is answering
+    something the operator asked, so the question is reprinted above the answer
+    -- an answer with no question attached is not answerable, and the operator
+    is invoked fresh with no memory of having asked. Without one, the owner is
+    simply adding to the brief.
+
+    Both shapes state the precedence explicitly. The brief is the human speaking
+    now; the goal-prompt is what they wanted when the lane was created, and it
+    is never rewritten. Silently reconciling the two is the one thing this
+    section must not leave to inference.
+
+    Empty when there is no brief. Plan phase only: a brief can only ever arrive
+    on the call that opens a run, so this never renders mid-run.
+    """
+    if not inputs.owner_brief:
+        return ""
+    precedence = (
+        "Treat it as their present intent: where it contradicts the goal-prompt "
+        "above, it wins."
+    )
+    if not inputs.pending_question:
+        return (
+            "\n## Brief from the task owner\n"
+            f"{inputs.owner_brief.strip()}\n\n{precedence}\n"
+        )
+    return (
+        "\n## Your question, and the owner's answer\n"
+        "You left this lane blocked on the question below. The owner has "
+        f"answered it.\n\n### Your question\n{inputs.pending_question.strip()}"
+        f"\n\n### Their answer\n{inputs.owner_brief.strip()}\n\n{precedence}\n"
     )
 
 
@@ -230,11 +279,27 @@ def _plan_task(inputs: ReviewInputs) -> str:
             "with a short `title`. Then write the first prompt, which should "
             "almost always be a research step, not an edit."
         )
+    brief = ""
+    if inputs.owner_brief:
+        # The brief is rendered for this call only, so the instruction to act on
+        # it -- and to leave a trace -- belongs here too. A section the operator
+        # reads but no directive tells it to consume is how an answer gets
+        # acknowledged in the prompt and then ignored in the verdict; and since
+        # nothing persists the brief, whatever the next invocation needs has to be
+        # written into the checklist now or it is gone (Tenet 8).
+        brief = (
+            " The task owner's brief above is new input from this run: act on it, "
+            "and leave a trace of what it changed -- a remark for a decision, the "
+            "affected step's notes for a scope change. If it answers a question "
+            "you escalated on, close the step you left blocked and record the "
+            "decision in that step's evidence. If it drops a step you no longer "
+            "want, mark it `cancelled` rather than leaving it pending."
+        )
     return (
         f"## Your task: plan (before managed turn {inputs.iteration + 1})\n"
         f"{situation}\n"
         "If the goal is too ambiguous to plan responsibly, return `ask_human` "
-        "with the specific questions."
+        f"with the specific questions.{brief}"
     )
 
 
@@ -287,11 +352,11 @@ def parse_verdict(text: str) -> Verdict | None:
 
 _TEMPLATE = """# backseat-harness: operator call
 
-## Goal (meta-prompt)
-{meta_prompt}
-
+## Goal-prompt
+{goal_prompt}
+{owner_brief}
 ## Task directory
-`{task_dir}` holds the meta-prompt and checklist. You may point the managed
+`{task_dir}` holds the goal-prompt and checklist. You may point the managed
 agent at it for the big picture.
 
 ## Handoff docs (`{docs_dir}`)
@@ -321,7 +386,7 @@ Respond with a SINGLE JSON object and nothing after it:
     "steps": {{
       "step-id": {{
         "title": "short description (required when adding a step)",
-        "status": "pending|active|done|blocked",
+        "status": "pending|active|done|blocked|cancelled",
         "evidence": "what you verified, for done steps",
         "notes": "optional",
         "model": "optional slot name from the Model slots section (omit for the default model)"

@@ -80,7 +80,7 @@ def test_paths_derive_from_workspace(tmp_path):
     cfg = load_config(tmp_path)
     assert cfg.backseat_dir == tmp_path / ".backseat"
     tp = cfg.task_paths("mytask")
-    assert tp.meta == tmp_path / ".backseat" / "tasks" / "mytask" / "meta.md"
+    assert tp.goal == tmp_path / ".backseat" / "tasks" / "mytask" / "goal.md"
     assert tp.ledger.name == "ledger.jsonl"
 
 

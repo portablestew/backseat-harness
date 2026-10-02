@@ -1,11 +1,11 @@
-"""CLI lane creation: a `run` meta-prompt argument bootstraps a task."""
+"""CLI lane creation: `run`'s second argument is the goal, or a brief."""
 
 from backseat_harness import spawn
-from backseat_harness.cli import _ensure_meta, main
+from backseat_harness.cli import _ensure_goal, main
 from backseat_harness.config import load_config
 
 
-def test_run_requires_meta_for_new_task(tmp_path, capsys):
+def test_run_requires_goal_for_new_task(tmp_path, capsys):
     rc = main(["-C", str(tmp_path), "run", "fresh"])
     assert rc == 2
     assert "second argument" in capsys.readouterr().out
@@ -13,8 +13,8 @@ def test_run_requires_meta_for_new_task(tmp_path, capsys):
     assert not (tmp_path / ".backseat").exists()
 
 
-def test_run_accepts_positional_meta_for_new_task(tmp_path, monkeypatch):
-    """`run slug "goal"` creates meta.md; `run slug` alone does not."""
+def test_run_accepts_positional_goal_for_new_task(tmp_path, monkeypatch):
+    """`run slug "goal"` creates goal.md; `run slug` alone does not."""
     from conftest import FakeProvider
 
     import backseat_harness.cli as cli
@@ -29,28 +29,58 @@ def test_run_accepts_positional_meta_for_new_task(tmp_path, monkeypatch):
     rc = main(["-C", str(tmp_path), "run", "fresh", "Build the thing."])
     assert rc == 0
     paths = load_config(tmp_path).task_paths("fresh")
-    assert paths.meta.read_text(encoding="utf-8") == "Build the thing.\n"
+    assert paths.goal.read_text(encoding="utf-8") == "Build the thing.\n"
 
 
-def test_ensure_meta_creates_lane(tmp_path):
+def test_ensure_goal_creates_lane(tmp_path):
     paths = load_config(tmp_path).task_paths("fresh")
-    assert _ensure_meta(paths, "  Add GET /hello.  ") is None
-    assert paths.meta.read_text(encoding="utf-8") == "Add GET /hello.\n"
+    assert _ensure_goal(paths, "  Add GET /hello.  ") == (None, None)
+    assert paths.goal.read_text(encoding="utf-8") == "Add GET /hello.\n"
 
 
-def test_ensure_meta_accepts_same_goal_and_existing_lane(tmp_path):
+def test_ensure_goal_reads_second_argument_as_a_note(tmp_path):
+    """A lane with a goal turns a differing argument into a brief, not a rewrite."""
     paths = load_config(tmp_path).task_paths("t")
-    _ensure_meta(paths, "Goal")
-    assert _ensure_meta(paths, "Goal") is None
-    assert _ensure_meta(paths, None) is None
+    _ensure_goal(paths, "Goal")
+    assert _ensure_goal(paths, "D1: keep the shared budget") == (
+        None,
+        "D1: keep the shared budget",
+    )
+    # The goal is never rewritten by a brief.
+    assert paths.goal.read_text(encoding="utf-8") == "Goal\n"
 
 
-def test_ensure_meta_rejects_different_goal(tmp_path):
+def test_ensure_goal_ignores_text_identical_to_the_goal(tmp_path):
+    """Passing the goal back is a wrapper forwarding config, not an instruction."""
     paths = load_config(tmp_path).task_paths("t")
-    _ensure_meta(paths, "Goal")
-    error = _ensure_meta(paths, "Other goal")
-    assert error and "different meta-prompt" in error
-    assert paths.meta.read_text(encoding="utf-8") == "Goal\n"
+    _ensure_goal(paths, "Goal")
+    assert _ensure_goal(paths, "Goal") == (None, None)
+    assert _ensure_goal(paths, "  Goal  ") == (None, None)
+    assert _ensure_goal(paths, None) == (None, None)
+
+
+def test_ensure_goal_fills_an_empty_scaffold(tmp_path):
+    """`init t` writes an empty goal.md; the argument is still the goal, not a brief.
+
+    The emptiness check has to come first. Tested in the other order, a new
+    lane's argument reads as a *changed* goal against the empty file, the goal
+    is refused outright, and the alternative the error suggests dead-ends behind
+    it.
+    """
+    paths = load_config(tmp_path).task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("\n", encoding="utf-8")
+    assert _ensure_goal(paths, "The real goal") == (None, None)
+    assert paths.goal.read_text(encoding="utf-8") == "The real goal\n"
+
+
+def test_ensure_goal_rejects_empty_scaffold_with_no_argument(tmp_path):
+    paths = load_config(tmp_path).task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("\n", encoding="utf-8")
+    error, brief = _ensure_goal(paths, None)
+    assert brief is None
+    assert error and "is empty" in error
 
 
 def test_takeover_unknown_task(tmp_path, capsys):
@@ -71,7 +101,7 @@ def test_takeover_opens_session_then_resumes(tmp_path, monkeypatch):
     config = load_config(ws)
     paths = config.task_paths("t")
     paths.root.mkdir(parents=True)
-    paths.meta.write_text("Goal\n", encoding="utf-8")
+    paths.goal.write_text("Goal\n", encoding="utf-8")
     # A prior run left a paused task bound to a native session.
     binding = Binding(root_uuid="root-1", provider="opencode")
     binding.generations.append(Generation(n=1, native_id="ses_live"))
@@ -113,7 +143,7 @@ def test_takeover_no_resume_skips_loop(tmp_path, monkeypatch, capsys):
 
     paths = load_config(tmp_path).task_paths("t")
     paths.root.mkdir(parents=True)
-    paths.meta.write_text("Goal\n", encoding="utf-8")
+    paths.goal.write_text("Goal\n", encoding="utf-8")
 
     monkeypatch.setattr(cli.spawn, "run_interactive", lambda provider, native_id, cwd: 0)
 
@@ -150,9 +180,191 @@ def test_result_line_omits_reason_on_complete_only():
     blocked = TaskResult(slug="t", status=TaskStatus.BLOCKED, iterations=2, reason="which db?")
     assert _result_line(blocked) == "t: blocked after 2 iterations (which db?)"
     out_of_budget = TaskResult(
-        slug="t", status=TaskStatus.BLOCKED, iterations=50, reason="max_iterations reached"
+        slug="t",
+        status=TaskStatus.BLOCKED,
+        iterations=47,
+        reason="max_iterations reached after 30 turns this run (47 total)",
     )
-    assert _result_line(out_of_budget).endswith("(max_iterations reached)")
+    # The lane total and the run budget disagree by design, so the line has to
+    # carry both rather than read as a count that overshot its own limit.
+    assert _result_line(out_of_budget) == (
+        "t: blocked after 47 iterations "
+        "(max_iterations reached after 30 turns this run (47 total))"
+    )
+
+
+def _blocked_lane(tmp_path, slug="t", reason="D1: keep the shared budget, or split it?"):
+    """A lane left blocked by an ask_human, with its question recorded."""
+    from backseat_harness import storage
+    from backseat_harness.models import TaskState, TaskStatus
+
+    paths = load_config(tmp_path).task_paths(slug)
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+    storage.save_state(
+        paths, TaskState(slug=slug, status=TaskStatus.BLOCKED, iteration=45, reason=reason)
+    )
+    return paths
+
+
+def test_bare_resume_refuses_a_blocked_lane_and_quotes_the_question(
+    tmp_path, monkeypatch, capsys
+):
+    """A bare `run` on a blocked lane must not silently drop the question."""
+    import backseat_harness.cli as cli
+
+    def no_run(**kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("a blocked lane must not resume without a brief")
+
+    monkeypatch.setattr(cli, "run_task", no_run)
+    _blocked_lane(tmp_path, reason="D1: keep the shared budget, or split it?")
+
+    rc = main(["-C", str(tmp_path), "run", "t"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "blocked, not continue" in out
+    # The question is quoted whole, not truncated the way progress truncates it.
+    assert "D1: keep the shared budget, or split it?" in out
+    assert 'run t "' in out
+
+
+def test_bare_resume_refuses_a_complete_lane(tmp_path, monkeypatch, capsys):
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.models import TaskState, TaskStatus
+
+    def no_run(**kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("a complete lane must not resume without a brief")
+
+    monkeypatch.setattr(cli, "run_task", no_run)
+    paths = load_config(tmp_path).task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+    storage.save_state(paths, TaskState(slug="t", status=TaskStatus.COMPLETE, iteration=9))
+
+    rc = main(["-C", str(tmp_path), "run", "t"])
+    assert rc == 2
+    assert "complete, not continue" in capsys.readouterr().out
+
+
+def test_bare_resume_allowed_on_a_continue_lane(tmp_path, monkeypatch):
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.models import TaskState, TaskStatus
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen.update(kwargs)
+        from backseat_harness.models import TaskResult
+
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    paths = load_config(tmp_path).task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+    storage.save_state(paths, TaskState(slug="t", status=TaskStatus.CONTINUE, iteration=3))
+
+    rc = main(["-C", str(tmp_path), "run", "t"])
+    assert rc == 0
+    assert seen["owner_brief"] is None
+
+
+def test_note_unblocks_a_blocked_lane(tmp_path, monkeypatch):
+    """`run t "the answer"` is the unblock: it resumes and carries the brief."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen.update(kwargs)
+        from backseat_harness.models import TaskResult, TaskStatus
+
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    _blocked_lane(tmp_path)
+
+    rc = main(["-C", str(tmp_path), "run", "t", "Keep the shared budget; D2 report-only."])
+    assert rc == 0
+    assert seen["owner_brief"] == "Keep the shared budget; D2 report-only."
+
+
+def test_note_from_a_continue_lane_is_allowed(tmp_path, monkeypatch):
+    """No blocked_on gate: the owner may add commentary mid-flight."""
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen.update(kwargs)
+        from backseat_harness.models import TaskResult, TaskStatus
+
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    paths = load_config(tmp_path).task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+
+    assert main(["-C", str(tmp_path), "run", "t", "also sweep the docs"]) == 0
+    assert seen["owner_brief"] == "also sweep the docs"
+
+
+def test_note_with_prompt_is_rejected(tmp_path, monkeypatch, capsys):
+    """-p skips the operator, so a brief would have nowhere to go."""
+    import backseat_harness.cli as cli
+
+    def no_run(**kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("a brief paired with --prompt must be rejected")
+
+    monkeypatch.setattr(cli, "run_task", no_run)
+    _blocked_lane(tmp_path)
+
+    rc = main(["-C", str(tmp_path), "run", "t", "the answer", "-p", "do the thing"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "brief needs the operator" in out
+    assert "--prompt" in out
+
+
+def test_prompt_without_a_note_still_resumes_a_blocked_lane(tmp_path, monkeypatch):
+    """-p bypasses the gate: it is the explicit "skip the operator" override.
+
+    The gate is on the second argument, which asks the operator to act. -p does
+    not involve the operator at all, so refusing it would remove the one way to
+    drive a blocked lane without the operator in the loop.
+    """
+    from conftest import FakeProvider
+
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen.update(kwargs)
+        from backseat_harness.models import TaskResult, TaskStatus
+
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    _blocked_lane(tmp_path)
+
+    rc = main(["-C", str(tmp_path), "run", "t", "-p", "do the thing"])
+    assert rc == 0
+    assert seen["first_prompt"] == "do the thing"
+    assert seen["owner_brief"] is None
 
 
 def _capture_operator_spawn(monkeypatch, provider=None, call=None):

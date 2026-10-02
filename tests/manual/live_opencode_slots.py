@@ -218,7 +218,7 @@ def main(argv: list[str]) -> int:
     )
     paths = config.task_paths("live-opencode")
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.meta.write_text(
+    paths.goal.write_text(
         "Prove a per-step model slot changes the serving opencode model.\n",
         encoding="utf-8",
     )
