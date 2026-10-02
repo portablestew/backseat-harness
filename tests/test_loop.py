@@ -500,6 +500,133 @@ def test_active_step_slot_resolves_and_recomputes_each_turn(config, task):
     ]
 
 
+def test_ledger_records_the_asked_for_model_despite_a_slot_rewrite(config, task):
+    """The line records the id the harness composed into that turn's --model --
+    what it asked for, not the slot as the verdict leaves it: turn 1 asks for
+    `fast`, the verdict rewrites s1's slot to `thinker`, and line 1 still says
+    `fast-model`."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, models={"fast": "fast-model", "thinker": "think-model"})
+    paths.checklist.write_text(
+        json.dumps({
+            "steps": {"s1": {"status": "active", "model": "fast"}},
+            "remarks": [],
+        }),
+        encoding="utf-8",
+    )
+
+    verdicts = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {"s1": {"model": "thinker"}}},
+        }),
+        '{"verdict":"done"}',
+    ])
+    seen: list[tuple] = []
+
+    def runner(prov, spec):
+        seen.append(spec.extra_args)
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner, lambda p: next(verdicts),
+        first_prompt="go",
+    )
+
+    assert seen == [
+        ("--model", "fast-model"),  # turn 1: s1 active with slot 'fast'
+        ("--model", "think-model"),  # turn 2: the rewrite took effect
+    ]
+    lines = [
+        json.loads(line)
+        for line in paths.ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    # The rewrite is on disk -- yet line 1 records the id turn 1 asked for,
+    # because the value comes from that turn's composed flags, not a
+    # re-resolution after this verdict's merge.
+    assert json.loads(paths.checklist.read_text())["steps"]["s1"]["model"] == "thinker"
+    assert lines[0]["model"] == "fast-model"
+    assert lines[1]["model"] == "think-model"
+
+
+def test_ledger_model_is_null_when_no_model_was_composed(config, task):
+    """No slot, no [models] default, no [harness].model: nothing asked for a
+    model, so the line claims none -- the provider's own default is not
+    knowable from here."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model=None, models={}, extra_args=())
+    specs: list[SpawnSpec] = []
+
+    def runner(prov, spec):
+        specs.append(spec)
+        return _managed_runner_ok(prov, spec)
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    assert "--model" not in specs[0].extra_args
+    line = json.loads(paths.ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert line["model"] is None
+    (entry,) = list(storage.read_ledger(paths))
+    assert entry.model is None
+
+
+def test_ledger_records_an_owner_passthrough_model(config, task):
+    """Nothing resolves through slots or config, but the owner's extra_args
+    compose a --model: the line records that id, because it is what the
+    harness composed into the turn's flags -- the ask, not what served."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config,
+        model=None,
+        models={},
+        extra_args=("--skip-approvals", "--model", "owner-baseline"),
+    )
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: '{"verdict":"done"}', first_prompt="go",
+    )
+    line = json.loads(paths.ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert line["model"] == "owner-baseline"
+
+
+def test_plan_line_records_null_model_and_the_review_line_the_turns(config, task):
+    """A plan decision spawns no turn, so its line is null even with a model
+    configured; the review line after the turn names the composed id. Raw JSON
+    and LedgerEntry.from_dict agree on both."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(config, model="cfg-model", models={})
+
+    verdicts = iter([
+        '{"verdict":"continue","next_prompt":"go"}',
+        '{"verdict":"done"}',
+    ])
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, lambda p: next(verdicts)
+    )
+
+    raw = [
+        json.loads(line)
+        for line in paths.ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    entries = list(storage.read_ledger(paths))
+    assert [e.phase for e in entries] == ["plan", "review"]
+    assert raw[0]["model"] is None
+    assert entries[0].model is None
+    assert raw[1]["model"] == "cfg-model"
+    assert entries[1].model == "cfg-model"
+
+
 def test_cancelled_step_does_not_drive_the_model_slot(config, task):
     """A cancelled step is not active, so it cannot supply the turn's model."""
     import json as _json

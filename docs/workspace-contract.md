@@ -255,14 +255,29 @@ Append-only, one JSON object per operator decision. It is written **last**
 (after checklist + binding + state), so its final line marks the last
 fully-committed step — the anchor for crash recovery. `phase` is `"plan"` for a
 decision made with no managed turn (a new or resumed run; `iteration` is the
-lane's turn count so far) and `"review"` after a managed turn. `next_prompt` is
-the exact prompt the operator queued for the next turn (`null` when the
+lane's turn count so far) and `"review"` after a managed turn. `model` is the id
+the harness composed into that turn's `--model` — what it *asked* for, not what
+served: the active step's slot resolved through `[models]`, else the default
+binding, else a passthrough `--model` in the owner's `extra_args`, read off the
+spawn's composed flags rather than re-resolved when the line is written, so a
+verdict that rewrites the step's slot still records the id that turn asked for.
+The ask can be refused: when a provider rejects the id (kiro's loud rejection
+quotes it back) the turn ends with no reply and a nonzero exit, and the loop
+still writes the review line carrying the refused id — the line records what
+was requested and is never evidence that its model served. `null` covers
+composition only: no `--model` was composed at all (no step slot, no
+`[models] default`, no `[harness].model`, none in the owner's `extra_args`;
+the provider's own default is not knowable from here, so none is claimed) or a
+`phase: "plan"` line, which spawns no turn. A refusal is not `null` — the
+refused id is what was asked for. Lines written before the field existed read
+back as `null`. `next_prompt`
+is the exact prompt the operator queued for the next turn (`null` when the
 verdict queues none). Every line carries both `at` (epoch float, for sorting)
 and `at_local` (ISO-8601 with offset, derived on write and never read back, so
 a reader never has to convert a timestamp by hand).
 
 ```json
-{"at": 1750003600.0, "at_local": "2025-06-15T09:46:40-07:00", "phase": "review", "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next", "next_prompt": "Add a test for GET /hello ..."}
+{"at": 1750003600.0, "at_local": "2025-06-15T09:46:40-07:00", "phase": "review", "model": "anthropic/claude-opus-4", "iteration": 7, "generation": 2, "verdict": "continue", "exit_code": 0, "timed_out": false, "duration_s": 42.1, "notes": "wired the route; test next", "next_prompt": "Add a test for GET /hello ..."}
 ```
 
 ## transcript.md

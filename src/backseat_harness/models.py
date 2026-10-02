@@ -234,6 +234,19 @@ class LedgerEntry:
     at: float = field(default_factory=time.time)
     #: "review" (after a managed turn) or "plan" (operator only, no turn).
     phase: str = "review"
+    #: The model id the harness composed into this turn's ``--model`` -- what it
+    #: asked for, not what served: read from the spawn's own flags rather than
+    #: re-resolved when the line is written (the verdict being persisted may
+    #: already have rewritten the active step's slot). The ask can be refused:
+    #: a provider rejection ends the turn with no reply, and the review line
+    #: still carries the refused id -- so a line never proves its model served.
+    #: None when no ``--model`` was composed at all -- no step slot, no
+    #: ``[models]`` default, no ``[harness].model``, none in the owner's
+    #: ``extra_args`` -- and on every plan-phase line, which spawns nothing; a
+    #: refusal is not None, it keeps the refused id. The provider's own default
+    #: is not knowable from here, so none is claimed. Lines written before the
+    #: field existed read back as None.
+    model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -246,6 +259,7 @@ class LedgerEntry:
                 timespec="seconds"
             ),
             "phase": self.phase,
+            "model": self.model,
             "iteration": self.iteration,
             "generation": self.generation,
             "verdict": self.verdict.value,
@@ -271,6 +285,9 @@ class LedgerEntry:
             reset_context=bool(data.get("reset_context", False)),
             at=float(data.get("at", time.time())),
             phase=data.get("phase", "review") or "review",
+            # Absent on lines written before the field existed; an empty id is
+            # not one either (config parsing drops those), so both read None.
+            model=data.get("model") or None,
         )
 
 

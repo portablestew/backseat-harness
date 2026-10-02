@@ -497,7 +497,14 @@ def run_task(
             )
         verdict = call_operator(outcome, transcript_file, slot_warning=review_warning)
         with progress.step("persist review verdict"):
-            _persist(paths, state, binding, verdict, result, phase="review")
+            # This turn's composed flags, not a fresh resolution: _persist
+            # merges the verdict's checklist update first, and re-resolving
+            # after that merge would record the rewritten slot instead.
+            _persist(
+                paths, state, binding, verdict, result,
+                phase="review",
+                model=_composed_model(spec.extra_args),
+            )
         _report(verdict)
         last_verdict = verdict.kind
 
@@ -656,6 +663,28 @@ def _resolve_turn_model(
     return model, None, "; ".join(warnings) or None
 
 
+def _composed_model(extra_args: tuple[str, ...]) -> str | None:
+    """The model id a spawn's composed flags name, or None when they name none.
+
+    Read off the tuple handed to the provider rather than re-resolved from the
+    checklist: it is the id the harness asked for, not a claim that it served --
+    a provider may refuse it and the caller still records it -- and the verdict
+    being persisted may already have rewritten the active step's slot. Last
+    ``--model`` wins, matching the CLI and the documented flag order (owner's
+    ``extra_args`` first, the turn's own ``--model`` after — docs 2-plan E8).
+    With no ``--model`` anywhere the provider's own default answers, which is
+    not knowable from here, so the caller records None rather than inventing
+    one.
+    """
+    model: str | None = None
+    for i, arg in enumerate(extra_args):
+        if arg == "--model":
+            model = extra_args[i + 1] if i + 1 < len(extra_args) else None
+        elif arg.startswith("--model="):
+            model = arg.split("=", 1)[1] or None
+    return model
+
+
 def _valid_model_slot(slot: Any, config: Config) -> bool:
     """A slot value is valid iff it names a ``[models]`` key (docs 2-plan §5a).
 
@@ -784,11 +813,18 @@ def _persist(
     verdict: Verdict,
     result: TurnResult | None,
     phase: str,
+    model: str | None = None,
 ) -> None:
     """Apply a verdict to disk. The harness is the only writer.
 
     Order matters for crash-safety: checklist merge -> binding -> state ->
     ledger (ledger last = committed).
+
+    ``model`` is the id the spawn named for the turn this verdict reviews (see
+    ``_composed_model``), passed in from the turn that ran: re-resolving here
+    would read the checklist *after* the merge above and record the next
+    turn's slot on this turn's line. It defaults to None because a
+    plan-phase verdict spawns no turn, so no ``--model`` was composed for it.
     """
     current = checklist_mod.load_checklist(paths.checklist)
     merged = checklist_mod.merge_update(current, verdict.checklist_update)
@@ -808,6 +844,7 @@ def _persist(
             next_prompt=verdict.next_prompt,
             reset_context=verdict.reset_context,
             phase=phase,
+            model=model,
         ),
     )
 
