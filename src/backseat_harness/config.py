@@ -22,8 +22,20 @@ from typing import Any
 import tomllib
 
 # One hour default managed-turn timeout, per the design. A one-shot turn should
-# bail rather than hang, so this is a hard ceiling with a watchdog on top.
+# bail rather than hang, so this is a hard ceiling enforced by spawn.run_with_timeout:
+# it kills the whole process tree on expiry (a bare kill leaves an npm shim's
+# child holding the output pipe) and bounds every teardown step after the
+# deadline -- the pipe close included, for a holder the tree walk misses -- to
+# one grace budget, so the ceiling lands either way.
 DEFAULT_TURN_TIMEOUT_S = 3600
+
+# The operator's only job is to read a turn and emit one JSON verdict, so it gets
+# a tighter ceiling than a managed turn that may run a test suite. Separate
+# because the two are not the same kind of work: raise this per task when the
+# operator runs expensive validation, and lower operator_retry_budget to keep the
+# worst case bounded, since the budget multiplies this -- each call costs at most
+# this plus one grace budget (spawn's enforced bound).
+DEFAULT_OPERATOR_TIMEOUT_S = 1800
 
 # ~1MB transcript ~= 250-300k tokens: the preemptive compaction trigger.
 DEFAULT_COMPACT_THRESHOLD_BYTES = 1_000_000
@@ -39,6 +51,12 @@ DEFAULT_MAX_GENERATIONS = 20
 # the interesting signal is the repetition, not the count. 0 disables the cap and
 # leaves max_iterations governing.
 DEFAULT_PROBLEM_REPEAT_CAP = 3
+# Provider invocations allowed for one operator verdict, counting the first. A
+# clean answer never touches it; an unparsable envelope and a bad model slot
+# draw on the same budget, because to the loop they are one failure -- the
+# operator's answer was not usable. Matches problem_repeat_cap's convention: a
+# count of occurrences, not of retries on top. 1 means no re-ask.
+DEFAULT_OPERATOR_RETRY_BUDGET = 3
 
 
 @dataclass(frozen=True)
@@ -56,6 +74,10 @@ class OperatorConfig:
     verify_commands: list[str] = field(default_factory=list)
     # Extra CLI flags for the operator's invocation (see Config.extra_args).
     extra_args: tuple[str, ...] = ()
+    # Ceiling on one operator call, independent of the managed turn's: the
+    # operator reads and decides, the agent builds and runs things, so the same
+    # hour is generous for one and a stall for the other.
+    timeout_s: int = DEFAULT_OPERATOR_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -80,6 +102,10 @@ class Config:
     # recovery that keeps changing the prompt is bounded by max_iterations as
     # before. 0 disables the cap.
     problem_repeat_cap: int = DEFAULT_PROBLEM_REPEAT_CAP
+    # Provider invocations allowed per operator verdict, counting the first.
+    # Bounds the worst case of a wedged operator at budget * operator.timeout_s;
+    # lower it when raising that timeout for a validation-heavy task.
+    operator_retry_budget: int = DEFAULT_OPERATOR_RETRY_BUDGET
     # Provider-specific flags passed through to every managed turn. This is how
     # the workspace owner grants the CLI its non-interactive permissions: the
     # harness deliberately picks no default, because the safe-vs-usable tradeoff
@@ -285,6 +311,7 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         agent=op_data.get("agent", cfg.operator.agent),
         verify_commands=list(op_data.get("verify_commands", cfg.operator.verify_commands)),
         extra_args=tuple(op_data.get("extra_args", cfg.operator.extra_args)),
+        timeout_s=int(op_data.get("timeout_s", cfg.operator.timeout_s)),
     )
     return replace(
         cfg,
@@ -301,6 +328,9 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         max_generations=int(harness.get("max_generations", cfg.max_generations)),
         problem_repeat_cap=int(
             harness.get("problem_repeat_cap", cfg.problem_repeat_cap)
+        ),
+        operator_retry_budget=int(
+            harness.get("operator_retry_budget", cfg.operator_retry_budget)
         ),
         models=_merge_models(cfg, data),
         operator=operator,

@@ -2,6 +2,8 @@ from pathlib import Path
 
 from backseat_harness.config import (
     DEFAULT_COMPACT_THRESHOLD_BYTES,
+    DEFAULT_OPERATOR_RETRY_BUDGET,
+    DEFAULT_OPERATOR_TIMEOUT_S,
     DEFAULT_TURN_TIMEOUT_S,
     Config,
     _apply_overrides,
@@ -15,6 +17,63 @@ def test_defaults_without_config_file(tmp_path):
     assert cfg.compact_threshold_bytes == DEFAULT_COMPACT_THRESHOLD_BYTES
     assert cfg.provider == "opencode"
     assert cfg.operator.provider == "opencode"
+    assert cfg.operator.timeout_s == DEFAULT_OPERATOR_TIMEOUT_S
+    assert cfg.operator_retry_budget == DEFAULT_OPERATOR_RETRY_BUDGET
+
+
+def test_the_two_timeouts_are_independent_settings(tmp_path):
+    """The operator reads and decides; the managed agent builds and runs things.
+    Sharing one ceiling means the right value for one is a stall for the other,
+    so each is set on its own and neither leaks into the other."""
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        "[harness]\nturn_timeout_s = 7200\n\n[operator]\ntimeout_s = 600\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.turn_timeout_s == 7200
+    assert cfg.operator.timeout_s == 600
+
+    # And the reverse: raising the operator's leaves the managed turn alone.
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        "[harness]\nturn_timeout_s = 600\n\n[operator]\ntimeout_s = 5400\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.turn_timeout_s == 600
+    assert cfg.operator.timeout_s == 5400
+
+
+def test_the_operator_timeout_takes_a_task_layer_override(tmp_path, fake_home):
+    """A validation-heavy task can buy its operator more time without touching
+    the workspace default, which is the escape hatch the default relies on."""
+    _write(tmp_path / ".backseat" / "config.toml", "[operator]\ntimeout_s = 600\n")
+    _write(
+        tmp_path / ".backseat" / "tasks" / "t" / "config.toml",
+        "[operator]\ntimeout_s = 5400\n",
+    )
+    assert load_config(tmp_path, "t", home=fake_home).operator.timeout_s == 5400
+    assert load_config(tmp_path, None, home=fake_home).operator.timeout_s == 600
+
+
+def test_operator_retry_budget_resolves_and_layers(tmp_path, fake_home):
+    _write(fake_home / ".backseat" / "config.toml", "[harness]\noperator_retry_budget = 5\n")
+    _write(tmp_path / ".backseat" / "config.toml", "[harness]\noperator_retry_budget = 2\n")
+    _write(
+        tmp_path / ".backseat" / "tasks" / "t" / "config.toml",
+        "[harness]\noperator_retry_budget = 1\n",
+    )
+    assert load_config(tmp_path, "t", home=fake_home).operator_retry_budget == 1
+    assert load_config(tmp_path, None, home=fake_home).operator_retry_budget == 2
+    assert load_config(tmp_path / "bare", None, home=fake_home).operator_retry_budget == 5
+
+
+def test_operator_retry_budget_defaults_when_unset(tmp_path):
+    cfg = load_config(tmp_path)
+    assert cfg.operator_retry_budget == DEFAULT_OPERATOR_RETRY_BUDGET
+    # A stray key elsewhere must not invent the knob.
+    assert _apply_overrides(cfg, {"operator": {"model": "x"}}).operator_retry_budget == (
+        DEFAULT_OPERATOR_RETRY_BUDGET
+    )
 
 
 def test_paths_derive_from_workspace(tmp_path):

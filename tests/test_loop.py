@@ -7,7 +7,7 @@ from conftest import FakeProvider
 
 from backseat_harness import storage
 from backseat_harness.history import SessionInfo
-from backseat_harness.loop import run_task
+from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.models import (
     Binding,
     Generation,
@@ -15,7 +15,29 @@ from backseat_harness.models import (
     TaskStatus,
     VerdictKind,
 )
-from backseat_harness.providers.base import TurnResult
+from backseat_harness.providers.base import SpawnSpec, TurnResult
+from backseat_harness.providers.kiro import KiroProvider
+
+#: A kiro 2.26.1 refusal, verbatim: fresh and ``--resume-id`` turns both end
+#: this way when the id is not in the catalog -- ``runError`` at stage
+#: ``prompt`` naming the id, empty stderr, exit 1.
+_KIRO_RUNERROR = (
+    '{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}'
+    '\n'
+    '{"type":"metadata","data":{"sessionId":"15742df0-2fe0-4fbd-84c5-fdf924c42dbd","contextUsag'
+    'ePercentage":7.193499565124512,"reasoning":{"support":"unavailable","effortLevels":[]}}}'
+    '\n'
+    '{"type":"runError","data":{"sessionId":"15742df0-2fe0-4fbd-84c5-fdf924c42dbd","stage":"prompt",'
+    '"message":"Internal error (code -32603): Encountered an error in the response stream: '
+    "The model 'no-such-model-xyz' is not available. Please use '/model' to select a different "
+    'model and try again. (request_id: ed60301d-9126-4917-a764-5b1a7aaf72c2)"}}'
+    '\n'
+)
+
+#: Phrases from the retired advisory. On 2.26.1 the CLI applies --model, so no
+#: channel may still assert that it does not (docs 1, "Re-test on kiro-cli
+#: 2.26.1"); these guard both channels against the claim coming back.
+_RETIRED_KIRO_CLAIM = ("does not honor", "default routing", "never applies")
 
 
 @pytest.fixture(autouse=True)
@@ -540,9 +562,9 @@ def test_disagreement_reaches_the_plan_phase_prompt(config, task, capsys):
 def test_kiro_advisory_and_disagreement_both_reach_the_prompt(config, task, capsys):
     """The kiro branch overwrote slot_warning wholesale. A turn that is
     slot-sourced on kiro AND ambiguous must carry both sentences in one prompt:
-    the harness picked one of two models and is saying so, *and* the provider
-    will ignore the flag either way. Losing either would be losing half the
-    truth about the turn."""
+    the harness picked one of two models and is saying so, *and* what kiro still
+    cannot tell anyone about the turn -- that no field attests which model
+    served it. Losing either would be losing half the truth about the turn."""
     from dataclasses import replace
 
     slug, paths = task
@@ -566,8 +588,8 @@ def test_kiro_advisory_and_disagreement_both_reach_the_prompt(config, task, caps
         first_prompt="go",
     )
     kiro = (
-        "provider kiro does not honor --model; step 's1' slot 'fast' will run "
-        "on kiro's default routing anyway"
+        "provider kiro exposes no per-turn serving-model field; step 's1' slot "
+        "'fast' requests 'fast-model' and kiro's own records carry only the request"
     )
     note = _disagreement(("s1", "fast"), ("s2", "slow"))
     prompt = prompts[-1]
@@ -577,8 +599,13 @@ def test_kiro_advisory_and_disagreement_both_reach_the_prompt(config, task, caps
     # The flag is still composed and the slot-sourced provenance still keys.
     assert seen == [("--model", "fast-model")]
     err = capsys.readouterr().err
-    assert "[warn] provider kiro does not honor --model" in err
+    assert "[warn] provider kiro exposes no per-turn serving-model field" in err
     assert f"[warn] task: {note}" in err
+    # Nothing on either channel may claim the flag is ignored: 2.26.1 applies
+    # it, and the advisory is about the missing attestation field only.
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in err
+        assert retired not in prompt
 
 
 def test_bad_slot_and_disagreement_both_reach_the_prompt(config, task, capsys):
@@ -836,10 +863,18 @@ def test_empty_slot_binding_never_reaches_the_prompt_as_usable(config, task, cap
     assert seen == [("--model", "cfg-model")]
 
 
-# --- Kiro v2 warning: stderr only, slot-sourced ids only (docs 2-plan §7) ---
+# --- kiro: never falsely accused, never silently refused ---------------------
+# On kiro-cli 2.26.1 the CLI applies --model on fresh and resumed turns
+# (docs 1, "Re-test on kiro-cli 2.26.1"), so the old "does not honor --model"
+# advisory asserted something measured false. What survives: the residual the
+# measurement supports (kiro exposes no per-turn serving-model field), and the
+# refusal that is real -- an id the catalog does not have, which kiro quotes
+# back and the harness has to name on both channels.
 
 
 def test_kiro_warns_when_slot_supplies_the_model(config, task, capsys):
+    """Accepted-id branch: a slot-sourced kiro turn states only what is left to
+    state -- no attestation field -- and names the slot and the id asked for."""
     slug, paths = task
     config = _kiro(config)
     paths.checklist.write_text(json.dumps({
@@ -848,19 +883,27 @@ def test_kiro_warns_when_slot_supplies_the_model(config, task, capsys):
     }), encoding="utf-8")
     config = _models(config, {"fast": "fast-model"})
     seen: list[tuple] = []
+    prompts: list[str] = []
 
     run_task(
         slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: '{"verdict":"done"}', first_prompt="go",
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
     )
     assert seen == [("--model", "fast-model")]  # the flag is still composed
     err = capsys.readouterr().err
     assert "'s1'" in err and "'fast'" in err
-    assert "does not honor --model" in err
+    assert "'fast-model'" in err
+    assert "exposes no per-turn serving-model field" in err
+    # Nothing that claims the flag is ignored -- on either channel.
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in err
+        assert retired not in prompts[-1]
 
 
 def test_kiro_stays_quiet_when_model_comes_from_the_fallback(config, task, capsys):
-    """No slot involved -> the kiro warning must not fire (default path)."""
+    """No slot involved -> the advisory must not fire (default path), and still
+    nothing on stderr may claim the flag is ignored."""
     from dataclasses import replace
 
     slug, _ = task
@@ -872,7 +915,181 @@ def test_kiro_stays_quiet_when_model_comes_from_the_fallback(config, task, capsy
         lambda p: '{"verdict":"done"}', first_prompt="go",
     )
     assert seen == [("--model", "cfg-model")]
-    assert "does not honor --model" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "exposes no per-turn serving-model field" not in err
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in err
+
+
+def test_kiro_rejected_id_is_loud_naming_slot_and_id(config, task, capsys):
+    """Refused-id branch, fresh turn. A [models] binding naming an id kiro does
+    not have must be unmistakable: kiro quotes the id back in its runError, and
+    the harness names slot and id on stderr and in the operator prompt rather
+    than letting the turn end as an unnamed nonzero exit."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config, provider="kiro", model="cfg-model",
+        models={"fast": "no-such-model-xyz"},
+    )
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    prompts: list[str] = []
+    specs: list[SpawnSpec] = []
+
+    def runner(prov, spec):
+        specs.append(spec)
+        return TurnResult(
+            exit_code=1, timed_out=False, duration_s=0.2,
+            native_session_id="sess-1", stdout=_KIRO_RUNERROR, stderr="",
+        )
+
+    run_task(
+        slug, config, KiroProvider(), runner,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    # Fresh turn: the id was still composed onto the argv.
+    assert specs[0].resume_native_id is None
+    assert specs[0].extra_args[-2:] == ("--model", "no-such-model-xyz")
+    loud = (
+        "kiro rejected model id 'no-such-model-xyz' (step 's1' slot 'fast'); "
+        "the turn produced no reply"
+    )
+    err = capsys.readouterr().err
+    assert f"[warn] {loud}" in err
+    # The remedy ships with the complaint: where valid ids come from.
+    assert "`kiro-cli chat --list-models` lists the ids kiro accepts" in err
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in err
+    review = prompts[-1]
+    assert review.count("Slot warning:") == 1
+    assert loud in review  # both causes on one line: advisory, then refusal
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in review
+
+
+def test_kiro_rejected_id_is_loud_on_the_resumed_turn(config, task, capsys):
+    """The same refusal on the resumed path. Turn 1 runs fine and hands the
+    session back; turn 2 resumes it with the bad id, and the complaint lands in
+    that turn's review prompt -- not the first one."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config, provider="kiro", model="cfg-model",
+        models={"fast": "no-such-model-xyz"},
+    )
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}},
+        "remarks": [],
+    }), encoding="utf-8")
+    prompts: list[str] = []
+    specs: list[SpawnSpec] = []
+
+    def runner(prov, spec):
+        specs.append(spec)
+        if spec.resume_native_id is None:
+            return _managed_runner_ok(prov, spec)  # turn 1: fine, id sess-1
+        return TurnResult(
+            exit_code=1, timed_out=False, duration_s=0.2,
+            native_session_id="sess-1", stdout=_KIRO_RUNERROR, stderr="",
+        )
+
+    verdicts = iter([
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "again",
+            "checklist_update": {"steps": {"s1": {"status": "active", "model": "fast"}}},
+        }),
+        json.dumps({"verdict": "done"}),
+    ])
+    run_task(
+        slug, config, KiroProvider(), runner,
+        lambda p: (prompts.append(p), next(verdicts))[1],
+        first_prompt="go",
+    )
+    # Turn 2 resumed the session turn 1 created, still with the bad id.
+    assert len(specs) == 2
+    assert specs[1].resume_native_id == "sess-1"
+    assert specs[1].extra_args[-2:] == ("--model", "no-such-model-xyz")
+    loud = (
+        "kiro rejected model id 'no-such-model-xyz' (step 's1' slot 'fast'); "
+        "the turn produced no reply"
+    )
+    err = capsys.readouterr().err
+    assert f"[warn] {loud}" in err
+    assert len(prompts) == 2
+    assert loud not in prompts[0]  # the clean turn's review says nothing
+    assert loud in prompts[1]
+    assert prompts[1].count("Slot warning:") == 1
+
+
+def test_kiro_rejected_id_names_the_default_binding_when_no_slot_supplied(
+    config, task, capsys
+):
+    """The default binding is a [models] binding too. With no active step the
+    id comes from [models].default, and that is what the complaint names -- no
+    slot exists to blame."""
+    from dataclasses import replace
+
+    slug, paths = task
+    config = replace(
+        config, provider="kiro", model="cfg-model",
+        models={"default": "no-such-model-xyz"},
+    )
+    prompts: list[str] = []
+    specs: list[SpawnSpec] = []
+
+    def runner(prov, spec):
+        specs.append(spec)
+        return TurnResult(
+            exit_code=1, timed_out=False, duration_s=0.2,
+            native_session_id="sess-1", stdout=_KIRO_RUNERROR, stderr="",
+        )
+
+    run_task(
+        slug, config, KiroProvider(), runner,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    assert specs[0].extra_args[-2:] == ("--model", "no-such-model-xyz")
+    loud = (
+        "kiro rejected model id 'no-such-model-xyz' ([models] default); "
+        "the turn produced no reply"
+    )
+    err = capsys.readouterr().err
+    assert f"[warn] {loud}" in err
+    # No slot sourced the id, so the per-turn advisory does not fire either.
+    assert "exposes no per-turn serving-model field" not in err
+    assert loud in prompts[-1]
+
+
+def test_failed_turn_without_a_refusal_signal_prints_no_rejection(config, task, capsys):
+    """Exit 1 alone names nothing. The loop asks the provider what the CLI's
+    own words say; a provider with no refusal vocabulary (the base default)
+    answers None and the operator sees the ordinary failure, not a complaint
+    about a model."""
+    slug, _ = task
+    prompts: list[str] = []
+
+    def runner(prov, spec):
+        return TurnResult(
+            exit_code=1, timed_out=False, duration_s=0.2,
+            native_session_id="sess-1", stdout="", stderr="cli crashed",
+        )
+
+    run_task(
+        slug, config, FakeProvider(), runner,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+    err = capsys.readouterr().err
+    assert "rejected model id" not in err
+    assert "Slot warning" not in prompts[-1]
 
 
 # --- Operator prompt carries slot vocabulary + warnings (docs 2-plan §4) ---
@@ -928,7 +1145,8 @@ def test_on_disk_bad_slot_reaches_the_operator_prompt(config, task, capsys):
 
 
 def test_kiro_slot_warning_reaches_the_operator_prompt(config, task, capsys):
-    """§7: the kiro limitation warning lands in the review prompt verbatim."""
+    """The kiro advisory lands in the review prompt verbatim -- residual only:
+    what kiro does not expose, not a claim about the flag."""
     from dataclasses import replace
 
     slug, paths = task
@@ -949,10 +1167,15 @@ def test_kiro_slot_warning_reaches_the_operator_prompt(config, task, capsys):
     )
     review_prompt = prompts[-1]
     assert (
-        "Slot warning: provider kiro does not honor --model; step 's1' slot "
-        "'fast' will run on kiro's default routing anyway"
+        "Slot warning: provider kiro exposes no per-turn serving-model field; "
+        "step 's1' slot 'fast' requests 'fast-model' and kiro's own records "
+        "carry only the request"
     ) in review_prompt
-    assert "will run on kiro's default routing anyway" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "exposes no per-turn serving-model field" in err
+    for retired in _RETIRED_KIRO_CLAIM:
+        assert retired not in review_prompt
+        assert retired not in err
 
 
 def test_clean_turn_carries_no_slot_warning(config, task, capsys):
@@ -1013,12 +1236,12 @@ def test_bad_slot_in_verdict_rejected_and_reasked_once(config, task):
     )
 
     assert result.status is TaskStatus.COMPLETE
-    # Reject + one re-ask, no more.
+    # Reject + one re-ask, no more: the clean retry lands inside the budget.
     assert len(prompts) == 2
     assert prompts[1].startswith(prompts[0] + "\n\nYour checklist_update set")
     assert "'ghost' on step 's1'" in prompts[1]
     assert 'Valid slots: fast (or "default"; omit for the default model).' in prompts[1]
-    assert "Output the JSON object only." in prompts[1]
+    assert "Output the JSON object only, no prose." in prompts[1]
     # The clean retry was persisted verbatim, slot intact.
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
     assert data["steps"]["s1"] == {"status": "done", "model": "fast"}
@@ -1046,12 +1269,16 @@ def test_clean_verdict_is_not_reinvoked(config, task):
 def test_reask_still_bad_accepts_strips_and_warns(config, task, capsys):
     """A re-ask that still names a bad slot is accepted with the model key
     stripped before merge: the bad key never reaches disk, stderr names the
-    step ids and values dropped."""
+    step ids and values dropped. The budget, not the fault, is what ends it."""
     from dataclasses import replace
 
     slug, paths = task
     config = replace(config, model="cfg-model", models={"fast": "fast-model"})
     prompts: list[str] = []
+    bad_slot = {
+        "verdict": "done",
+        "checklist_update": {"steps": {"s1": {"status": "done", "model": "phantom"}}},
+    }
     responses = iter([
         json.dumps({
             "verdict": "done",
@@ -1059,12 +1286,8 @@ def test_reask_still_bad_accepts_strips_and_warns(config, task, capsys):
                 "s1": {"status": "done", "model": "ghost"},
             }},
         }),
-        json.dumps({
-            "verdict": "done",
-            "checklist_update": {"steps": {
-                "s1": {"status": "done", "model": "phantom"},
-            }},
-        }),
+        json.dumps(bad_slot),
+        json.dumps(bad_slot),  # budget spent: this one is accepted and stripped
     ])
 
     def operator_invoker(prompt: str) -> str:
@@ -1078,12 +1301,13 @@ def test_reask_still_bad_accepts_strips_and_warns(config, task, capsys):
 
     # Strike three: accepted anyway (slot hygiene must not couple to turn flow).
     assert result.status is TaskStatus.COMPLETE
-    assert len(prompts) == 2  # reject + one re-ask, then accept
+    assert len(prompts) == 3  # reject + re-ask + the attempt the budget allows
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
     assert data["steps"]["s1"] == {"status": "done"}  # model key stripped
     assert "model" not in data["steps"]["s1"]
     err = capsys.readouterr().err
     assert "still named unknown model slot(s)" in err
+    assert "after 3 attempt(s)" in err
     # 'ghost' was rejected outright; only the accepted retry's 'phantom' was dropped.
     assert "'phantom' on step 's1'" in err
     assert "model" not in data["steps"]["s1"]
@@ -1108,7 +1332,14 @@ def test_stripped_slot_residue_rides_the_next_prompt(config, task, capsys):
         }),
         json.dumps({
             "verdict": "continue",
-            "next_prompt": "step 3",
+            "next_prompt": "step 2",
+            "checklist_update": {"steps": {
+                "s1": {"status": "active", "model": "ghost"},
+            }},
+        }),
+        json.dumps({
+            "verdict": "continue",
+            "next_prompt": "step 2",
             "checklist_update": {"steps": {
                 "s1": {"status": "active", "model": "ghost"},
             }},
@@ -1130,29 +1361,166 @@ def test_stripped_slot_residue_rides_the_next_prompt(config, task, capsys):
     )
 
     assert result.status is TaskStatus.COMPLETE
-    assert len(prompts) == 3  # review 1, its re-ask, review 2
+    assert len(prompts) == 4  # review 1 spent all 3 attempts, then review 2
     # The first prompt was clean; the residue lands on the next one only.
     assert "Slot warning:" not in prompts[0]
     assert (
         "Slot warning: operator verdict still named unknown model slot(s) "
-        "after 1 re-ask(s), dropping: 'ghost' on step 's1'" in prompts[2]
+        "after 3 attempt(s), dropping: 'ghost' on step 's1'" in prompts[3]
     )
     # Turn 2 ran the stripped step on the default binding (no slot left).
     assert seen[1] == ("--model", "cfg-model")
     assert "still named unknown model slot(s)" in capsys.readouterr().err
 
 
-def test_slot_reask_budget_is_separate_from_parse_reask(config, task):
-    """An operator that needs both gets both: the parse re-ask inside op.review
-    keeps its exact contract, and the slot re-ask reuses the ORIGINAL prompt,
-    not the parse-re-asked one."""
+def test_a_budget_of_one_means_no_reask_at_all(config, task, capsys):
+    """The budget counts invocations, so 1 is a single call. An owner who does
+    not want the harness talking to the operator twice says 1, and gets one.
+
+    The synthesized PROBLEM queues no prompt, so the loop re-sends the same one
+    and the turn-level repeat cap is what finally stops it -- the two guards are
+    separate, and only the inner one is switched off here.
+    """
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, operator_retry_budget=1)
+    prompts: list[str] = []
+
+    result = run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), "no json here")[1],
+        first_prompt="go",
+    )
+
+    # One operator call per iteration; no re-ask inside any of them.
+    assert len(prompts) == config.problem_repeat_cap
+    assert result.status is TaskStatus.BLOCKED
+    assert "problem stuck" in result.reason
+    err = capsys.readouterr().err
+    assert "operator produced no parsable verdict on 1 attempt(s)" in err
+    assert "retrying" not in err
+
+
+def test_a_nonsense_budget_still_makes_one_attempt(config, task):
+    """A budget below 1 is a typo, not a request to skip the operator. Clamping
+    to one attempt is the only reading that keeps the loop honest."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, operator_retry_budget=0)
+    prompts: list[str] = []
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok,
+        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 1
+
+
+def test_a_timed_out_empty_reply_reports_the_timeout_not_a_format_error(config, task):
+    """An empty reply and an unreadable one are different faults, and an empty
+    one earns the timeout story only when the call was actually killed -- the
+    flag rides the reply here. The operator that gets re-asked is a fresh
+    invocation with no memory of the last, so saying which one it was is the
+    whole difference between a correction and a repeat -- and only the timeout
+    is something it can act on by answering faster."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter([OperatorReply("", timed_out=True), '{"verdict":"done"}'])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 2
+    retried = prompts[1]
+    assert "was empty" in retried
+    assert "no parsable verdict JSON" not in retried
+    # The ceiling it blew is named, so the correction is actionable.
+    assert f"{config.operator.timeout_s}s timeout" in retried
+    assert "process tree was terminated" in retried
+
+
+def test_a_completed_empty_reply_reports_no_kill(config, task):
+    """An empty reply from a call that ran to its end was not killed, so the
+    re-ask must not claim a timeout never hit or a kill never done -- it names
+    the real fault (no text came back) and the correction that follows."""
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter(["", '{"verdict":"done"}'])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 2
+    retried = prompts[1]
+    assert "was empty" in retried
+    # No kill claim and no timeout-budget advice: nothing timed out.
+    assert f"{config.operator.timeout_s}s timeout" not in retried
+    assert "process tree was terminated" not in retried
+    assert "validation tool calls" not in retried
+    # The real fault is named instead.
+    assert "so nothing was killed, but no text came back" in retried
+    # Still an empty-reply complaint, not a format one.
+    assert "no parsable verdict JSON" not in retried
+
+
+def test_an_unreadable_reply_names_the_json_problem_only(config, task):
+    from dataclasses import replace
+
+    slug, _ = task
+    config = replace(config, models={"fast": "fast-model"})
+    prompts: list[str] = []
+    responses = iter(["I could not decide.", '{"verdict":"done"}'])
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        first_prompt="go",
+    )
+
+    assert len(prompts) == 2
+    assert "contained no parsable verdict JSON" in prompts[1]
+    assert "was empty" not in prompts[1]
+
+
+def test_retry_budget_is_shared_and_accumulates_complaints(config, task, capsys):
+    """One budget for both faults, and each re-ask names every complaint so far.
+
+    The operator first answers with no JSON, then with a bad slot. The third
+    prompt must carry both corrections, because the retried operator has no
+    memory of the calls before it.
+    """
     from dataclasses import replace
 
     slug, _ = task
     config = replace(config, models={"fast": "fast-model"})
     prompts: list[str] = []
     responses = iter([
-        "this is prose with no json",  # unparseable -> op.review parse re-ask
+        "this is prose with no json",  # unparsable
         json.dumps({                    # parses, but names a bad slot
             "verdict": "continue",
             "next_prompt": "step 2",
@@ -1177,12 +1545,18 @@ def test_slot_reask_budget_is_separate_from_parse_reask(config, task):
 
     assert result.status is TaskStatus.COMPLETE
     assert len(prompts) == 3
-    # Parse re-ask untouched (same base prompt + its one exact suffix).
-    assert prompts[1] == prompts[0] + "\n\nOutput the JSON object only, no prose."
-    # Slot re-ask is a separate budget on the original assembled prompt.
-    assert prompts[2].startswith(prompts[0] + "\n\nYour checklist_update set")
-    assert "Output the JSON object only, no prose." not in prompts[2]
+    # Every re-ask is the same base prompt plus its accumulated complaints.
+    for reask in prompts[1:]:
+        assert reask.startswith(prompts[0] + "\n\n")
+        assert reask.endswith("Output the JSON object only, no prose.")
+    assert "no parsable verdict JSON" in prompts[1]
+    assert "ghost" not in prompts[1]
     assert "'ghost' on step 's1'" in prompts[2]
+    assert "no parsable verdict JSON" in prompts[2]  # the first fault still stands
+    # One line per retry, naming which fault it was.
+    err = capsys.readouterr().err
+    assert "operator attempt 1/3 was unparsable; retrying" in err
+    assert "operator attempt 2/3 was a bad model slot; retrying" in err
 
 
 def test_plan_phase_bad_slot_is_rejected_too(config, task):
@@ -1338,9 +1712,10 @@ def test_verdict_naming_default_is_valid_without_a_default_key(config, task, cap
 
 
 def test_unparseable_reask_synthesizes_problem_without_persisting(config, task):
-    """The re-ask answering garbage follows the loop's standing unparseable
-    convention: PROBLEM is synthesized, nothing is persisted, no residue is
-    staged (nothing was stripped — the bad verdict was discarded whole)."""
+    """Spending the budget without a usable verdict follows the loop's standing
+    unparseable convention: PROBLEM is synthesized, nothing is persisted, and
+    the notes name how many attempts were spent and on what — otherwise the next
+    operator call sees a bare 'problem' with no cause."""
     from dataclasses import replace
 
     slug, paths = task
@@ -1352,6 +1727,7 @@ def test_unparseable_reask_synthesizes_problem_without_persisting(config, task):
             "checklist_update": {"steps": {"s1": {"status": "done", "model": "ghost"}}},
         }),
         "still no json here",
+        "and still none here",
     ])
 
     def operator_invoker(prompt: str) -> str:
@@ -1363,11 +1739,19 @@ def test_unparseable_reask_synthesizes_problem_without_persisting(config, task):
         first_prompt="go",
     )
 
-    assert len(prompts) == 2  # reject + the one re-ask
+    assert len(prompts) == 3  # the whole budget, on the original prompt
     assert result.status is TaskStatus.BLOCKED
     assert "max_iterations" in result.reason
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
-    assert data["steps"] == {}  # the bad verdict was never merged
+    assert data["steps"] == {}  # no verdict was ever accepted
+    # The cause reaches the ledger, naming both faults the budget was spent on.
+    ledger = paths.ledger.read_text(encoding="utf-8")
+    assert "operator produced no parsable verdict on 3 attempt(s)" in ledger
+    assert "unparsable" in ledger
+    # The third prompt still carries attempt 1's complaint: the retried operator
+    # has no memory of the calls before it, so a stale fault is not withdrawn.
+    assert "no parsable verdict JSON" in prompts[2]
+    assert "'ghost' on step 's1'" in prompts[2]
 
 
 def test_non_string_slot_in_verdict_is_bad_and_strips(config, task):
@@ -1387,6 +1771,10 @@ def test_non_string_slot_in_verdict_is_bad_and_strips(config, task):
             "verdict": "done",
             "checklist_update": {"steps": {"s1": {"status": "done", "model": 7}}},
         }),
+        json.dumps({
+            "verdict": "done",
+            "checklist_update": {"steps": {"s1": {"status": "done", "model": 7}}},
+        }),
     ])
 
     def operator_invoker(prompt: str) -> str:
@@ -1398,8 +1786,8 @@ def test_non_string_slot_in_verdict_is_bad_and_strips(config, task):
         first_prompt="go",
     )
 
-    assert len(prompts) == 2
-    assert "'7' on step 's1'" in prompts[1]
+    assert len(prompts) == 3
+    assert "7 on step 's1'" in prompts[1]  # a JSON number, rendered as sent
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
     assert data["steps"]["s1"] == {"status": "done"}  # the 7 never hit disk
 

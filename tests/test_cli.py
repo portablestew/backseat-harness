@@ -1,5 +1,6 @@
 """CLI lane creation: a `run` meta-prompt argument bootstraps a task."""
 
+from backseat_harness import spawn
 from backseat_harness.cli import _ensure_meta, main
 from backseat_harness.config import load_config
 
@@ -154,7 +155,7 @@ def test_result_line_omits_reason_on_complete_only():
     assert _result_line(out_of_budget).endswith("(max_iterations reached)")
 
 
-def _capture_operator_spawn(monkeypatch, provider=None):
+def _capture_operator_spawn(monkeypatch, provider=None, call=None):
     """Stub the operator spawn end to end and capture the stdin prompt."""
     from conftest import FakeProvider
 
@@ -164,15 +165,13 @@ def _capture_operator_spawn(monkeypatch, provider=None):
     monkeypatch.setattr(cli.spawn, "resolve_argv", lambda cmd: cmd)
     seen = {}
 
-    class _Proc:
-        stdout = "ok"
-
-    def fake_run(cmd, **kwargs):
+    def fake_run_with_timeout(cmd, **kwargs):
         seen["input"] = kwargs["input"]
         seen["argv"] = list(cmd)
-        return _Proc()
+        seen["timeout_s"] = kwargs["timeout_s"]
+        return call() if call is not None else spawn.CompletedCall(0, "ok", "", False)
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.spawn, "run_with_timeout", fake_run_with_timeout)
     return seen
 
 
@@ -199,6 +198,37 @@ def test_operator_invoker_prepends_persona_for_named_agent(config, monkeypatch):
     assert seen["input"] == f"{load_persona()}\n\nDo the review."
 
 
+def test_operator_invoker_passes_the_configured_ceiling(config, monkeypatch):
+    """[operator].timeout_s is what bounds the call: cli hands that number to
+    run_with_timeout, not some hardcoded default."""
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+
+    seen = _capture_operator_spawn(monkeypatch)
+    cli._make_operator_invoker(config, replace(config.operator, timeout_s=42))(
+        "Do the review."
+    )
+    assert seen["timeout_s"] == 42
+
+
+def test_operator_invoker_flags_only_a_killed_call(config, monkeypatch):
+    """The reply carries timed_out exactly when the spawn was killed -- that
+    flag, not the emptiness of the text, is what the loop conditions its kill
+    claim on."""
+    import backseat_harness.cli as cli
+
+    _capture_operator_spawn(monkeypatch, call=lambda: spawn.CompletedCall(0, "", "", True))
+    killed = cli._make_operator_invoker(config, config.operator)("Do the review.")
+    assert killed == ""
+    assert getattr(killed, "timed_out", False) is True
+
+    _capture_operator_spawn(monkeypatch, call=lambda: spawn.CompletedCall(0, "ok", "", False))
+    done = cli._make_operator_invoker(config, config.operator)("Do the review.")
+    assert done == "ok"
+    assert getattr(done, "timed_out", False) is False
+
+
 def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
     """[harness].agent (managed) and [operator].agent both land as --agent."""
     import pathlib as _pathlib
@@ -219,15 +249,14 @@ def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
     monkeypatch.setattr(cli, "get_provider", lambda name: OpencodeProvider())
     seen = {}
     monkeypatch.setattr(cli.spawn, "resolve_argv", lambda cmd: cmd)
-
-    class _Proc:
-        stdout = "ok"
-
-    def fake_run(cmd, **kwargs):
-        seen["argv"] = list(cmd)
-        return _Proc()
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        cli.spawn,
+        "run_with_timeout",
+        lambda cmd, **kwargs: (
+            seen.update(argv=list(cmd))
+            or spawn.CompletedCall(0, "ok", "", False)
+        ),
+    )
     try:
         op_config = replace(config.operator, agent="my-reviewer")
         cli._make_operator_invoker(config, op_config)("Do the review.")

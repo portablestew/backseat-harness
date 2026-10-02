@@ -76,6 +76,13 @@ class Provider(ABC):
     #: sessions. Used to scope size lookups and fork rendering (see history.py).
     history_provider: str
 
+    #: Command that lists the model ids this CLI accepts, when the adapter
+    #: knows one. Quoted by the loop inside the complaint it raises after a
+    #: rejected id, so "which ids are valid?" has an answer in the same breath
+    #: as the failure rather than a separate lookup the operator has to think
+    #: up. None means no known command, and no hint is printed.
+    list_models_command: str | None = None
+
     @abstractmethod
     def build_command(self, spec: SpawnSpec) -> list[str]:
         """Return the argv for a non-interactive one-shot turn.
@@ -90,6 +97,18 @@ class Provider(ABC):
         Best-effort. When it returns None the loop falls back to a marker
         search through history, which is the authoritative path anyway.
         """
+
+    def rejected_model_id(self, stdout: str, stderr: str) -> str | None:
+        """The model id the CLI refused before the turn could run, or ``None``.
+
+        Optional observability, not part of the abstract contract: a CLI that
+        says "I do not have that model" hands the id back so the loop can name
+        the binding that asked for it, and a CLI with no such signal inherits
+        ``None`` and the loop stays quiet. Implementations must key on the
+        provider's own words for the refusal -- never on the exit code alone,
+        which an ordinary failed turn shares.
+        """
+        return None
 
     @abstractmethod
     def extract_text(self, stdout: str) -> str:

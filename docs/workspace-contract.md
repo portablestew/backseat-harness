@@ -48,13 +48,15 @@ provider = "opencode"          # managed-agent CLI (opencode | claude | kiro)
 model = "..."                  # optional: managed agent's model (--model)
 agent = "..."                  # optional: named provider agent for managed turns
 extra_args = []                # flags per managed turn; where you grant perms
-turn_timeout_s = 3600          # hard per-turn ceiling
+turn_timeout_s = 3600          # hard per-turn ceiling for a managed turn
 compact_threshold_bytes = 1000000
 max_iterations = 50
 max_wall_clock_s = 86400
 max_generations = 20
 problem_repeat_cap = 3        # consecutive identical-prompt PROBLEMs before
-                              # BLOCKED as stuck; 0 = disabled (max_iterations)
+                               # BLOCKED as stuck; 0 = disabled (max_iterations)
+operator_retry_budget = 3      # provider invocations per operator verdict,
+                               # counting the first; 1 = never re-ask
 
 [models]                     # per-step model slots: slot-name = "model-id"
 fast = "..."                 # a step's `model` field names one of these keys
@@ -66,9 +68,32 @@ model = "..."                  # optional
 agent = "..."                  # optional: a named agent instead of the provider default
 extra_args = []                # optional, as above
 verify_commands = []           # optional: exact commands the operator may run itself
+timeout_s = 1800               # hard ceiling for one operator call
 ```
 
 Every layer is optional; code defaults fill anything no layer sets.
+
+**The two ceilings are separate settings, not one.** `[harness].turn_timeout_s`
+bounds a managed turn, which may build and run a test suite;
+`[operator].timeout_s` bounds a call whose whole job is to read a turn and emit
+one JSON verdict. The right value for one is a stall for the other, so neither
+inherits from the other. Both are enforced by `spawn.run_with_timeout`, which
+kills the whole process tree on expiry (npm CLIs arrive through a `.cmd` shim, so
+killing only the direct child leaves the real process holding the output pipe)
+and then bounds every teardown step after the deadline — the pipe close
+included — to a single shared grace budget, so a pipe holder the tree walk
+misses delays the call by at most that budget rather than until it exits.
+
+`operator_retry_budget` counts *invocations*, not retries on top, so `3` is one
+call plus two re-asks and `1` disables re-asking entirely. One budget covers
+every unusable reply — an unparsable envelope and a bad model slot draw on the
+same allowance, because to the loop they are one failure — and each re-ask names
+every complaint so far, including whether the previous reply was empty (the call
+was killed) or merely unreadable. It multiplies the operator ceiling — each
+call costs at most `timeout_s` plus one grace budget, by the same bound as a
+managed turn — so raise `[operator].timeout_s` for a validation-heavy task and
+lower this to keep the worst case bounded.
+
 
 `[models]` is the per-step model vocabulary, and it is the one table that does
 not replace wholesale: a task layer rebinds one slot name and keeps the rest.

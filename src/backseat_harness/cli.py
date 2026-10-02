@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 
 from backseat_harness import __version__, spawn
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
-from backseat_harness.loop import run_task
+from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.operator import load_persona
 from backseat_harness.providers import get_provider
 from backseat_harness.providers.base import Provider, SpawnSpec
@@ -253,6 +252,12 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
     providers and a workspace's own agent still gets the guidance. Permissions
     are the workspace owner's; the harness only forwards
     ``[operator].model``/``extra_args``. The persona is read once, here.
+
+    The call is bounded by ``[operator].timeout_s``, not the managed turn's
+    ceiling, and a timeout yields an empty reply flagged ``timed_out``
+    (``OperatorReply``), so the loop tells a killed call from silence instead
+    of inferring a kill from the emptiness. The loop owns what happens next;
+    this layer only launches.
     """
     provider: Provider = get_provider(op_config.provider)
     persona = load_persona()
@@ -268,28 +273,26 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
             prompt=prompt,
             cwd=config.workspace_root,
             resume_native_id=None,
-            timeout_s=config.turn_timeout_s,
+            timeout_s=op_config.timeout_s,
             extra_args=tuple(extra),
         )
         cmd = spawn.resolve_argv(provider.build_command(spec))
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(config.workspace_root),
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=config.turn_timeout_s,
+        call = spawn.run_with_timeout(
+            cmd,
+            cwd=config.workspace_root,
+            input=prompt,
+            timeout_s=op_config.timeout_s,
+        )
+        if call.timed_out:
+            print(
+                f"[warn] task: operator call hit its {op_config.timeout_s}s timeout "
+                "and its process tree was terminated",
+                file=sys.stderr,
             )
-        except subprocess.TimeoutExpired:
-            # An unparseable (here: empty) reply becomes a 'problem' verdict
-            # upstream, which is the right outcome for an operator that hung.
-            return ""
+            return OperatorReply("", timed_out=True)
         # The operator's verdict JSON is inside its reply, so pull the assistant
         # text out of the event stream rather than handing back raw events.
-        return provider.extract_text(proc.stdout or "")
+        return provider.extract_text(call.stdout or "")
 
     return invoke
 

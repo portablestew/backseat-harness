@@ -25,17 +25,12 @@ and tests can supply a real subprocess runner or a fake.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
 
 from backseat_harness import marker as marker_mod
 from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, Verdict
-
-# A callable that takes the fully-assembled operator prompt and returns its
-# final textual message. Injected by the loop (real CLI) or tests (fake).
-InvokeFn = Callable[[str], str]
 
 
 def load_persona() -> str:
@@ -84,11 +79,18 @@ class ReviewInputs:
 #: call, so an unbounded ``evidence``/``remarks`` makes the prompt grow with the
 #: task until it crowds out the turn's actual evidence. The full text stays in
 #: ``checklist.json`` on disk; the operator is told to grep it for more.
-CHECKLIST_FIELD_LIMIT = 250
+CHECKLIST_FIELD_LIMIT = 400
 
 #: How many of the most recent ``remarks`` survive inline. Older ones are already
 #: superseded by step evidence or the handoff docs.
-CHECKLIST_RECENT_REMARKS = 5
+CHECKLIST_RECENT_REMARKS = 10
+
+#: Fields kept for a step already marked ``done``. Its notes and evidence were
+#: verified when the step closed, so re-inlining them on every call buys a long
+#: transcript of closed work at the cost of the live steps -- which is what the
+#: operator is actually reading. The map entry stays so the plan's shape is still
+#: visible; the full text is one grep of ``checklist.json`` away.
+DONE_STEP_FIELDS = ("title", "status")
 
 
 def _clip(text: str, limit: int = CHECKLIST_FIELD_LIMIT) -> str:
@@ -104,9 +106,17 @@ def render_checklist(checklist: Checklist, task_dir: str) -> str:
     The on-disk file is the full record; this is the working view. ``..[+N chars]``
     markers point at the file rather than naming it inline on every field, so the
     prompt carries one pointer instead of one per truncated string.
+
+    ``done`` steps collapse to ``DONE_STEP_FIELDS``. Their evidence was checked
+    when the step closed; re-inlining it every call is what turns a long run's
+    checklist into the largest thing in the prompt, and a finished step is the one
+    thing the operator has no reason to re-read.
     """
     steps = {}
     for step_id, step in checklist.steps.items():
+        if step.get("status") == "done":
+            steps[step_id] = {k: step[k] for k in DONE_STEP_FIELDS if k in step}
+            continue
         steps[step_id] = {
             key: (_clip(value) if isinstance(value, str) else value)
             for key, value in step.items()
@@ -254,7 +264,8 @@ def parse_verdict(text: str) -> Verdict | None:
     Tolerates prose and stray braces around the envelope: every ``{`` is tried
     as the start of a JSON object, and the last object that is a valid verdict
     wins (the envelope is requested last). Returns None if none is found; the
-    loop treats that as a 'problem' after one re-ask.
+    loop owns the re-ask, and names this failure in the retried prompt so the
+    operator knows whether its reply was empty or merely unreadable.
     """
     decoder = json.JSONDecoder()
     found: Verdict | None = None
@@ -272,15 +283,6 @@ def parse_verdict(text: str) -> Verdict | None:
                 pass
         start = text.find("{", end)
     return found
-
-
-def review(inputs: ReviewInputs, invoke: InvokeFn) -> Verdict | None:
-    """Run one operator call, with a single re-ask on parse failure."""
-    prompt = build_prompt(inputs)
-    verdict = parse_verdict(invoke(prompt))
-    if verdict is not None:
-        return verdict
-    return parse_verdict(invoke(prompt + "\n\nOutput the JSON object only, no prose."))
 
 
 _TEMPLATE = """# backseat-harness: operator call

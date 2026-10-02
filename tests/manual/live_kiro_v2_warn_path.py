@@ -7,15 +7,15 @@ runs the research gate demanded. Same shape as
 flipped by the scripted operator's ``checklist_update``. Run in a throwaway temp
 workspace so the live turns cannot touch a working tree.
 
-**The target here is detection, not switching.** Nothing in this run is expected
-to show a model changing, and a verdict that implied one would be wrong.
-``providers/kiro.py`` does not pass ``--v3``, so the engine is the default v2,
-and research section 3a (``1-research-model-switch.md:149-173``) established that
-v2 never applies ``--model``: it accepts the flag, prints
+**The target here is detection, not switching.** ``providers/kiro.py`` does not
+pass ``--v3``, so the engine is the default v2. Research section 3a
+(``1-research-model-switch.md:149-173``) established that on
+``kiro-cli-chat 2.25.0`` v2 never applies ``--model``: it accepts the flag, prints
 ``[warn] failed to set model '<id>': Method not found`` on **stderr**, exits 0,
-and serves the turn from its ``auto`` router. So what this run has to prove is
-that the harness *notices* and *surfaces* that rejection rather than passing the
-flag and reporting success. Four things are recorded per turn:
+and serves the turn from its ``auto`` router. The installed 2.26.1 applies the
+flag instead, and refuses an id outside the catalog (see the verdict block). So
+what this run has to prove is that the harness *notices* and *surfaces* an
+outcome rather than passing the flag and reporting success. Four per turn:
 
     (i)   the argv the harness built carries the slot's concrete model id
     (ii)  kiro's own ``[warn] failed to set model`` on that turn's CLI stderr
@@ -68,8 +68,8 @@ SIDECAR_DIR = Path(os.path.expanduser(r"~\.kiro\sessions\cli"))
 
 # The same two ids research 3a probed, in the same order, so the warn text this
 # run produces can be compared to that probe line for line. Research 3b showed
-# v2 cannot distinguish valid from invalid ids -- both produce the identical
-# warn -- so these are not being validated here, only carried through.
+# (on 2.25.0) v2 cannot distinguish valid from invalid ids -- both produced the
+# identical warn; the installed 2.26.1 can, so these are carried, not validated.
 SLOT_A = "claude-sonnet-4.6"
 SLOT_B = "glm-5"
 
@@ -80,7 +80,11 @@ FIRST_PROMPT = "Reply with the single word: OK-ONE"
 SECOND_PROMPT = "Reply with the single word: OK-TWO"
 
 KIRO_WARN = "[warn] failed to set model"
-LOOP_WARN = "[warn] provider kiro does not honor --model"
+# The loop's kiro advisory. It states the residual the 2.26.1 re-test measured
+# (kiro exposes no per-turn serving-model field) and names the step, slot, and
+# id -- the old "does not honor --model" text was retired with that re-test,
+# because 2.26.1 applies the flag.
+LOOP_WARN = "[warn] provider kiro exposes no per-turn serving-model field"
 SLOT_WARNING_PREFIX = "Slot warning:"
 
 
@@ -124,7 +128,7 @@ class Turn:
 
     @property
     def resume_flag(self) -> str | None:
-        """kiro resumes with --resume-id (providers/kiro.py:58)."""
+        """kiro resumes with --resume-id (providers/kiro.py:81)."""
         argv = self.argv
         return argv[argv.index("--resume-id") + 1] if "--resume-id" in argv else None
 
@@ -138,32 +142,53 @@ class Turn:
 
     @property
     def sidecar_model(self) -> str | None:
+        """kiro's own model record, under the sidecar's ``session_state``.
+
+        The per-turn entry for *this* turn (``conversation_metadata.
+        user_turn_metadatas[index-1].model``) is read first: it is the record
+        that belongs to this turn, where the session-level field
+        (``rts_model_state.model_info.model_id``) is last-write-wins across the
+        whole session. The root-level ``model`` key the driver used to read
+        does not exist in this schema.
+        """
         if not self.sidecar:
             return None
-        for key in ("model", "rts_model_state.model_info.model_id"):
-            value = self.sidecar
-            for part in key.split("."):
-                if not isinstance(value, dict) or part not in value:
-                    value = None
-                    break
-                value = value[part]
-            if isinstance(value, str):
-                return value
+        state = self.sidecar.get("session_state")
+        if not isinstance(state, dict):
+            return None
+        meta = state.get("conversation_metadata")
+        if isinstance(meta, dict):
+            entries = meta.get("user_turn_metadatas")
+            if isinstance(entries, list) and 0 <= self.index - 1 < len(entries):
+                record = entries[self.index - 1]
+                if isinstance(record, dict):
+                    value = record.get("model")
+                    if isinstance(value, str) and value:
+                        return value
+        rts = state.get("rts_model_state")
+        if isinstance(rts, dict):
+            info = rts.get("model_info")
+            if isinstance(info, dict):
+                value = info.get("model_id")
+                if isinstance(value, str) and value:
+                    return value
         return None
 
 
 def _recording_runner(turns: list[Turn], err: io.StringIO, marks: list[int]):
-    """Spawn for real, recording the stderr-window boundaries around each turn.
+    """Spawn for real, recording the stderr-window boundaries after each turn.
 
-    The loop prints its kiro ``[warn]`` *before* calling the runner
-    (``loop.py:234`` precedes ``loop.py:251``), so the stderr between the previous
-    runner call and this one is exactly this turn's loop-side output.
+    Each turn's loop-side output now brackets the spawn on both sides: the
+    pre-spawn slot/kiro advisory prints before the runner is called, and the
+    rejected-id complaint prints right after it returns (``loop.py``), so the
+    window that starts at the previous runner's *return* mark and ends at this
+    one's return mark is exactly this turn's loop-side output.
     """
 
     def runner(provider, spec):
-        marks.append(len(err.getvalue()))
         result = run_turn(provider, spec)
         turns.append(Turn(len(turns) + 1, spec, result, provider))
+        marks.append(len(err.getvalue()))
         return result
 
     return runner
@@ -223,7 +248,7 @@ def main(argv: list[str]) -> int:
     paths = config.task_paths("live-kiro-v2")
     paths.root.mkdir(parents=True, exist_ok=True)
     paths.meta.write_text(
-        "Prove the harness detects and surfaces kiro v2's refusal of --model.\n",
+        "Prove the harness surfaces kiro's --model outcome on both channels (see verdict).\n",
         encoding="utf-8",
     )
     paths.checklist.write_text(
@@ -239,8 +264,8 @@ def main(argv: list[str]) -> int:
     print(f"[models]                         : {config.models}")
     print("checklist step s1                : model='a' -> operator flips it to 'b'")
     print("operator invoker                 : scripted, 2 answers (continue, done)")
-    print(f"expected kiro warn               : {KIRO_WARN} '<id>': Method not found")
-    print(f"expected loop warn               : {LOOP_WARN} ...")
+    print(f"expected kiro warn (2.25.0 only): {KIRO_WARN} '<id>': Method not found")
+    print(f"expected loop warn               : {LOOP_WARN}")
     print(f"sidecar dir (read-only, after)   : {SIDECAR_DIR}")
 
     turns: list[Turn] = []
@@ -259,8 +284,9 @@ def main(argv: list[str]) -> int:
         )
 
     stderr_text = err.getvalue()
-    # Attribute each turn's loop-side stderr: the window between the previous
-    # runner call's entry mark and this one's.
+    # Attribute each turn's loop-side stderr: the window ending at this turn's
+    # runner-return mark, i.e. everything the loop printed for this turn --
+    # the pre-spawn advisory and the post-spawn complaint alike.
     for i, turn in enumerate(turns):
         lo = marks[i - 1] if i else 0
         turn.loop_stderr = stderr_text[lo : marks[i]].strip()
@@ -326,22 +352,22 @@ def main(argv: list[str]) -> int:
     print(f"  turn 1 slot 'a' -> argv --model {models[0] if models else None}")
     print(f"  turn 2 slot 'b' -> argv --model {models[1] if len(models) > 1 else None}")
     print()
-    print("  DID THE SERVING MODEL CHANGE? NO")
-    print(
-        "  expected: kiro v2 never applies --model (research 3a). No switch is "
-        "the correct outcome, not a failure of this run."
-    )
-    print(f"  kiro rejected the flag on both turns : {all(kiro_warned)}  {kiro_warned}")
+    changed = [m is not None and s == m for m, s in zip(models, served, strict=False)]
+    print(f"  DID THE SERVING MODEL CHANGE? {'YES' if all(changed) else 'NO'}")
+    print("  expected: 2.25.0 never applies --model (research 3a); 2.26.1 applies it (re-test).")
+    print(f"  kiro printed its own reject line    : {all(kiro_warned)}  {kiro_warned}")
     print(f"  harness warned on both turns        : {all(loop_warned)}  {loop_warned}")
     print(f"  operator told on both turns         : {all(surfaced)}  {surfaced}")
     print(f"  sidecar model, turn 1 / turn 2      : {served[0] if served else None} / "
           f"{served[1] if len(served) > 1 else None}")
-    detected = all(kiro_warned) and all(loop_warned) and all(surfaced)
+    detected = all(loop_warned) and all(surfaced)
+    refused = all(kiro_warned)
     print()
-    print(f"  DID THE HARNESS DETECT AND SURFACE THE REFUSAL? {'YES' if detected else 'NO'}")
-    print("  evidence: per-turn CLI stderr (kiro's own line), per-turn loop stderr")
-    print("            ([warn] provider kiro does not honor --model), and the")
-    print("            'Slot warning:' line in that turn's operator prompt")
+    print(f"  WAS KIRO'S --model FLAG REFUSED? {refused}")
+    print(f"  DID THE HARNESS REPORT WHAT HAPPENED ON BOTH CHANNELS? {detected}")
+    print("  evidence: per-turn CLI stderr (kiro's own line when there is one), per-turn")
+    print("            loop stderr ([warn] provider kiro exposes no per-turn")
+    print("            serving-model field), and the 'Slot warning:' prompt line")
     print("  NOT from the reply text: the replies are not consulted for any of this")
     print()
     print(f"  run status           : {result.status.value}  ({result.reason})")

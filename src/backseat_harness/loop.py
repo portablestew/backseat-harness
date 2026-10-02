@@ -47,12 +47,89 @@ from backseat_harness.providers.base import SpawnSpec, TurnResult
 
 # Runs one managed turn and returns its outcome. Injected (real subprocess/fake).
 ManagedRunner = Callable[[Provider, SpawnSpec], TurnResult]
-# Invokes the operator with an assembled prompt and returns its final text.
+# Invokes the operator with an assembled prompt and returns its final text,
+# an OperatorReply when the call was killed (any other str reply was not).
 OperatorInvoker = Callable[[str], str]
 
-# Bad-slot re-asks are their own budget (docs 2-plan §5a), separate from the
-# parse re-ask inside op.review: an operator that needs both gets both.
-MODEL_SLOT_REASKS = 1
+
+class OperatorReply(str):
+    """An operator reply that remembers whether its call was killed.
+
+    A ``str`` subclass so an invoker that merely returns text (tests, other
+    frontends) is still a valid reply: an unflagged reply was not timed out.
+    The flag originates where the kill is actually known -- the cli layer
+    reading ``spawn.run_with_timeout``'s ``timed_out`` -- so the loop's re-ask
+    conditions the timeout story on the kill rather than on the text being
+    empty: an empty reply from a completed call was never killed.
+    """
+
+    def __new__(cls, text: str, *, timed_out: bool = False) -> OperatorReply:
+        reply = super().__new__(cls, text)
+        reply.timed_out = timed_out
+        return reply
+
+
+def _slot_complaint(bad: list[tuple[str, str]], config: Config) -> str:
+    """The correction text for a verdict naming slots no ``[models]`` defines.
+
+    Names the offending step ids and values, the configured slots, and the two
+    things that are always acceptable -- the reserved ``default`` name and
+    omitting the field -- so the operator can fix the response without having to
+    recall the rules from an earlier turn.
+    """
+    bad_text = ", ".join(f"{value!r} on step {sid!r}" for sid, value in bad)
+    which = "which is" if len(bad) == 1 else "none of which is"
+    slots = ", ".join(sorted(config.models))
+    valid_line = (
+        f'Valid slots: {slots} (or "default"; omit for the default model).'
+        if slots
+        else 'No model slots are configured; do not set "model".'
+    )
+    return (
+        f'Your checklist_update set "model" to {bad_text}, {which} not a '
+        f"configured slot. {valid_line} Re-send it with a valid \"model\" (or none)."
+    )
+
+
+def _model_rejection_warning(
+    config: Config,
+    provider: Provider,
+    model_id: str,
+    turn_model: str | None,
+    slot_source: tuple[str, str] | None,
+) -> str:
+    """The loud complaint for a turn the provider refused to run.
+
+    ``model_id`` is the id the CLI itself quoted back (kiro names it in its
+    ``runError``), and the origin says who asked for it, so the operator can
+    go straight to the binding that produced it: the step's slot when a slot
+    supplied the id, otherwise the default binding's own name. A rejection
+    with no ``--model`` composed at all cannot be the harness's doing, and
+    says so rather than blaming a binding that was never used.
+
+    The remedy hint rides with the complaint when the adapter knows the
+    command that lists valid ids, so "which ids are valid?" is answered in
+    the same breath as the failure.
+    """
+    subject = f"{config.provider} rejected model id {model_id!r}"
+    if slot_source is not None:
+        sid, slot = slot_source
+        origin = f"step '{sid}' slot '{slot}'"
+    elif turn_model is not None:
+        bound = config.models.get("default")
+        origin = "[models] default" if isinstance(bound, str) and bound else "[harness] model"
+    else:
+        return (
+            f"{subject} with no --model composed for this turn; the turn "
+            "produced no reply (the id came from the provider's own selection)"
+        )
+    hint = (
+        f" Fix the model id -- `{provider.list_models_command}` lists the ids "
+        f"{config.provider} accepts"
+        if provider.list_models_command
+        else ""
+    )
+    return f"{subject} ({origin}); the turn produced no reply.{hint}"
 
 
 def run_task(
@@ -105,44 +182,104 @@ def run_task(
             docs=_list_docs(paths, config.workspace_root),
             transcript_file=transcript_file,
         )
-        verdict = op.review(inputs, operator_invoker)
-        verdict = verdict or Verdict(kind=VerdictKind.PROBLEM, notes="unparseable verdict")
-        # §5a: the operator may invent a slot name in any phase (plan is its
-        # first chance to write steps). Validation lives here — the loop owns
-        # config.models — never in parse_verdict. The re-ask re-uses the *same
-        # assembled prompt* (rebuilding from the identical frozen inputs gives
-        # the identical text, and the checklist that would persist on a strike
-        # three stays unpersisted until the verdict is accepted); the budget
-        # here is separate from the parse re-ask inside op.review.
+        # One budget for every unusable reply, whatever made it unusable. An
+        # unparsable envelope and a bad model slot are the same failure to the
+        # loop -- the operator's answer was not usable -- so they draw on the
+        # same allowance, and each attempt names every complaint so far so a
+        # re-ask corrects rather than repeats. Each attempt yields at most one
+        # complaint (a verdict that did not parse has no checklist_update to
+        # check), so the suffix stays one or two sentences.
+        #
+        # The re-ask re-uses the *same assembled prompt*: rebuilding from the
+        # identical frozen inputs gives the identical text, and a checklist that
+        # would persist on a strike stays unpersisted until the verdict is
+        # accepted. Slot validation lives here, never in parse_verdict, because
+        # this is the layer that owns config.models (§5a).
+        budget = max(1, config.operator_retry_budget)
+        complaints: list[tuple[str, str]] = []
+        attempts = 0
+        verdict: Verdict | None = None
+        bad: list[tuple[str, str]] = []
+        while True:
+            attempts += 1
+            prompt = op.build_prompt(inputs)
+            if complaints:
+                prompt += "\n\n" + " ".join(text for _, text in complaints) + (
+                    " Re-send the complete JSON response."
+                    " Output the JSON object only, no prose."
+                )
+            text = operator_invoker(prompt)
+            verdict = op.parse_verdict(text)
+            if verdict is None:
+                # Three faults, three corrections. An empty reply licenses the
+                # timeout story only when the call actually timed out: the flag
+                # rides the reply from the layer that killed it, while an empty
+                # reply from a completed call was never killed -- claiming a
+                # kill sends the operator to shorten a budget that never bound.
+                # An unreadable reply is the envelope never being found, no
+                # matter what made it non-empty.
+                if text.strip():
+                    complaints.append(
+                        (
+                            "unparsable",
+                            "Your previous response contained no parsable verdict JSON.",
+                        )
+                    )
+                elif getattr(text, "timed_out", False):
+                    complaints.append(
+                        (
+                            "empty",
+                            f"Your previous response was empty: the operator call hit "
+                            f"its {config.operator.timeout_s}s timeout and its process "
+                            "tree was terminated. Answer again, keeping any validation "
+                            "tool calls short enough to finish inside that budget.",
+                        )
+                    )
+                else:
+                    complaints.append(
+                        (
+                            "empty",
+                            "Your previous response was empty: the operator call ended "
+                            "without timing out, so nothing was killed, but no text "
+                            "came back. Answer again, sending the complete JSON "
+                            "response.",
+                        )
+                    )
+            else:
+                bad = _bad_model_slots(verdict, config)
+                if not bad:
+                    break
+                complaints.append(("a bad model slot", _slot_complaint(bad, config)))
+            if attempts >= budget:
+                break
+            print(
+                f"[warn] task: operator attempt {attempts}/{budget} was "
+                f"{complaints[-1][0]}; retrying",
+                file=sys.stderr,
+            )
+
         residue: str | None = None
-        bad = _bad_model_slots(verdict, config)
-        for _ in range(MODEL_SLOT_REASKS if bad else 0):
-            bad_text = ", ".join(f"'{v}' on step '{sid}'" for sid, v in bad)
-            which = "which is" if len(bad) == 1 else "none of which is"
-            slots = ", ".join(sorted(config.models))
-            valid_line = (
-                f'Valid slots: {slots} (or "default"; omit for the default model).'
-                if slots
-                else 'No model slots are configured; do not set "model".'
+        if verdict is None:
+            # Every attempt failed to yield a verdict. Say so in the ledger
+            # notes (_persist) and the operator-note line a watcher reads
+            # (_report) -- plus the finish reason if this verdict lands
+            # terminal -- rather than leaving a bare 'problem' with no cause.
+            # The notes reach no checklist and no later prompt; only those
+            # sinks carry them.
+            reasons = ", ".join(label for label, _ in complaints)
+            verdict = Verdict(
+                kind=VerdictKind.PROBLEM,
+                notes=(
+                    f"operator produced no parsable verdict on {attempts} attempt(s) "
+                    f"({reasons})"
+                ),
             )
-            reask = (
-                f"{op.build_prompt(inputs)}\n\n"
-                f"Your checklist_update set \"model\" to {bad_text}, {which} not "
-                f"a configured slot. {valid_line} "
-                "Re-send the complete JSON response with a valid \"model\" "
-                "(or none). Output the JSON object only."
-            )
-            verdict = (
-                op.parse_verdict(operator_invoker(reask))
-                or Verdict(kind=VerdictKind.PROBLEM, notes="unparseable verdict on re-ask")
-            )
-            bad = _bad_model_slots(verdict, config)
-        if bad:
+        elif bad:
             verdict, dropped = _strip_invalid_model_slots(verdict, config)
             residue = (
                 "operator verdict still named unknown model slot(s) after "
-                f"{MODEL_SLOT_REASKS} re-ask(s), dropping: "
-                + "; ".join(f"'{v}' on step '{sid}'" for sid, v in dropped)
+                f"{attempts} attempt(s), dropping: "
+                + "; ".join(f"{value!r} on step {sid!r}" for sid, value in dropped)
             )
             print(f"[warn] task: {residue}", file=sys.stderr)
         slot_residue = residue
@@ -173,9 +310,9 @@ def run_task(
         # Same fresh disk read the turn loop uses; the model is discarded
         # (nothing is spawned here) and the review phase re-resolves, so the
         # warning is one-shot rather than carried across the boundary. The kiro
-        # override at :228+ is deliberately not applied here: it is a finding-2
-        # concern about whether a composed --model is honored, and this phase
-        # composes no flag.
+        # advisory below is deliberately not applied here: it is a standing
+        # caveat about kiro's missing serving-model field, it quotes the id a
+        # slot resolved, and this phase composes no flag and runs no turn.
         _plan_model, _plan_slot_source, plan_warning = _resolve_turn_model(
             checklist_mod.load_checklist(paths.checklist), config
         )
@@ -241,18 +378,27 @@ def run_task(
         )
         if slot_source is not None and config.provider == "kiro":
             kiro_sid, kiro_slot = slot_source
-            # Composed, not overwritten. A slot-sourced turn can now also carry
-            # a warning of its own (a disagreement, an unusable [models].default),
-            # and a turn can be both slot-sourced on kiro and ambiguous -- the
-            # harness picked one of two models and is telling the operator so.
-            # The condition still keys on slot_source alone: whether a slot
-            # supplied the id is unchanged, only the assignment is. The review's
-            # "the kiro branch cannot clobber an existing warning" property no
-            # longer holds, because a resolved slot can now return one, and it
-            # does not need to -- the two are meant to reach the prompt together.
+            # Composed, not overwritten: a slot-sourced turn can also carry a
+            # warning of its own (a disagreement, an unusable [models].default),
+            # and both reach the prompt together.
+            #
+            # What this advisory says changed with the CLI. On 2.26.1 kiro
+            # applies --model on fresh and resumed turns (docs 1, "Re-test on
+            # kiro-cli 2.26.1"), so the line this used to print -- "provider
+            # kiro does not honor --model ... will run on kiro's default
+            # routing anyway" -- stated as fact something measured false on
+            # the installed version, on every slot-sourced kiro turn. The one
+            # thing kiro still does not expose is any field saying which model
+            # *served* the turn: the ACP stream carries no model, and the
+            # sidecar records the request (`user_turn_metadatas[].model`), not
+            # an attestation. That residual, and nothing else, is claimed
+            # here -- on stderr and in the operator prompt alike. The failure
+            # that is real (an id kiro does not have) is caught after the
+            # spawn, where kiro quotes the id back.
             kiro_warning = (
-                f"provider kiro does not honor --model; step '{kiro_sid}' slot "
-                f"'{kiro_slot}' will run on kiro's default routing anyway"
+                f"provider kiro exposes no per-turn serving-model field; step "
+                f"'{kiro_sid}' slot '{kiro_slot}' requests {turn_model!r} and "
+                f"kiro's own records carry only the request"
             )
             print(f"[warn] {kiro_warning}", file=sys.stderr)
             slot_warning = (
@@ -275,6 +421,22 @@ def run_task(
             ),
         )
         result = managed_runner(provider, spec)
+        # The refusal that can be named exactly, caught where it happens. kiro
+        # quotes the id back in its runError, so the binding that asked for it
+        # can be quoted to the operator instead of the turn just ending as an
+        # unnamed nonzero exit; fresh and resumed turns emit the same event, so
+        # one check covers both paths (docs/12-kiro-loud-path-live.md). Warnings
+        # collected before the spawn stay in ``slot_warning`` too: the review
+        # prompt carries the advisory and this complaint on one line.
+        rejected = provider.rejected_model_id(result.stdout, result.stderr)
+        if rejected is not None:
+            rejection = _model_rejection_warning(
+                config, provider, rejected, turn_model, slot_source
+            )
+            print(f"[warn] {rejection}", file=sys.stderr)
+            slot_warning = (
+                f"{slot_warning}; {rejection}" if slot_warning else rejection
+            )
         binding = _record_native(binding, result, provider)
         outcome = TurnOutcome(
             exit_code=result.exit_code,

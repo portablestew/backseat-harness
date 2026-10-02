@@ -239,3 +239,72 @@ def test_history_provider_matches_chat_mother_forker_name():
     assert KiroProvider.history_provider == "kiro_cli"
     names = {p.name for p in default_providers()}
     assert KiroProvider.history_provider in names
+
+
+#: A refusal, verbatim: what kiro-cli 2.26.1 emits when the id is not in the
+#: catalog -- runError at stage prompt naming the id, empty stderr, exit 1
+#: (same shape on fresh and ``--resume-id`` turns).
+_REJECTED = (
+    '{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}'
+    '\n'
+    '{"type":"metadata","data":{"sessionId":"15742df0-2fe0-4fbd-84c5-fdf924c42dbd","contextUsag'
+    'ePercentage":7.193499565124512,"reasoning":{"support":"unavailable","effortLevels":[]}}}'
+    '\n'
+    '{"type":"runError","data":{"sessionId":"15742df0-2fe0-4fbd-84c5-fdf924c42dbd","stage":"prompt",'
+    '"message":"Internal error (code -32603): Encountered an error in the response stream: '
+    "The model 'no-such-model-xyz' is not available. Please use '/model' to select a different "
+    'model and try again. (request_id: ed60301d-9126-4917-a764-5b1a7aaf72c2)"}}'
+    '\n'
+)
+
+
+def test_rejected_model_id_reads_the_id_kiro_named():
+    p = KiroProvider()
+    assert p.rejected_model_id(_REJECTED, "") == "no-such-model-xyz"
+
+
+def test_rejected_model_id_none_on_a_well_formed_run():
+    p = KiroProvider()
+    assert p.rejected_model_id(_ONESHOT, "") is None
+    assert p.rejected_model_id(_RESUME, "") is None
+
+
+def test_rejected_model_id_ignores_an_unrelated_failure():
+    # An ordinary failed turn shares exit 1, but carries no kiro words naming a
+    # model: keying on the message means naming nothing here.
+    p = KiroProvider()
+    stdout = (
+        '{"type":"runError","data":{"sessionId":"' + _SESSION + '","stage":"prompt",'
+        '"message":"Internal error (code -32603): connection reset by peer"}}\n'
+    )
+    assert p.rejected_model_id(stdout, "") is None
+
+
+def test_rejected_model_id_scans_stderr_when_the_message_lands_there():
+    p = KiroProvider()
+    stderr = (
+        "The model 'glm-4.6' is not available. Please use '/model' to select a "
+        "different model and try again.\n"
+    )
+    assert p.rejected_model_id("", stderr) == "glm-4.6"
+
+
+def test_rejected_model_id_ignores_the_phrase_outside_a_run_error():
+    # The sentence inside a reply body is talk about models, not a refusal.
+    p = KiroProvider()
+    stdout = (
+        '{"type":"sessionUpdate","data":{"sessionId":"' + _SESSION + '","update":{'
+        '"sessionUpdate":"agent_message_chunk","content":{"type":"text",'
+        '"text":"The model \'gone\' is not available. (My advice: pick another.)"}}}}'
+        '\n'
+    )
+    assert p.rejected_model_id(stdout, "") is None
+
+
+def test_list_models_command_names_the_kiro_catalog():
+    from backseat_harness.providers.base import Provider
+
+    assert KiroProvider.list_models_command == "kiro-cli chat --list-models"
+    # No known command on the base: the loop's hint must not fire for a
+    # provider that cannot answer the question.
+    assert Provider.list_models_command is None

@@ -1,6 +1,6 @@
 from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, VerdictKind
-from backseat_harness.operator import ReviewInputs, build_prompt, parse_verdict, review
+from backseat_harness.operator import ReviewInputs, build_prompt, parse_verdict
 
 
 def _outcome(exit_code=0, timed_out=False):
@@ -71,24 +71,6 @@ def test_build_prompt_no_hint_on_clean_exit():
         outcome=_outcome(), iteration=1,
     )
     assert "abnormally" not in build_prompt(inputs)
-
-
-def test_review_reasks_once_on_bad_output():
-    calls = []
-
-    def invoke(prompt: str) -> str:
-        calls.append(prompt)
-        if len(calls) == 1:
-            return "sorry no json"
-        return '{"verdict":"continue","next_prompt":"retry"}'
-
-    inputs = ReviewInputs(
-        meta_prompt="Goal", checklist=Checklist(), managed_fork="fork",
-        outcome=_outcome(), iteration=1,
-    )
-    v = review(inputs, invoke)
-    assert len(calls) == 2
-    assert v.kind is VerdictKind.CONTINUE
 
 
 def test_parse_ignores_trailing_prose_with_braces():
@@ -203,7 +185,8 @@ def test_persona_ships_with_package():
 
     persona = load_persona()
     assert "vibecoding" in persona
-    assert "one small" in persona
+    assert "One small step per turn" in persona
+    assert "Name the class, not the instances" in persona
 
 
 def test_prompt_lists_handoff_docs():
@@ -224,16 +207,52 @@ def test_prompt_lists_handoff_docs():
 def test_checklist_fields_are_clipped_with_a_marker():
     """Long evidence is cut, and the prompt says how much and where to look."""
     from backseat_harness.checklist import Checklist
-    from backseat_harness.operator import render_checklist
+    from backseat_harness.operator import CHECKLIST_FIELD_LIMIT, render_checklist
 
+    limit = CHECKLIST_FIELD_LIMIT
     cl = Checklist(
-        steps={"1-research": {"status": "done", "evidence": "E" * 900}},
+        steps={"1-research": {"status": "active", "evidence": "E" * (limit + 500)}},
         remarks=[],
     )
     out = render_checklist(cl, ".backseat/tasks/t")
-    assert "E" * 250 in out
-    assert "..[+650 chars]" in out
-    assert "E" * 251 not in out
+    assert "E" * limit in out
+    assert "..[+500 chars]" in out
+    assert "E" * (limit + 1) not in out
+
+
+def test_done_steps_inline_as_a_map_entry_and_drop_their_evidence():
+    """Closed work stays visible as a plan entry without its verified bytes."""
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import render_checklist
+
+    cl = Checklist(
+        steps={
+            "1-research": {
+                "title": "Research the flag",
+                "status": "done",
+                "evidence": "verified at 48a0da1, 134 passed",
+                "notes": "close-out detail nobody needs again",
+            }
+        },
+        remarks=[],
+    )
+    out = render_checklist(cl, ".backseat/tasks/t")
+    assert "Research the flag" in out
+    assert '"status": "done"' in out
+    assert "134 passed" not in out
+    assert "close-out detail" not in out
+
+
+def test_non_done_steps_keep_every_field():
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import render_checklist
+
+    cl = Checklist(
+        steps={"11": {"title": "T", "status": "blocked", "notes": "n", "evidence": "e"}},
+        remarks=[],
+    )
+    out = render_checklist(cl, ".backseat/tasks/t")
+    assert all(v in out for v in ("T", "blocked", "n", "e"))
 
 
 def test_short_checklist_fields_are_left_alone():
@@ -250,12 +269,12 @@ def test_only_recent_remarks_are_inlined_and_older_ones_point_at_the_file():
     from backseat_harness.checklist import Checklist
     from backseat_harness.operator import CHECKLIST_RECENT_REMARKS, render_checklist
 
-    total = 20
+    total = CHECKLIST_RECENT_REMARKS + 10
     remarks = [f"remark-{i}" for i in range(total)]
     out = render_checklist(Checklist(steps={}, remarks=remarks), ".backseat/tasks/t")
     # The most recent CHECKLIST_RECENT_REMARKS survive; the rest are counted off.
-    assert "remark-19" in out
+    assert f"remark-{total - 1}" in out
     assert f"remark-{total - CHECKLIST_RECENT_REMARKS}" in out
-    assert "remark-14" not in out
-    assert f"..[{total - CHECKLIST_RECENT_REMARKS} earlier remarks omitted" in out
+    assert "remark-9" not in out
+    assert "..[10 earlier remarks omitted" in out
     assert "checklist.json" in out
