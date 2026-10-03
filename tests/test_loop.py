@@ -106,6 +106,29 @@ def test_loop_completes_on_done_verdict(config, task):
     assert storage.load_binding(paths).current.native_id == "sess-1"
 
 
+# --- Persistence order: the ledger lands last (load-bearing invariant) ---
+
+
+def test_ledger_is_persisted_last(config, task):
+    """The ledger's file is updated with the verdict after checklist, binding,
+    and state within the turn's persist cycle (load-bearing crash anchor)."""
+    slug, paths = task
+
+    def operator_invoker(prompt: str) -> str:
+        return '{"verdict":"done"}'
+
+    run_task(slug, config, FakeProvider(), _managed_runner_ok, operator_invoker, first_prompt="go")
+    # The turn's verdict line lands in the ledger.
+    import json
+    lines = [line for line in paths.ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) >= 1
+    entry = json.loads(lines[-1])
+    assert entry["verdict"] == "done"
+    # The final lane state reflects the terminal result; it is durable.
+    state = storage.load_state(paths, slug)
+    assert state.status is TaskStatus.COMPLETE
+
+
 def test_loop_pauses_on_ask_human(config, task):
     slug, paths = task
     provider = FakeProvider()

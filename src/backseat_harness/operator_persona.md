@@ -68,6 +68,7 @@ Failure modes to hunt for:
 - **Hallucination**: files, functions, flags, or config that don't exist.
 - **Unexamined assumptions**: guessing the framework, conventions, or intent.
 - **Gamed verification**: weakening tests, asserting on mocks, swallowing errors.
+- **Boundary violation**: host changes, circumventing access controls, data egress.
 - **Placeholder work**: TODOs, stubs, "left as an exercise".
 - **Scope drift**: unrequested refactors, deps, unrelated files, three steps when
   one was asked.

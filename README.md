@@ -31,7 +31,7 @@ your goal-prompt (the goal)
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Key decisions (see `docs/workspace-contract.md` for the full contract):
+Key decisions:
 
 - **Bare driver.** No tools are injected into the managed agent. All state and
   tooling live on the harness / operator side.
@@ -58,12 +58,49 @@ Key decisions (see `docs/workspace-contract.md` for the full contract):
   (3 attempts, 1s apart) and a store that stays unreadable warns and degrades
   rather than ending the run.
 - **Verdict on stdout.** The operator returns a JSON envelope
-  (`verdict`, `next_prompt`, `checklist_update`, `notes`). The harness is the
-  only writer to disk.
+  (`verdict`, `next_prompt`, `checklist_update`, `notes`) and the harness applies
+  it. The harness is the only writer to a lane's state, with one exception:
+  `docs/`, which the managed agent writes at the operator's request. It never
+  writes any `config.toml` at any layer.
 - **Durable checklist.** A map (not an array) that agents can add to and revise
   but never erase: null-stripped, field-whitelisted, freely-settable status.
 - **Library-first.** `run_task(...)` is the entry point; the CLI is a thin
   wrapper. Every path is injectable so an orchestrator can build on it.
+
+## On-disk layout
+
+A workspace is any directory holding `.backseat/`. Each task gets one lane, and
+lanes are independent: separate session chain, checklist, binding, and ledger.
+
+```
+.backseat/
+  config.toml                # harness defaults, provider prefs, budgets
+  tasks/
+    <slug>/
+      goal.md                # the goal-prompt, written once by `init`
+      config.toml            # optional per-task config (highest layer)
+      checklist.json         # durable progress map
+      binding.json           # root_uuid -> generation chain (recoverable cache)
+      ledger.jsonl           # append-only, one line per operator decision
+      state.json             # status, iteration, generation
+      transcript.md          # the managed session, rewritten each turn
+      logs/                  # one file per provider call
+      docs/                  # handoff docs, written by the managed agent
+```
+
+Every file is plain JSON / TOML / Markdown and carries a `"v"` schema version, so
+a parent workflow can read a lane's state without importing the loop. Unknown
+top-level sections are ignored rather than rejected. `TaskPaths` in
+`config.py` resolves all of these paths; `storage.py` reads and writes the JSON.
+
+Four invariants are load-bearing and enforced in code rather than described here:
+
+| invariant | why | enforced by |
+|---|---|---|
+| the ledger line lands **last** | its final line marks the last fully-committed step, so it anchors crash recovery | `loop._persist` |
+| the root UUID is redacted from `transcript.md` and every log | an operator that quotes a file must not make its own stored session match the task's marker search | `marker.redact`, `logs.redact_file` |
+| identity is the marker, not `binding.json` | a lost binding is reconstructible by searching transcripts for `<meta>START SESSION` | `marker.prepend_marker` |
+| unknown step fields are dropped, not merged | a step is a map the operator revises but never erases, so a stray key must not become state | `checklist.STEP_FIELDS` |
 
 ## Install
 
@@ -78,24 +115,12 @@ Requires Python 3.10+ and the managed agent's own CLI — one of
 (`kiro-cli`) — installed and authenticated on your PATH.
 backseat-harness never stores provider keys; it uses the CLI's ambient auth.
 
-Permissions: every CLI runs auto-approved, on both the managed turn and the
-operator. A non-interactive process has nobody to answer a prompt, so the only
-two options are *deny* (every write and shell command refused, exit 0 — the work
-silently fails) or *approve*. The harness picks approve, and applies it to the
-same argv both sides use:
-
-| CLI | default in `build_command` | narrower options |
-|---|---|---|
-| opencode | `--auto` | `--agent <name>` |
-| claude | `--permission-mode auto` | `--allowedTools` / `--disallowedTools`, `--setting-sources` |
-| kiro | `--trust-all-tools` | `--agent <name>` with a tool-permission block, `--trust-tools=<read\|grep\|write\|shell>` |
-
-So the tools you expose are tools that run. **To restrict what an agent can do,
-define a repo-level agent and point `[harness].agent` / `[operator].agent` at
-it** — that is the supported narrowing mechanism, and it beats a permission
-flag: an allowlist you wrote once, versioned with the repo, instead of a CLI's
-trust switch turned wide open. `extra_args` is still the place for per-workspace
-adjustments on top of the default.
+Permissions: every CLI runs auto-approved (opencode `--auto`, claude `--permission-mode auto`,
+kiro `--trust-all-tools`). A non-interactive process has nobody to answer a prompt,
+so deny (exit 0, silent failure) is worse than approve. The harness picks approve.
+Narrow it with `[harness].agent` / `[operator].agent` (repo-level agent definition),
+not by removing `--auto`: a single allowlist versioned with the repo beats a CLI
+switch turned wide open. `extra_args` is for adjustments on top.
 
 The operator runs the provider's default agent, or your own via
 `[operator].agent`. The persona (`src/backseat_harness/operator_persona.md`) is
@@ -149,7 +174,20 @@ Config resolves in three optional layers, higher layers overriding lower ones:
 `status`; `list` reads only the user and workspace layers). Arrays (`extra_args`,
 `verify_commands`) are **replaced wholesale**, never concatenated. A task layer
 may override anything, `[operator]` included. Every layer is read-only to the
-harness; code defaults fill anything no layer sets.
+harness; code defaults fill anything no layer sets. A commented example lives in
+[`examples/.backseat/config.toml`](examples/.backseat/config.toml).
+
+**Separate ceilings.** `[harness].turn_timeout_s` (managed turn, default 3600) and
+`[operator].timeout_s` (operator verdict, default 1800) are independent. `operator_retry_budget` (default 3) counts invocations per verdict — one call plus two re-asks; `1` disables re-asking. It multiplies `timeout_s`, so raise the timeout for heavy validation and lower the budget to bound the worst case.
+
+`[models]` is the per-step model vocabulary, and the one table that merges by key
+rather than being replaced wholesale: a task layer rebinds one slot and keeps the
+rest. A key is a slot by virtue of existing — there is no fixed vocabulary — and
+its value is an opaque model id passed verbatim as `--model`. `default` is the
+only reserved name, and is what a step resolves to when it names no slot. A
+checklist step routes itself by setting its `model` field to one of those keys.
+`[operator].model` is not a slot: it profiles the operator, which is never routed
+per step.
 
 ## Use as a library
 
@@ -180,53 +218,16 @@ deterministic and testable without a live CLI.
 
 ## Human takeover and briefs
 
-When the operator hits something only you can settle — an ambiguous goal, a
-product call, a credential — it returns the `ask_human` verdict and the loop
-blocks the lane (`status` shows `blocked`, with the question as the reason).
-
-**Usually you answer with a brief**, because the operator is the party that asked:
+`ask_human` blocks the lane. Answer with a brief (the operator's words ride the
+plan-phase prompt, outrank the goal, and end with the run):
 
 ```bash
-backseat-harness run hello-endpoint "Use SQLite; no external service."
+backseat-harness run <slug> "Use SQLite."
 ```
 
-The operator is re-invoked to re-plan, and its prompt carries your question
-first and your answer under it — it has no memory of having asked, and an
-answer with nothing attached is not answerable. You may also add a brief to a
-lane that is merely `continue`, or to a `complete` one to open more work.
-
-**Take over the wheel** when the conversation belongs to the agent itself rather
-than to the operator:
-
-```bash
-backseat-harness takeover hello-endpoint
-```
-
-This opens the managed session in the CLI's own interactive UI (for opencode,
-the TUI at the current generation's session), attached to your terminal. Drive
-the conversation as far as you need to remove the ambiguity, then quit. The
-harness is blocked on that process; when it exits, the operator re-plans from
-the session you just advanced and the loop continues. Your input lands as the
-managed agent's own conversation history, so the operator sees it as context on
-the next turn. The pending question is printed before the handoff.
-
-The two are not interchangeable. A brief never reaches the managed agent; a
-takeover never speaks to the operator directly. So a question about the agent's
-own work takes a takeover, and a decision the operator escalated — a product
-call, a config choice, a ruling on a finding — takes a brief, because the managed
-agent has no standing to answer it.
-
-`--no-resume` hands off without running the loop afterward, for when you just
-want to poke at the session. And the session is an ordinary CLI session, so you
-can always resume it by hand instead:
-
-```bash
-opencode --session <native_session_id>      # native id is shown in `status`
-```
-
-The `<meta>… #n</meta>` marker at the top tells you which generation you landed
-in. Each compaction opens a *new* session, so `status` shows the current
-generation's id, not the whole chain — `binding.json` has the rest.
+`takeover <slug>` opens the managed session in the CLI's interactive UI; when
+you quit, the harness re-plans and continues. A brief never reaches the managed
+agent; a takeover never reaches the operator. They are not interchangeable.
 
 ## Scope
 

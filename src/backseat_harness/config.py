@@ -112,11 +112,13 @@ class Config:
     # Bounds the worst case of a wedged operator at budget * operator.timeout_s;
     # lower it when raising that timeout for a validation-heavy task.
     operator_retry_budget: int = DEFAULT_OPERATOR_RETRY_BUDGET
-    # Provider-specific flags passed through to every managed turn. This is how
-    # the workspace owner grants the CLI its non-interactive permissions: the
-    # harness deliberately picks no default, because the safe-vs-usable tradeoff
-    # is the owner's to make, and a turn that blocks on an approval prompt just
-    # burns the timeout.
+    # Provider-specific flags passed through to every managed turn, on top of
+    # the auto-approve grant each adapter applies by default (opencode --auto,
+    # claude --permission-mode auto, kiro --trust-all-tools). This is how the
+    # workspace owner narrows the grant or passes per-workspace adjustments,
+    # since the safe-vs-usable tradeoff is the owner's to make: the harness does
+    # not narrow it itself. A turn that blocks on an approval prompt just burns
+    # the timeout.
     extra_args: tuple[str, ...] = ()
     # Per-step model slots: names the operator may set on a checklist step to
     # route that step's turns through a concrete ``--model``. Keys are slots by

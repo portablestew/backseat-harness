@@ -1,55 +1,79 @@
-# backseat-harness workspace config. All values are optional; code defaults
-# apply for anything omitted. A task dir may override sparingly (future).
+# backseat-harness workspace config. Every value is optional; code defaults fill
+# anything omitted. Layers, lowest precedence first:
+#
+#   ~/.backseat/config.toml              user
+#   .backseat/config.toml                workspace (this file)
+#   .backseat/tasks/<slug>/config.toml   task, and it may override anything below
+#
+# Arrays are replaced wholesale, never concatenated. The harness never writes a
+# config.toml at any layer.
 
 [harness]
-# Managed-agent CLI to drive. v0.1 supports "opencode".
+# Managed-agent CLI: "opencode" | "claude" | "kiro".
 provider = "opencode"
-# model = "anthropic/claude-opus-4"  # optional, managed agent's model (--model)
-# agent = "my-builder"               # optional, named provider agent (--agent);
-#                                    # otherwise the CLI's default agent runs
+# model = "anthropic/claude-opus-4"   # optional, the managed agent's model
+# agent = "my-builder"                # optional named agent (--agent)
 
-# Flags passed straight through to every managed turn. This is where you grant
-# the CLI its non-interactive permissions -- the harness picks no default,
-# because a turn that stops for an approval prompt just burns the timeout, and
-# the safe-vs-usable tradeoff is yours to make.
-#
-# For opencode, "--auto" approves anything not explicitly denied. opencode marks
-# it dangerous, and it is: prefer denying what matters in an agent definition
-# (.opencode/agent/*.md) and pairing that with --agent below.
-# extra_args = ["--auto"]
+# Extra flags for every managed turn, on top of the auto-approve grant each
+# adapter already passes (opencode --auto, claude --permission-mode auto, kiro
+# --trust-all-tools). This is for per-workspace adjustments, not for the grant
+# itself: to restrict what an agent may do, write a repo-level agent definition
+# and point [harness].agent at it.
 extra_args = []
 
-# Hard ceiling per managed turn. A turn should bail rather than hang, so pair
-# this with the permission flags above. Default: 3600 (1h).
+# Hard ceiling per managed turn. A turn should bail rather than hang.
+# Default: 3600.
 turn_timeout_s = 3600
 
-# Preemptive compaction trigger. When the managed session passes this many bytes
-# (~250-300k tokens at 1MB), the next turn starts a fresh generation seeded with
-# a chat-fork of the prior one. Default: 1_000_000.
-#
-# Size is reported by chat-mother-forker. For opencode that is summed SQLite row
-# bytes rather than a file size, so it is the right scale for a threshold but not
-# comparable against a file-backed CLI's numbers.
+# Preemptive compaction trigger, in transcript bytes as chat-mother-forker
+# reports them (~250-300k tokens at 1MB). For opencode that is summed SQLite row
+# bytes rather than a file size: the right scale for a threshold, not comparable
+# against a file-backed CLI. Default: 1_000_000.
 compact_threshold_bytes = 1000000
 
-# Loop budget guards. max_iterations and max_wall_clock_s are scoped to one `run`
-# call, not to the lane's whole life: a resumed lane gets a fresh budget, and
-# state.json's iteration keeps counting up across runs.
+# Loop budgets, all scoped to one `run` call rather than to the lane's whole
+# life: a resumed lane gets a fresh budget, while state.json's `iteration` keeps
+# counting up for the ledger stamps and the log names. A run that exhausts them
+# blocks with both counts in `reason`.
 max_iterations = 30
 max_wall_clock_s = 86400
 max_generations = 20
 
+# Consecutive PROBLEM verdicts that re-send the same prompt before the run is
+# blocked as stuck. A recovery that keeps changing the prompt is bounded by
+# max_iterations instead. 0 disables the cap.
+problem_repeat_cap = 3
+
+# Provider invocations allowed per operator verdict, counting the first, so 3 is
+# one call plus two re-asks and 1 disables re-asking. It multiplies
+# [operator].timeout_s, so raise that for a validation-heavy task and lower this
+# to keep the worst case bounded.
+operator_retry_budget = 3
+
+# Per-step model slots. A checklist step names a key here and its turns run under
+# that id. Keys are slots by virtue of existing, with no fixed vocabulary;
+# `default` is the only reserved name, and is the binding for a step that names
+# no slot. A pair that is not a non-empty string is dropped with a warning, never
+# silently. A task layer rebinds one key and keeps the rest.
+[models]
+# fast = "anthropic/claude-haiku-4-5"
+# default = "anthropic/claude-sonnet-4-5"
+
 [operator]
-# The operator agent. Same CLI tool, read-only profile. Often a stronger
-# model than the managed agent; kept decoupled and configurable.
+# The operator is the same CLI as the managed agent by default, often a stronger
+# model. The persona is prepended to every operator prompt, so one source of truth
+# serves all providers; the harness writes no operator profile.
 provider = "opencode"
-# model = "anthropic/claude-opus-4"  # optional, provider/model form for opencode
-# By default the harness writes and uses its own read-only "backseat-operator"
-# agent (.backseat/agents/opencode/). Name another agent here to use yours.
-# agent = "my-operator"
+# model = "anthropic/claude-opus-4"  # optional
+# agent = "my-operator"              # optional named agent, and the supported
+#                                    # way to narrow what the operator may do
 # extra_args = []                    # optional, as above
 
-# Exact commands the operator may run itself (allow-listed in its bash
-# permissions), e.g. a fast test run. Everything else it delegates to the
-# managed agent.
+# Exact commands the operator may run itself, e.g. a fast test run. Everything
+# else it delegates to the managed agent.
 verify_commands = []
+
+# Hard ceiling for one operator call, which is a call whose whole job is to read a
+# turn and emit one verdict -- deliberately not the managed turn's value.
+# Default: 1800.
+timeout_s = 1800
