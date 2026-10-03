@@ -270,6 +270,41 @@ def test_goal_md_is_copied_last_and_lands_with_the_newest_mtime(workspace: Path)
     assert (dest / "goal.md").read_text(encoding="utf-8") == GOAL_TEXT
 
 
+def test_guard_blocks_legitimate_fresh_lane(workspace: Path):
+    """A fresh legitimate lane (goal.md present, no state.json) must block."""
+    _write_job(workspace, "report")
+    tasks = workspace / ".backseat" / "tasks"
+    fresh_lane = _lane(tasks, "job-report-20260105-060000")  # no state.json
+    # The partial/debris case: a lane with no goal.md should NOT block.
+    debris = tasks / "job-report-20260104-060000-debris"
+    debris.mkdir(parents=True)
+    # No goal.md, no state.json => interrupted debris; must be ignored.
+    # A legitimate unfinished lane (fresh) still holds the guard.
+    assert jobs.fire(workspace, "report", now=_utc(2026, 1, 6, 6)) is None
+    # After the fresh lane completes, the guard releases.
+    _complete(fresh_lane)
+    # The debris lane (no goal.md) does not block a new fire.
+    result = jobs.fire(workspace, "report", now=_utc(2026, 1, 7, 6))
+    assert result is not None
+
+
+def test_partial_lane_without_goal_md_ignored_by_guard(workspace: Path):
+    """An interrupted partial copy (dir present, goal.md absent) is debris
+    and must not permanently block future fires."""
+    _write_job(workspace, "report")
+    tasks = workspace / ".backseat" / "tasks"
+    # Partial/interrupted copy: dir exists but no goal.md (copied last).
+    partial = tasks / "job-report-partial"
+    partial.mkdir(parents=True)
+    # No goal.md, no state.json => interrupted debris; ignored by guard.
+    # A completed lane exists alongside, so fire should succeed.
+    complete_lane = _lane(tasks, "job-report-20260101-060000", status=TaskStatus.COMPLETE)
+    result = jobs.fire(workspace, "report", now=_utc(2026, 1, 3, 6))
+    assert result is not None
+    # The partial debris remains but does not block.
+    assert partial.exists() and not (partial / "goal.md").exists()
+
+
 def test_a_timestamp_collision_gets_a_counter_suffix_instead_of_overwriting(
     workspace: Path,
 ):

@@ -5,8 +5,10 @@ The daemon, register-workspace, and the registry all run as real
 subprocesses over a real workspace under a hermetic temp HOME. The daemon's
 spawned ``run`` picks up a stub provider CLI injected on PATH (no parent
 monkeypatch reaches the daemon subprocess). Termination uses
-CREATE_NEW_PROCESS_GROUP + CTRL_BREAK_EVENT so the finally releases the
-guard; the assertion requires that release.
+CREATE_NEW_PROCESS_GROUP + CTRL_BREAK_EVENT; the daemon installs a
+SIGBREAK (Windows) / SIGTERM (POSIX) graceful-shutdown handler that calls
+self.stop(), so finally releases the guard; the assertions require that
+release.
 """
 
 from __future__ import annotations
@@ -213,24 +215,22 @@ def test_e2e_daemon_picks_up_new_goal_and_spawns_run(
         os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
     proc.wait(timeout=15)
 
-    # --- 7. Termination evidence (reported blocker, not false success). ---
-    # CTRL_BREAK_EVENT delivered, finally does not release guard on this
-    # Windows process (verified by manual test and 3 consecutive e2e runs).
-    # Report daemon stdout tail and actual guard state rather than encoding
-    # the failure as an assertion.
-    stdout_evidence = _tail(daemon_stdout_path)
+    # --- 7. Assert clean termination (finally runs, guard released). ---
     with db.open_db() as conn:
         guard_after = db.kv_get(conn, db.DAEMON_KEY)
         rows_after = db.list_tasks(conn)
-    block_msg = (
-        f"[blocker] CTRL_BREAK_EVENT sent to daemon group; guard after kill: "
-        f"{guard_after} (expected None if finally ran; stays on Windows); "
-        f"live harness rows after kill: "
-        f"{[r for r in rows_after if r.get('workspace_path') == str(workspace.resolve())]}"
+    assert guard_after is None, (
+        f"daemon guard not released after CTRL_BREAK_EVENT: {guard_after}; "
+        f"expected finally to clear it"
     )
-    print(block_msg)
-    tail_str = stdout_evidence[-500:] if stdout_evidence else "(empty)"
-    print(f"[blocker] daemon stdout tail (last 500 chars):\n{tail_str}")
+    orphan_rows = [
+        r for r in rows_after
+        if r.get("workspace_path") == str(workspace.resolve())
+        and r.get("harness_pid") is not None
+    ]
+    assert not orphan_rows, (
+        f"orphan harness rows remain after termination: {orphan_rows}"
+    )
 
     # --- 8. Final verification: workspace registered ---
     with db.open_db() as conn:

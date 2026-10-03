@@ -116,8 +116,10 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")  # D — deliberate: 5s busy absorbs DDL+INSERT contention
     conn.executescript(_SCHEMA_SQL)
+    # D — durable reasoning: per-connection DDL + INSERT OR IGNORE is idempotent
+    # and protected by BUSY_TIMEOUT_MS (5000); deliberate tradeoff.
     # INSERT OR IGNORE: first connect seeds schema-version, later connects
     # leave a possibly-migrated value alone.
     conn.execute(
@@ -366,8 +368,12 @@ def claim_task(
     task_relpath: str,
     harness_pid: int,
     harness_start: float | None = None,
-) -> int:
+) -> int | None:
     """Atomically claim a task row for this run; returns the row id.
+
+    Returns the row id of the claimed/updated task; returns `None` only
+    if the row disappeared after claim/update (should never occur in
+    normal operation).
 
     Auto-adds the workspace first (goal.md: workspaces are added before a
     task is initialized or run, bumping workspaces-version iff new). Then,
@@ -407,7 +413,13 @@ def claim_task(
                 "WHERE workspace_id = ? AND task_relpath = ?",
                 (int(harness_pid), float(start), ws_id, task_relpath),
             )
-        return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        # Return the actual row id of the claimed/updated task; None only
+        # if the row disappeared after claim/update (should never occur).
+        row_id_row = conn.execute(
+            "SELECT id FROM tasks WHERE workspace_id = ? AND task_relpath = ?",
+            (ws_id, task_relpath),
+        ).fetchone()
+        return int(row_id_row["id"]) if row_id_row is not None else None
 
 
 def record_provider(

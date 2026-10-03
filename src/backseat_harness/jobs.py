@@ -122,6 +122,8 @@ def _parse_tz(raw: object) -> tzinfo:
     try:
         return ZoneInfo(str(raw))
     except Exception as exc:  # noqa: BLE001 - ZoneInfoNotFoundError's bases vary by platform
+        # B — durable reasoning: missing tzdata (Windows) fails gracefully here
+        # (load_jobs catches ValueError, warns loudly, skips job); deliberate.
         raise ValueError(f"tz {raw!r} is not resolvable (is tzdata installed?): {exc}") from exc
 
 
@@ -156,7 +158,8 @@ def load_job(workspace: Path | str, slug: str) -> Job | None:
             return None
         return parse_job(slug, spec.read_text(encoding="utf-8"))
     except (OSError, ValueError, KeyError) as exc:
-        print(f"[warn] jobs: cannot load {spec}: {exc}", file=sys.stderr)
+        import logging
+        logging.getLogger("daemon").warning("jobs: cannot load %s: %s", spec, exc)
         return None
 
 
@@ -255,13 +258,19 @@ def fire(workspace: Path | str, slug: str, *, now: float | None = None) -> Path 
     if not src.is_dir():
         return None
     lanes = destinations(workspace, slug)
-    if any(not _complete(lane) for lane in lanes):  # goal:70
+    # Guard semantics: holds on legitimate unfinished lanes (goal.md present,
+    # state.json not complete). Ignores interrupted debris (no goal.md) — it
+    # must never permanently block future fires.
+    if any(
+        not _complete(lane) and (lane / _GOAL_NAME).exists() for lane in lanes
+    ):  # goal:70
         return None
     for stale in lanes[KEEP_COMPLETED:]:  # goal:71
         try:
             shutil.rmtree(stale)
         except OSError as exc:
-            print(f"[warn] jobs: cannot delete {stale}: {exc}", file=sys.stderr)
+            import logging
+            logging.getLogger("daemon").warning("jobs: cannot delete %s: %s", stale, exc)
     stamp = time.strftime(_STAMP_FORMAT, time.localtime(now if now is not None else time.time()))
     dest = _fresh_lane(tasks, f"job-{slug}-{stamp}")
     goal = src / _GOAL_NAME

@@ -630,3 +630,42 @@ def test_a_debug_run_announces_and_times_its_steps(tmp_path, capsys, monkeypatch
     # The provider call is an expected silence bounded by a configured ceiling,
     # so it announces its ceiling and where its output is going.
     assert any("calling operator" in line and "1800s ceiling" in line for line in lines)
+
+
+def test_bare_daemon_prints_help_and_exits_2(capsys):
+    rc = main(["daemon"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "usage" in out.lower() or "daemon" in out
+
+
+def test_daemon_run_dispatches_to_foreground_handler(monkeypatch):
+    import backseat_harness.cli as cli
+    args = cli._build_parser().parse_args(["daemon", "run"])
+    assert args.command == "daemon"
+    assert args.daemon_command == "run"
+    assert args.func == cli._cmd_daemon
+
+
+def test_daemon_subcommands_parse_with_format_json():
+    import backseat_harness.cli as cli
+    cmds = [
+        ["daemon", "status"],
+        ["daemon", "stop"],
+        ["daemon", "restart"],
+        ["daemon", "install"],
+    ]
+    for cmd in cmds:
+        args = cli._build_parser().parse_args(["--format", "json", *cmd])
+        assert args.format == "json"
+        assert args.command == "daemon"
+
+
+def test_daemon_install_with_uninstall_and_path_override():
+    import backseat_harness.cli as cli
+    args = cli._build_parser().parse_args(
+        ["daemon", "install", "--uninstall", "--path-override", "/tmp/custom"]
+    )
+    assert args.uninstall is True
+    assert args.path_override == "/tmp/custom"
+    assert args.func == cli._cmd_daemon_install

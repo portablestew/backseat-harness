@@ -149,8 +149,11 @@ def test_claim_replaces_a_row_whose_harness_died(conn, workspace: Path, monkeypa
         raise db.psutil.NoSuchProcess(pid)
 
     monkeypatch.setattr(db, "_process", _dead)
-    db.claim_task(conn, workspace, "tasks/x", 200, 2000.0)
+    tid = db.claim_task(conn, workspace, "tasks/x", 200, 2000.0)
     row = db.get_task(conn, workspace, "tasks/x")
+    # Contract: claim_task returns the actual claimed/updated row id (not
+    # coincidentally matching by connection state via last_insert_rowid).
+    assert tid == row["id"]
     assert row["harness_pid"] == 200
     assert row["harness_start"] == 2000.0
     # The new run starts with no provider recorded.
@@ -165,6 +168,25 @@ def test_claim_replaces_a_row_after_pid_reuse(conn, workspace: Path, monkeypatch
     monkeypatch.setattr(db, "_process", lambda pid: FakeProc(99999.0))
     db.claim_task(conn, workspace, "tasks/x", 200, 2000.0)
     assert db.get_task(conn, workspace, "tasks/x")["harness_pid"] == 200
+
+
+def test_claim_task_returns_actual_row_id_on_update(conn, workspace: Path, monkeypatch):
+    """Update path: return value equals SELECT id, not coincidental last_insert_rowid.
+
+    The None-when-row-vanished path is unreachable in normal operation (no
+    concurrent deletion of the same workspace/task by design); the contract
+    allows it for defensive completeness.
+    """
+    # First claim.
+    tid1 = db.claim_task(conn, workspace, "tasks/x", 100, 1000.0)
+    assert tid1 is not None and isinstance(tid1, int)
+    # Replacement claim on a new connection eliminates coincidence.
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(99999.0))
+    with db.connect(path=db.db_path()) as fresh_conn:
+        tid2 = db.claim_task(fresh_conn, workspace, "tasks/x", 200, 2000.0)
+    row = db.get_task(conn, workspace, "tasks/x")
+    assert tid2 == row["id"]
+    assert tid2 == tid1  # same row id (update, not new insert)
 
 
 def test_different_tasks_claim_concurrently_even_while_both_are_live(

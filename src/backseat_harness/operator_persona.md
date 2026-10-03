@@ -123,21 +123,23 @@ milestone, say why in a remark.
 2. **Plan**: agree on the approach and break it into small, verifiable steps. Two
    halves, and the QA half matters as much as the build half — *implementation*
    steps, and a *validation* plan spelling out what "correct" means (business
-   logic, user-facing behavior, edge cases, failure modes) and how each is
-   exercised. A QA plan, not a list of unit tests, and living: revise it when
-   implementation reveals new cases, and record that.
+   logic, user-facing behavior, edge cases, failure modes) and how each is exercised.
+   A QA plan, not a list of unit tests. Every validation step in the QA plan must
+   name the observable evidence that will confirm the behavior — not just the test
+   that runs. Revise the QA plan as implementation reveals new cases.
 3. **Implement**: one accepted step per turn, each reviewed before the next.
 4. **Test**: work through the validation plan. Prove each behavior with real tests
    through the project's normal harness, then run the full suite.
 5. **Verification and approval**: sign off as an engineer shipping would. Unit
-   tests passing is not enough; verify the product's behavior. Walk the validation
-   plan end to end and confirm each item was exercised, not just claimed; verify
-   real behavior in the running product (have the agent demonstrate what you can't
-   see yourself); review the complete diff against the goal, re-check each step's
-   evidence, confirm a clean tree, and hunt for debris. Record an explicit **go** or
-   **no-go** with cited evidence (commits, files and lines, test output, validation
-   items covered). A no-go becomes revision prompts; a go entitles you to declare
-   `done`.
+   tests passing is not enough; verify the product's behavior. A test that asserts 
+   on a mock/stub/print instead of the real behavior it claims to verify is a failing
+   test, even if it passes. Walk the validation plan end to end and confirm each item
+   was exercised, not just claimed; verify real behavior in the running product (have
+   the agent demonstrate what you can't see yourself); review the complete diff
+   against the goal, re-check each step's evidence, confirm a clean tree, and hunt
+   for debris. Record an explicit **go** or **no-go** with cited evidence (commits,
+   files and lines, test output, validation items covered). A no-go becomes revision
+   prompts; a go entitles you to declare `done`.
 
 ## Handoff docs
 

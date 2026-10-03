@@ -36,6 +36,7 @@ tests replace to script wakes.
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
@@ -181,9 +182,8 @@ class Scheduler:
                 try:
                     job.callback()
                 except Exception as exc:  # noqa: BLE001 - a dead job must not kill the pump
-                    print(
-                        f"[warn] scheduler: job {job.job_id!r} raised {exc!r}",
-                        file=sys.stderr,
+                    logging.getLogger("daemon").warning(
+                        "scheduler: job %r raised %r", job.job_id, exc
                     )
             if self._stop.is_set():
                 break
@@ -273,6 +273,8 @@ class Scheduler:
         return True
 
     def _start_watcher(self, target: Callable, *args) -> None:
+        # C — durable: thread count = max unique workspace keys ever adopted,
+        # not cycle count; same key updates in place, no accumulation.
         thread = threading.Thread(target=target, args=args, daemon=True)
         with self._lock:
             self._watchers.append(thread)
@@ -294,9 +296,8 @@ class Scheduler:
             try:
                 on_exit()
             except Exception as exc:  # noqa: BLE001 - a dead callback must not kill the wake
-                print(
-                    f"[warn] scheduler: pid watcher for {key[0]} raised {exc!r}",
-                    file=sys.stderr,
+                logging.getLogger("daemon").warning(
+                    "scheduler: pid watcher for %s raised %r", key[0], exc
                 )
         self.wake()
 
@@ -316,9 +317,8 @@ class Scheduler:
                         try:
                             on_change(changed)
                         except Exception as exc:  # noqa: BLE001 - same reasoning as above
-                            print(
-                                f"[warn] scheduler: file watcher {key!r} raised {exc!r}",
-                                file=sys.stderr,
+                            logging.getLogger("daemon").warning(
+                                "scheduler: file watcher %r raised %r", key, exc
                             )
                     self.wake()
             if self._stop.wait(interval):

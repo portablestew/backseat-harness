@@ -53,8 +53,10 @@ process: watchers observe, the pre-run sweep kills.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -87,6 +89,20 @@ DB_WATCH_KEY = "sqlite"
 #: The only filenames whose edits reset a check-in (goal:55-58). ``daemon.log``
 #: and everything else under tasks/jobs is noise the filter drops.
 _WATCHED_NAMES = frozenset({"goal.md", "job.toml"})
+
+# Logging: durable log under ~/.backseat; setup deferred to Daemon.run so
+# importing daemon.py is side-effect free (tests must not touch the real file).
+_LOG_PATH = Path.home() / ".backseat" / "daemon.log"
+_logger = logging.getLogger("daemon")
+_logger.setLevel(logging.INFO)
+
+
+def _setup_daemon_logging() -> None:
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _logger.handlers.clear()
+    handler = logging.FileHandler(str(_LOG_PATH), mode="a")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _logger.addHandler(handler)
 
 
 def checkin_job(workspace: str) -> str:
@@ -281,6 +297,7 @@ class Daemon:
             self._start = db.process_start(self._pid)
         with db.open_db() as conn:
             db.claim_daemon(conn, self._pid, self._start)
+        _logger.info("guard claimed pid=%s start=%s", self._pid, self._start)
 
     def run(self) -> None:
         """Claim the guard, then pump until :meth:`stop`; release it on the way out.
@@ -289,6 +306,16 @@ class Daemon:
         claim) must not clear a guard this instance never took.
         """
         self.claim()
+        _setup_daemon_logging()
+
+        def _shutdown(signum, frame):
+            self.stop()
+
+        if os.name == "nt":
+            signal.signal(signal.SIGBREAK, _shutdown)
+        else:
+            signal.signal(signal.SIGTERM, _shutdown)
+
         try:
             # Startup discovery: goal:48 sets its timestamp to now, so the
             # first pump pass adopts the workspace set before sleeping.
@@ -298,6 +325,8 @@ class Daemon:
             self._sched.stop()
             with db.open_db() as conn:
                 db.clear_daemon(conn, self._pid, self._start)
+            _logger.info("guard released pid=%s start=%s", self._pid, self._start)
+            _logger.info("shutdown")
 
     def stop(self) -> None:
         """Stop the pump and join the watcher threads (idempotent)."""
@@ -345,6 +374,7 @@ class Daemon:
         current = set(paths)
         for workspace in sorted(current - self._workspaces):
             self._workspaces.add(workspace)
+            _logger.info("discovery adopted workspace=%s", workspace)
             # Arm first, then watch (the busy branch's order): a file change
             # racing the adoption must find a pending job to move. Immediate:
             # a fresh task's own 30s gate supplies the delay (goal:51), so no
@@ -353,6 +383,7 @@ class Daemon:
             self._watch_workspace(workspace)
         for workspace in sorted(self._workspaces - current):
             self._workspaces.discard(workspace)
+            _logger.info("discovery dropped workspace=%s", workspace)
             self._sched.cancel(checkin_job(workspace))
             # The pending fires go with it: the workspace is no longer ours to
             # trigger in (goal:50, 2-plan §6).
@@ -397,6 +428,7 @@ class Daemon:
 
         busy = _live_pids(workspace)
         if busy:
+            _logger.info("check-in workspace=%s branch=busy pids=%s", workspace, [p for p, _ in busy])
             # Arm first, then watch: a pid dying between the two must find a
             # pending job to move (watchers only ever move pending jobs), and
             # the default is the fallback when the pid outlives a full period.
@@ -413,6 +445,7 @@ class Daemon:
 
         now = self._sched.now()
         if newest is not None and self._wall() - newest < QUIESCENCE_S:
+            _logger.info("check-in workspace=%s branch=quiescence newest=%.1f", workspace, newest)
             # Files are still moving: wait for quiescence before starting
             # anything (goal:40-41).
             self._arm(checkin_job(workspace), now + QUIESCENCE_S, self._checkin(workspace))
@@ -420,14 +453,17 @@ class Daemon:
 
         slug = _pick_lane(tasks_dir)
         if slug is None:
+            _logger.info("check-in workspace=%s branch=no_lane", workspace)
             # Nothing runnable: back to the default cadence (goal:31).
             self._arm(
                 checkin_job(workspace), now + CHECKIN_DEFAULT_S, self._checkin(workspace)
             )
             return
 
+        _logger.info("lane picked workspace=%s slug=%s", workspace, slug)
         # Success re-scans in 30s to spot the new pid (goal:46); a spawn that
         # raises falls through to check_in's default-and-re-raise.
+        _logger.info("run workspace=%s slug=%s", workspace, slug)
         self._spawn(workspace, slug)
         self._arm(checkin_job(workspace), now + AFTER_SPAWN_S, self._checkin(workspace))
 
@@ -479,6 +515,7 @@ class Daemon:
         for job_id in set(self._job_ids.get(workspace, set())) - set(wanted):
             self._sched.cancel(job_id)
         for job_id, slug in wanted.items():
+            _logger.info("arm workspace=%s job=%s", workspace, slug)
             self._arm(job_id, self._deadline(specs[slug]), self._fire(workspace, slug))
         if wanted:
             self._job_ids[workspace] = set(wanted)
@@ -515,7 +552,11 @@ class Daemon:
             job = jobs.load_job(workspace, slug)
             if job is None:
                 return
-            jobs.fire(workspace, slug, now=self._wall())
+            result = jobs.fire(workspace, slug, now=self._wall())
+            if result is not None:
+                _logger.info("fire workspace=%s slug=%s result=%s", workspace, slug, result)
+            else:
+                _logger.info("fire workspace=%s slug=%s held_off (guard held)", workspace, slug)
             self._arm(
                 trigger_job(workspace, slug),
                 self._deadline(job),
@@ -583,7 +624,12 @@ class Daemon:
         return on_change
 
     def _watch_db(self) -> None:
-        """Poll the registry's own mtime (goal:60-62); idempotent per key."""
+        """Poll the registry's own mtime (goal:60-62); idempotent per key.
+
+        F — durable: WAL mode means inserts go to -wal sidecar; the main
+        db.sqlite st_mtime does not change until checkpoint, so this poll
+        depends on the registry NOT using WAL.
+        """
         self._sched.watch_files(
             DB_WATCH_KEY, [db.db_path()], self._db_changed, interval=self._file_interval
         )

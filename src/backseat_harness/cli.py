@@ -122,11 +122,51 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     register.set_defaults(func=_cmd_register_workspace)
 
-    daemon = sub.add_parser(
+    daemon_parser = sub.add_parser(
         "daemon",
-        help="run the background scheduler: workspace check-ins (one instance)",
+        help="daemon lifecycle: run, install, restart, status, stop",
     )
-    daemon.set_defaults(func=_cmd_daemon)
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_command")
+
+    daemon_run = daemon_sub.add_parser(
+        "run",
+        help="run the background scheduler in the foreground until interrupted",
+    )
+    daemon_run.set_defaults(func=_cmd_daemon)
+
+    daemon_install = daemon_sub.add_parser(
+        "install",
+        help="register the daemon artifact and start it",
+    )
+    daemon_install.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove the artifact instead of installing",
+    )
+    daemon_install.add_argument(
+        "--path-override",
+        default=None,
+        help="override the frozen PATH at install/reinstall time",
+    )
+    daemon_install.set_defaults(func=_cmd_daemon_install)
+
+    daemon_restart = daemon_sub.add_parser(
+        "restart",
+        help="restart the registered daemon",
+    )
+    daemon_restart.set_defaults(func=_cmd_daemon_restart)
+
+    daemon_status = daemon_sub.add_parser(
+        "status",
+        help="show the daemon's guard-row and registration status",
+    )
+    daemon_status.set_defaults(func=_cmd_daemon_status)
+
+    daemon_stop = daemon_sub.add_parser(
+        "stop",
+        help="stop a registered daemon (does not kill unmanaged ones)",
+    )
+    daemon_stop.set_defaults(func=_cmd_daemon_stop)
 
     return p
 
@@ -369,6 +409,47 @@ def _cmd_daemon(args) -> int:
     except KeyboardInterrupt:
         pass
     _emit(args, {"daemon": "stopped"}, "daemon stopped")
+    return 0
+
+
+def _cmd_daemon_install(args) -> int:
+    # Stub for milestone 9; platform code will fill this.
+    payload = {"installed": False}
+    if args.uninstall:
+        payload["uninstalled"] = False
+        payload.update(
+            {
+                "installed": False,
+                "uninstalled": False,
+                "path_override": args.path_override,
+            }
+        )
+    else:
+        payload.update(
+            {"installed": False, "path_override": args.path_override}
+        )
+    _emit(args, payload, "daemon install stub")
+    return 0
+
+
+def _cmd_daemon_restart(args) -> int:
+    # Stub for milestone 9; platform code will fill this.
+    payload = {"restarted": False, "installed": False, "error": "nothing installed"}
+    _emit(args, payload, payload["error"])
+    return 2
+
+
+def _cmd_daemon_status(args) -> int:
+    # Stub for milestone 5; reads db guard row.
+    payload = {"running": False, "installed": False}
+    _emit(args, payload, "daemon status stub")
+    return 0
+
+
+def _cmd_daemon_stop(args) -> int:
+    # Stub for milestone 5; stops through registration only.
+    payload = {"stopped": False}
+    _emit(args, payload, "daemon stop stub")
     return 0
 
 
