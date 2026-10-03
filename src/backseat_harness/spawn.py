@@ -11,12 +11,15 @@ command-line limit (see providers.base).
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,6 +31,20 @@ from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, 
 #: the point of the helper, so a survivor that still holds a pipe must not
 #: turn a bounded wait back into an unbounded one.
 DEFAULT_KILL_GRACE_S = 5
+
+#: Callback fired the moment a provider CLI process starts: ``(pid,
+#: start_time)``. Set by the CLI around a claimed run (cli._cmd_run) so every
+#: spawn -- managed turn and operator call alike -- updates the task's row.
+#: A ContextVar like logs._current, never a module global, so a future
+#: concurrent lane cannot record into another lane's row.
+_provider_recorder: contextvars.ContextVar[Callable[[int, float], None] | None] = (
+    contextvars.ContextVar("backseat_harness_provider_recorder", default=None)
+)
+
+
+def set_provider_recorder(fn: Callable[[int, float], None] | None) -> None:
+    """Declare the callback :func:`run_with_timeout` fires on spawn (None clears)."""
+    _provider_recorder.set(fn)
 
 
 class CompletedCall(NamedTuple):
@@ -52,8 +69,13 @@ def resolve_argv(cmd: list[str]) -> list[str]:
     return [found, *cmd[1:]]
 
 
-def _kill_tree(proc: subprocess.Popen, budget_s: float) -> None:
-    """Terminate the child and everything it spawned, inside the grace budget.
+def kill_pid_tree(pid: int, *, budget_s: float = DEFAULT_KILL_GRACE_S) -> None:
+    """Terminate ``pid`` and everything it spawned, inside the grace budget.
+
+    The pid-level half of the teardown, shared by two callers: the timeout
+    path (``_kill_tree``, which adds a direct-child ``kill()`` race fallback
+    on top) and the pre-run orphan sweep, which kills a provider whose
+    harness died (db.sweep_orphans).
 
     ``Popen.kill`` is ``TerminateProcess`` on the direct child alone, and npm
     CLIs reach us through a ``.cmd`` shim -- so the direct child is ``cmd.exe``
@@ -62,17 +84,20 @@ def _kill_tree(proc: subprocess.Popen, budget_s: float) -> None:
     CPython's Windows timeout path re-reads that pipe to EOF after killing, so
     the caller blocks for as long as the orphan lives and never sees
     ``TimeoutExpired``. Killing the tree is what makes the deadline mean
-    anything; the bare ``kill()`` afterwards is only a race fallback for when
-    the tree walk finds nothing left to kill. ``taskkill`` itself draws on the
-    remaining budget: a helper that hangs must not be the thing that blows the
-    ceiling, so it is skipped outright when the budget is already spent (the
-    syscall-level ``kill()`` below still runs either way).
+    anything; on POSIX ``os.killpg`` is the tree walk -- the harness spawns
+    every provider in its own session (``start_new_session`` /
+    ``CREATE_NEW_PROCESS_GROUP``), so that pgid is the provider's tree, and
+    the own-group guard refuses to signal this process's own group even if a
+    provider somehow shares it (a missed tree is recoverable, a self-kill is
+    not). ``taskkill`` itself draws on the remaining budget: a helper that
+    hangs must not be the thing that blows the ceiling, so it is skipped
+    outright when the budget is already spent.
     """
     if os.name == "nt":
         if budget_s > 0:
             try:
                 subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
                     capture_output=True,
                     check=False,
                     timeout=budget_s,
@@ -81,9 +106,22 @@ def _kill_tree(proc: subprocess.Popen, budget_s: float) -> None:
                 pass
     else:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            pgid = os.getpgid(pid)
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+def _kill_tree(proc: subprocess.Popen, budget_s: float) -> None:
+    """Terminate the child and everything it spawned, inside the grace budget.
+
+    ``kill_pid_tree`` does the walking; the bare ``kill()`` afterwards is
+    only a race fallback for when the tree walk finds nothing left to kill.
+    """
+    kill_pid_tree(proc.pid, budget_s=budget_s)
     try:
         proc.kill()
     except OSError:
@@ -185,6 +223,20 @@ def run_with_timeout(
             **out_kwargs,
             **group_kwargs,
         )
+        # The one moment the provider's pid exists: tell the claim row (when
+        # a run declared a recorder). Recording must never break the spawn --
+        # a lost row update is diagnosable later, a killed turn is not -- so
+        # a failing callback warns and the call proceeds.
+        recorder = _provider_recorder.get()
+        if recorder is not None:
+            try:
+                recorder(proc.pid, time.time())
+            except Exception as exc:  # noqa: BLE001 - recording is best-effort
+                print(
+                    f"[warn] task: could not record provider pid {proc.pid} "
+                    f"({exc}); continuing",
+                    file=sys.stderr,
+                )
         try:
             stdout, stderr = proc.communicate(input, timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:

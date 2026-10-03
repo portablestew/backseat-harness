@@ -1,9 +1,10 @@
 """Thin CLI wrapper over the loop library.
 
 Subcommands: init (scaffold a task lane), run (drive a task), takeover, status,
-list. Every command supports ``--format json`` so a parent workflow can wait on
-the process and parse machine-readable output. The CLI wires real subprocess
-runners for the managed and operator agents; the loop itself stays injectable.
+list, register-workspace, daemon. Every command supports ``--format json`` so a
+parent workflow can wait on the process and parse machine-readable output. The
+CLI wires real subprocess runners for the managed and operator agents; the loop
+itself stays injectable.
 
 ``run <slug> [GOAL|BRIEF]`` reads its second argument two ways. On a lane with no
 goal-prompt yet it is the goal, and it is required. On a lane that already has
@@ -18,10 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
 
-from backseat_harness import __version__, logs, progress, spawn, storage
+from backseat_harness import __version__, db, logs, progress, spawn, storage
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
+from backseat_harness.daemon import Daemon
 from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.models import TaskStatus
 from backseat_harness.operator import load_persona
@@ -104,11 +108,37 @@ def _build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list", help="list task lanes")
     ls.set_defaults(func=_cmd_list)
 
+    register = sub.add_parser(
+        "register-workspace",
+        help="add a workspace dir to the registry the daemon scans",
+    )
+    register.add_argument(
+        "path", help="workspace directory to register (or drop with --unregister)"
+    )
+    register.add_argument(
+        "--unregister",
+        action="store_true",
+        help="remove this path from the registry instead of adding it",
+    )
+    register.set_defaults(func=_cmd_register_workspace)
+
+    daemon = sub.add_parser(
+        "daemon",
+        help="run the background scheduler: workspace check-ins (one instance)",
+    )
+    daemon.set_defaults(func=_cmd_daemon)
+
     return p
 
 
 def _cmd_init(args) -> int:
     config = load_config(args.workspace, args.slug)
+    # Register the workspace first (goal:3-5): the row must exist before any
+    # task lane lives under it, and add_workspace bumps workspaces-version
+    # only when this insert actually changes the set -- a repeat init in an
+    # already-listed workspace leaves the counter alone.
+    with db.open_db() as conn:
+        db.add_workspace(conn, config.workspace_root)
     paths = config.task_paths(args.slug)
     paths.root.mkdir(parents=True, exist_ok=True)
     if not paths.goal.exists():
@@ -156,15 +186,43 @@ def _cmd_run(args) -> int:
     managed_runner = run_turn
     operator_invoker = _make_operator_invoker(config, config.operator)
 
-    result = run_task(
-        slug=args.slug,
-        config=config,
-        provider=provider,
-        managed_runner=managed_runner,
-        operator_invoker=operator_invoker,
-        first_prompt=args.prompt,
-        owner_brief=brief,
-    )
+    # Registry hooks (2-plan §2), all *after* the rc-2 validation gates above
+    # so a refused run claims nothing: sweep orphans, claim this lane, record
+    # every provider spawn into the claimed row, and delete the row before
+    # leaving -- on every path, exceptions and Ctrl-C included.
+    task_relpath = paths.root.relative_to(config.workspace_root).as_posix()
+    with db.open_db() as conn:
+        db.sweep_orphans(conn)
+        try:
+            db.claim_task(
+                conn,
+                config.workspace_root,
+                task_relpath,
+                os.getpid(),
+            )
+        except db.ClaimConflict as exc:
+            _emit(args, {"slug": args.slug, "error": str(exc)}, str(exc))
+            return 2
+        spawn.set_provider_recorder(
+            lambda pid, start: db.record_provider(
+                conn, config.workspace_root, task_relpath, pid, start
+            )
+        )
+        try:
+            result = run_task(
+                slug=args.slug,
+                config=config,
+                provider=provider,
+                managed_runner=managed_runner,
+                operator_invoker=operator_invoker,
+                first_prompt=args.prompt,
+                owner_brief=brief,
+            )
+        finally:
+            # Clear first: a spawn during teardown must not write through a
+            # connection that release_task is about to make stale.
+            spawn.set_provider_recorder(None)
+            db.release_task(conn, config.workspace_root, task_relpath)
     _emit(args, result.to_dict(), _result_line(result))
     return 0 if result.status.value in {"complete", "blocked"} else 1
 
@@ -289,6 +347,84 @@ def _cmd_list(args) -> int:
     tasks_dir = config.tasks_dir
     slugs = sorted(p.name for p in tasks_dir.iterdir()) if tasks_dir.exists() else []
     _emit(args, {"tasks": slugs}, "\n".join(slugs) if slugs else "(no tasks)")
+    return 0
+
+
+def _cmd_daemon(args) -> int:
+    """Run the background daemon until it is stopped (2-plan §3).
+
+    The single-instance guard is claimed inside ``Daemon.run`` before anything
+    is scheduled: a live daemon already out there is refused with exit 2, the
+    same channel as the other pre-run refusals, and the running instance is
+    left untouched. Ctrl-C is the normal way to stop — by the time it surfaces
+    here the ``finally`` in ``run`` has already joined the watchers and
+    released the guard, so both exits report the same stopped payload.
+    """
+    instance = Daemon()
+    try:
+        instance.run()
+    except db.DaemonAlreadyRunning as exc:
+        _emit(args, {"error": str(exc)}, str(exc))
+        return 2
+    except KeyboardInterrupt:
+        pass
+    _emit(args, {"daemon": "stopped"}, "daemon stopped")
+    return 0
+
+
+def _cmd_register_workspace(args) -> int:
+    """Register (or ``--unregister``) a workspace dir in ``~/.backseat/db.sqlite``.
+
+    The path is resolved to an absolute form before it reaches the db so the
+    same workspace can never be listed twice under two spellings — the exact
+    normalization ``db.add_workspace``/``db.unregister_workspace`` apply, done
+    here too so the emitted payload reports the stored string.
+
+    The version bump is not this command's to manage: the db helpers move
+    ``workspaces-version`` exactly when the workspace set changes (2-plan §1),
+    so re-registering a listed path is a no-op and unregistering an unlisted
+    one succeeds silently — both required invariants (goal:18-22).
+
+    The workspace-shape guard (``.backseat/`` present, 2-plan §5) applies to
+    the add form only: registering points at an existing workspace, while
+    init/run auto-add covers one being created right now. ``--unregister``
+    stays a pure registry edit — a dir whose ``.backseat/`` already vanished
+    still needs its row dropped, and the task rows it leaves behind remain
+    visible to the pre-run sweep (db.py:243-245).
+    """
+    target = Path(args.path).expanduser().resolve()
+    if args.unregister:
+        with db.open_db() as conn:
+            removed = db.unregister_workspace(conn, target)
+            version = db.workspaces_version(conn)
+        text = (
+            f"Unregistered workspace {target}"
+            if removed
+            else f"Workspace {target} is not registered"
+        )
+        _emit(
+            args,
+            {"path": str(target), "unregistered": removed, "workspaces_version": version},
+            text,
+        )
+        return 0
+    if not (target / ".backseat").is_dir():
+        error = f"{target} is not a workspace (no .backseat/ directory there)"
+        _emit(args, {"path": str(target), "error": error}, error)
+        return 2
+    with db.open_db() as conn:
+        added = db.add_workspace(conn, target)
+        version = db.workspaces_version(conn)
+    text = (
+        f"Registered workspace {target}"
+        if added
+        else f"Workspace {target} is already registered"
+    )
+    _emit(
+        args,
+        {"path": str(target), "registered": added, "workspaces_version": version},
+        text,
+    )
     return 0
 
 
