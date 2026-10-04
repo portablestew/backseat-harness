@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -415,30 +416,104 @@ def _cmd_daemon(args) -> int:
 
 
 def _cmd_daemon_install(args) -> int:
-    # Stub for milestone 9; platform code will fill this.
-    payload = {"installed": False}
-    if args.uninstall:
-        payload["uninstalled"] = False
-        payload.update(
-            {
-                "installed": False,
-                "uninstalled": False,
+    original_path = os.environ.get("PATH")
+    if args.path_override:
+        os.environ["PATH"] = args.path_override
+
+    foreign_warning = None
+    try:
+        with db.open_db() as conn:
+            guard = db._daemon_record(conn)
+            if guard is not None and db.pid_live(guard.get("pid"), guard.get("start")):
+                registered = platform_mod.is_registered()
+                foreign_warning = (
+                    f"daemon is already live (pid={guard.get('pid')}); "
+                    f"install does not kill a running daemon; "
+                    f"ownership undeterminable (guard={guard.get('pid')}) — "
+                    f"if it was not started by this registration, use the "
+                    f"owning registration's `daemon restart` or `stop`; "
+                    f"otherwise foreground Ctrl-C to reclaim"
+                    f"{' (stale artifact exists)' if registered else ''}"
+                )
+    except Exception:
+        pass
+
+    try:
+        if args.uninstall:
+            platform_mod.uninstall()
+            payload = {"uninstalled": True, "path_override": args.path_override}
+            text = "daemon uninstalled"
+        else:
+            platform_mod.register()
+            start_ok = True
+            start_err = None
+            try:
+                platform_mod.start()
+            except Exception as exc:
+                start_ok = False
+                start_err = str(exc)
+            linger_text = None
+            try:
+                user = os.environ.get("USER") or os.environ.get("USERNAME", "user")
+                result = subprocess.run(
+                    ["loginctl", "show-user", user, "--property=Linger"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                output = (result.stdout or "")
+                if "Linger=no" in output:
+                    linger_text = (
+                        f"linger is disabled for {user}; "
+                        f"enable with: loginctl enable-linger {user}"
+                    )
+                elif "Linger=yes" in output:
+                    linger_text = f"linger enabled for {user}"
+            except Exception:
+                pass
+
+            installed_claim = start_ok and (foreign_warning is None)
+            payload = {
+                "installed": installed_claim,
                 "path_override": args.path_override,
+                "start_ok": start_ok,
             }
-        )
-    else:
-        payload.update(
-            {"installed": False, "path_override": args.path_override}
-        )
-    _emit(args, payload, "daemon install stub")
+            text_parts = ["daemon installed" if installed_claim else "daemon install incomplete"]
+            if start_err:
+                payload["start_error"] = start_err
+                text_parts.append(f"start failed: {start_err}")
+            if linger_text:
+                text_parts.append(f"[linger] {linger_text}")
+            if foreign_warning:
+                payload["warn"] = foreign_warning
+                text_parts.append(f"[warn] {foreign_warning}")
+                installed_claim = False
+                payload["installed"] = installed_claim
+            text = "; ".join(text_parts)
+    finally:
+        if original_path is not None:
+            os.environ["PATH"] = original_path
+        elif args.path_override:
+            os.environ.pop("PATH", None)
+
+    _emit(args, payload, text)
     return 0
 
 
 def _cmd_daemon_restart(args) -> int:
-    # Stub for milestone 9; platform code will fill this.
-    payload = {"restarted": False, "installed": False, "error": "nothing installed"}
-    _emit(args, payload, payload["error"])
-    return 2
+    if not platform_mod.is_registered():
+        payload = {"restarted": False, "installed": False, "error": "nothing installed"}
+        _emit(args, payload, payload["error"])
+        return 2
+    try:
+        platform_mod.restart()
+        payload = {"restarted": True, "installed": True}
+        text = "daemon restarted"
+    except Exception as exc:
+        payload = {"restarted": False, "installed": True, "error": str(exc)}
+        text = f"restart failed: {exc}"
+    _emit(args, payload, text)
+    return 0
 
 
 def _cmd_daemon_status(args) -> int:

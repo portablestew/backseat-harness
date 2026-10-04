@@ -1,4 +1,5 @@
 import os
+import sys
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock
 
@@ -90,3 +91,117 @@ def test_windows_artifact_is_valid_task_xml_with_wrapper(monkeypatch, tmp_path):
         assert "/IT" not in c, "Register command must not carry /IT when using /XML"
         assert "/F" in c, "Expected /F force flag"
         assert "/TN" in c and "backseat-daemon" in c, "Expected /TN backseat-daemon"
+
+
+@pytest.fixture(autouse=True)
+def fake_systemctl(monkeypatch):
+    """Never invoke a real systemctl command."""
+    calls = []
+    def capture(cmd):
+        calls.append(cmd)
+        return MagicMock(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(platform, "_run_systemctl", capture)
+    import backseat_harness.platform as _mod
+    _mod._SYSTEMCTL_CALLS = calls
+
+
+def test_linux_service_artifact_and_systemctl_calls(monkeypatch, tmp_path):
+    linux = platform._LinuxPlatform()
+
+    frozen_path = "/fake/linux/path"
+    original_get = os.environ.get
+    def fake_get(k, default=""):
+        return frozen_path if k == "PATH" else original_get(k, default)
+    monkeypatch.setattr(os.environ, "get", fake_get)
+
+    monkeypatch.setattr(linux, "artifact_path", lambda: tmp_path / "backseat-daemon.service")
+
+    # Capture all systemctl calls locally
+    systemctl_calls = []
+    def capture(cmd):
+        systemctl_calls.append(cmd)
+        return MagicMock(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(platform, "_run_systemctl", capture)
+
+    linux.register()
+
+    # Artifact assertions
+    artifact = tmp_path / "backseat-daemon.service"
+    assert artifact.exists(), ".service file must exist after register"
+    content = artifact.read_text(encoding="utf-8")
+    assert "Restart=always" in content
+    assert f"Environment=PATH={frozen_path}" in content
+    assert f"ExecStart={sys.executable} -m backseat_harness.cli daemon run" in content
+    assert "[Unit]" in content
+    assert "[Service]" in content
+    assert "[Install]" in content
+    assert "WantedBy=default.target" in content
+
+    assert any("daemon-reload" in c for c in systemctl_calls), "Expected daemon-reload call"
+
+    linux.start()
+    assert any("start" in c for c in systemctl_calls), "Expected start call"
+
+    linux.stop()
+    assert any("stop" in c for c in systemctl_calls), "Expected stop call"
+
+    linux.restart()
+    assert any("restart" in c for c in systemctl_calls), \
+        "Expected restart call (not stop+start sequence)"
+
+
+def test_macos_plist_artifact_and_launchctl_calls(monkeypatch, tmp_path):
+    mac = platform._MacOSPlatform()
+
+    frozen_path = "/fake/macos/path"
+    original_get = os.environ.get
+    def fake_get(k, default=""):
+        return frozen_path if k == "PATH" else original_get(k, default)
+    monkeypatch.setattr(os.environ, "get", fake_get)
+
+    monkeypatch.setattr(mac, "artifact_path", lambda: tmp_path / "backseat-daemon.plist")
+
+    launchctl_calls = []
+    def capture(cmd):
+        launchctl_calls.append(cmd)
+        return MagicMock(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(platform, "_run_launchctl", capture)
+
+    mac.register()
+
+    artifact = tmp_path / "backseat-daemon.plist"
+    assert artifact.exists(), ".plist file must exist after register"
+    content = artifact.read_text(encoding="utf-8")
+    assert "KeepAlive" in content
+    assert "<true/>" in content
+    assert f"<string>{frozen_path}</string>" in content
+    assert "backseat-daemon" in content
+    assert "ProgramArguments" in content
+    assert "daemon" in content
+    assert "run" in content
+
+    assert any("bootstrap" in c for c in launchctl_calls), \
+        "Expected bootstrap call"
+    # Verify domain is resolved (numeric uid, not literal $UID)
+    for c in launchctl_calls:
+        cmd_str = " ".join(str(x) for x in c)
+        assert "gui/$UID" not in cmd_str, \
+            "Domain must be resolved to numeric uid, not literal $UID"
+        assert "gui/" in cmd_str, "Resolved gui/ domain expected"
+
+    mac.start()
+    assert any("kickstart" in c for c in launchctl_calls)
+
+    mac.stop()
+    assert any("bootout" in c for c in launchctl_calls)
+
+    mac.restart()
+    # Restart is non-atomic: bootout unregisters, bootstrap re-registers (not kickstart)
+    restart_verb = launchctl_calls[-2:]  # last two calls: bootout, bootstrap
+    assert "bootout" in " ".join(str(x) for x in restart_verb), \
+        "Restart must begin with bootout"
+    assert "bootstrap" in " ".join(str(x) for x in restart_verb), \
+        "Restart must end with bootstrap (not kickstart)"
+    restart_last = restart_verb[-1]
+    assert "kickstart" not in " ".join(str(x) for x in [restart_last]), \
+        "Restart must not use kickstart"
