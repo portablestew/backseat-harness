@@ -669,3 +669,115 @@ def test_daemon_install_with_uninstall_and_path_override():
     assert args.uninstall is True
     assert args.path_override == "/tmp/custom"
     assert args.func == cli._cmd_daemon_install
+
+
+def test_daemon_status_running_registered(monkeypatch, capsys):
+    import json
+
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 1234, "start": 9999.0})
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(
+        platform_mod, "artifact_path",
+        lambda: type("P", (), {"exists": lambda s: True})(),
+    )
+    rc = main(["--format", "json", "daemon", "status"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["running"] is True
+    assert payload["installed"] is True
+    assert payload["pid"] == 1234
+    assert payload["start"] == 9999.0
+    assert payload["owns"] is True
+    assert isinstance(payload.get("uptime"), (int, float))
+    assert "owns" in payload
+
+
+def test_daemon_status_not_installed(monkeypatch, capsys):
+    import json
+
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
+    monkeypatch.setattr(
+        platform_mod, "artifact_path",
+        lambda: type("P", (), {"exists": lambda s: False})(),
+    )
+    rc = main(["--format", "json", "daemon", "status"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload == {"running": False, "installed": False}
+
+
+def test_daemon_status_installed_not_running(monkeypatch, capsys):
+    import json
+
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(
+        platform_mod, "artifact_path",
+        lambda: type("P", (), {"exists": lambda s: True})(),
+    )
+    rc = main(["--format", "json", "daemon", "status"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload == {"running": False, "installed": True}
+    assert "owns" not in payload
+
+
+def test_daemon_status_unmanaged_live(monkeypatch, capsys):
+    import json
+
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 777, "start": 3000.0})
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
+    monkeypatch.setattr(
+        platform_mod, "artifact_path",
+        lambda: type("P", (), {"exists": lambda s: False})(),
+    )
+    rc = main(["--format", "json", "daemon", "status"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["running"] is True
+    assert payload["installed"] is False
+    assert payload["pid"] == 777
+    assert payload["start"] == 3000.0
+    assert payload["owns"] is False
+    assert "owns" in payload
+    assert isinstance(payload.get("uptime"), (int, float))
+
+
+def test_daemon_stop_registered(monkeypatch, capsys):
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "stop", lambda: None)
+    rc = main(["daemon", "stop"])
+    assert rc == 0
+
+
+def test_daemon_stop_unmanaged_live(monkeypatch, capsys):
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 9999, "start": 5000.0})
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
+    monkeypatch.setattr(
+        platform_mod, "artifact_path",
+        lambda: type("P", (), {"exists": lambda s: False})(),
+    )
+    called = [False]
+    def spy_stop():
+        called[0] = True
+    monkeypatch.setattr(platform_mod, "stop", spy_stop)
+    rc = main(["daemon", "stop"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert not called[0], "platform.stop must not be called for unmanaged daemon"
+    assert "unmanaged" in out.lower() or "ctrl-c" in out.lower()

@@ -179,7 +179,7 @@ def test_a_second_daemon_start_exits_2(monkeypatch, capsys):
     monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
     monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
 
-    assert main(["daemon"]) == 2
+    assert main(["daemon", "run"]) == 2
     assert "already running" in capsys.readouterr().out
     # The refusal touched nothing: the running instance's record survives.
     with db.open_db() as conn:

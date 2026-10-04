@@ -21,9 +21,11 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from backseat_harness import __version__, db, logs, progress, spawn, storage
+from backseat_harness import platform as platform_mod
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
 from backseat_harness.daemon import Daemon
 from backseat_harness.loop import OperatorReply, run_task
@@ -440,16 +442,79 @@ def _cmd_daemon_restart(args) -> int:
 
 
 def _cmd_daemon_status(args) -> int:
-    # Stub for milestone 5; reads db guard row.
-    payload = {"running": False, "installed": False}
-    _emit(args, payload, "daemon status stub")
+    with db.open_db() as conn:
+        guard = db._daemon_record(conn)
+        registered = platform_mod.is_registered()
+        artifact_exists = platform_mod.artifact_path().exists()
+
+    live_guard = False
+    pid = None
+    start = None
+    if guard is not None:
+        pid = guard.get("pid")
+        start = guard.get("start")
+        live_guard = db.pid_live(pid, start)
+
+    # Four situations from 2-plan §5 / goal.md line 20-23
+    if live_guard:
+        owns = registered and artifact_exists
+        payload = {
+            "running": True,
+            "installed": registered or artifact_exists,
+            "pid": pid,
+            "start": start,
+            "uptime": round(time.time() - (start or 0), 2) if start else None,
+            "owns": owns,
+        }
+        if owns:
+            text = f"daemon running: pid={pid} start={start} owns={owns}"
+        else:
+            text = (
+                f"unmanaged daemon is live: pid={pid} start={start} "
+                f"(not owned by this installation); stop with Ctrl-C"
+            )
+    elif registered or artifact_exists:
+        payload = {"running": False, "installed": True}
+        text = "daemon installed but not running"
+    else:
+        payload = {"running": False, "installed": False}
+        text = "daemon not installed"
+    _emit(args, payload, text)
     return 0
 
 
 def _cmd_daemon_stop(args) -> int:
-    # Stub for milestone 5; stops through registration only.
-    payload = {"stopped": False}
-    _emit(args, payload, "daemon stop stub")
+    registered = platform_mod.is_registered()
+    with db.open_db() as conn:
+        guard = db._daemon_record(conn)
+        foreign_live = (
+            guard is not None
+            and db.pid_live(guard["pid"], guard.get("start"))
+        )
+    if registered:
+        try:
+            platform_mod.stop()
+            payload = {"stopped": True}
+            text = "daemon stopped"
+        except Exception as exc:
+            payload = {"stopped": False, "error": str(exc)}
+            text = f"stop failed: {exc}"
+    else:
+        if foreign_live and guard is not None:
+            payload = {
+                "stopped": False,
+                "unmanaged": True,
+                "pid": guard["pid"],
+                "start": guard.get("start"),
+            }
+            text = (
+                f"daemon is unmanaged (live pid={guard['pid']} with no "
+                f"registration); stop with foreground Ctrl-C instead"
+            )
+        else:
+            payload = {"stopped": False}
+            text = "daemon not installed; nothing to stop"
+    _emit(args, payload, text)
     return 0
 
 
