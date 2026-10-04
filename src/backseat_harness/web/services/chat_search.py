@@ -1,12 +1,15 @@
-"""Workspace chat search service (step 5.3).
+"""Workspace chat search service (step 5.3, 6.1, 6.3).
 
 Wraps chat-mother-forker search scoped to a workspace path, filtering out
 backseat-managed sessions (those carrying <meta>START SESSION or
 <meta>OPERATOR SESSION markers).
+Also provides global session search and classification (step 6.1).
+Also provides fork-provider selection helper (step 6.3).
 """
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +25,18 @@ class ChatInfo:
     project: str | None
     mtime: float
     preview: str
+
+
+@dataclass(frozen=True)
+class SessionSearchResult:
+    """One session from global search (step 6.1)."""
+
+    key: str
+    native_id: str
+    project: str | None
+    mtime: float
+    preview: str
+    classification: str  # "backseat task" | "operator" | "other"
 
 
 def _normalize(path: str | Path) -> str:
@@ -145,3 +160,139 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
         ))
 
     return results
+
+
+def classify_session(text: str) -> str:
+    """Classify a session transcript: "backseat task", "operator", or "other".
+
+    - "backseat task": contains a START SESSION marker (marker.parse_marker)
+    - "operator": contains an OPERATOR SESSION marker (marker.OPERATOR_SESSION_RE)
+    - "other": neither marker present
+    """
+    if marker.parse_marker(text) is not None:
+        return "backseat task"
+    if marker.OPERATOR_SESSION_RE.search(text):
+        return "operator"
+    return "other"
+
+
+def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearchResult]:
+    """Search all default providers, return sessions newest-first by mtime.
+
+    Args:
+        query: Search string passed to chat-mother-forker's find_chats (empty = all)
+        limit: Maximum number of sessions to return
+
+    Returns:
+        List of SessionSearchResult sorted by mtime descending (newest first),
+        each with a classification label.
+    """
+    try:
+        from backseat_harness import history
+    except ImportError:
+        return []
+
+    try:
+        find_chats = history._load("find_chats")
+        default_providers = history._load("default_providers")
+        providers = default_providers()
+    except Exception:
+        return []
+
+    try:
+        refs = find_chats(query, providers=providers, limit=limit)
+    except Exception:
+        return []
+
+    # Sort by mtime desc (newest first)
+    refs.sort(key=lambda r: getattr(r, "mtime", 0), reverse=True)
+
+    # Load transcripts and classify
+    results = []
+    load_chat = None
+    for ref in refs:
+        if len(results) >= limit:
+            break
+
+        try:
+            if load_chat is None:
+                load_chat = history._load("load_chat")
+            text = load_chat(ref.key, providers=providers)
+        except Exception:
+            classification = "other"
+            preview = ""
+        else:
+            classification = classify_session(text)
+            preview = text.strip()
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+
+        results.append(SessionSearchResult(
+            key=ref.key,
+            native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
+            project=getattr(ref, "project", None),
+            mtime=getattr(ref, "mtime", 0),
+            preview=preview,
+            classification=classification,
+        ))
+
+    return results
+
+
+# Map from chat-mother-forker provider key to backseat-harness fork provider name.
+# Harness provider names match the registry keys in providers/__init__.py:
+# 'opencode', 'kiro', 'claude'. Kiro IDE variants map to 'kiro' (kiro-cli tool).
+# opencode -> 'opencode', claude_code -> 'claude'.
+_CHAT_PROVIDER_TO_FORK_PROVIDER = {
+    "opencode": "opencode",
+    "kiro_cli": "kiro",
+    "kiro_ide": "kiro",          # Kiro IDE -> kiro (harness provider)
+    "kiro_ide_v2": "kiro",       # Kiro IDE v2 -> kiro
+    "claude_code": "claude",
+}
+
+# Supported fork providers in scan order (plan §6 lines 110-111), using harness provider names.
+_SUPPORTED_FORK_PROVIDERS = ("opencode", "kiro", "claude")
+
+
+def _extract_provider_from_key(key: str) -> str | None:
+    """Extract provider name from a ChatRef key (e.g., 'opencode:ses_...' -> 'opencode')."""
+    if not key or ":" not in key:
+        return None
+    return key.split(":", 1)[0]
+
+
+def pick_fork_provider(current_session_key: str, results: list[SessionSearchResult]) -> str:
+    """Select the provider to use for forking a session.
+
+    Rules (per 2-plan.md §6 lines 106-111):
+    1. Current provider is Kiro IDE (kiro_ide or kiro_ide_v2) -> kiro
+    2. Else, if results contain any supported-provider chat -> provider of the
+       most recent such chat (by mtime).
+    3. Else -> first of opencode / kiro / claude found on PATH.
+    4. None on PATH -> raise RuntimeError.
+    """
+    current_provider = _extract_provider_from_key(current_session_key)
+
+    # Rule 1: Current provider is Kiro IDE -> kiro (harness provider)
+    if current_provider in ("kiro_ide", "kiro_ide_v2"):
+        return "kiro"
+
+    # Rule 2: Most recent supported-provider chat in results
+    for r in results:
+        result_provider = _extract_provider_from_key(r.key)
+        fork_provider = _CHAT_PROVIDER_TO_FORK_PROVIDER.get(result_provider)
+        if fork_provider in _SUPPORTED_FORK_PROVIDERS:
+            return fork_provider
+
+    # Rule 3: PATH fallback in scan order
+    _EXE_FOR = {"opencode": "opencode", "kiro": "kiro-cli", "claude": "claude"}
+    for provider in _SUPPORTED_FORK_PROVIDERS:
+        if shutil.which(_EXE_FOR[provider]):
+            return provider
+
+    # Rule 4: Nothing on PATH
+    raise RuntimeError(
+        f"no supported CLI found on PATH (looked for opencode, kiro-cli, claude); "
+        f"current provider was {current_provider or 'unknown'}"
+    )
