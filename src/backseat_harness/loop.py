@@ -371,12 +371,12 @@ def run_task(
         # --- Budget guards (cheap, forward-only). ---
         if turns_this_run >= config.max_iterations:
             # Names both counts: state.iteration is the lane total TaskResult
-            # reports, so "blocked after 45 iterations" against a 30-turn run
+            # reports, so "continue after 45 iterations" against a 30-turn run
             # budget reads as a contradiction unless the run's own count is here.
             return _finish(
                 paths,
                 state,
-                TaskStatus.BLOCKED,
+                TaskStatus.CONTINUE,
                 last_verdict,
                 f"max_iterations reached after {config.max_iterations} turns this run "
                 f"({state.iteration} total)",

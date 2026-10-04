@@ -254,7 +254,7 @@ def test_loop_stops_at_max_iterations(config, task):
     result = run_task(
         slug, config, provider, _managed_runner_ok, operator_invoker, first_prompt="go"
     )
-    assert result.status is TaskStatus.BLOCKED
+    assert result.status is TaskStatus.CONTINUE
     assert "max_iterations" in result.reason
     assert result.iterations == 3
     assert (
@@ -291,7 +291,7 @@ def test_max_iterations_is_a_run_budget_not_a_lane_total(config, task):
         slug, config, FakeProvider(), runner, operator_invoker, first_prompt="go"
     )
 
-    assert result.status is TaskStatus.BLOCKED
+    assert result.status is TaskStatus.CONTINUE
     # Two turns spent this run, on top of the 45 the lane already had.
     assert result.iterations == 47
     assert result.reason == "max_iterations reached after 2 turns this run (47 total)"
@@ -1948,7 +1948,7 @@ def test_unparseable_reask_synthesizes_problem_without_persisting(config, task):
     )
 
     assert len(prompts) == 3  # the whole budget, on the original prompt
-    assert result.status is TaskStatus.BLOCKED
+    assert result.status is TaskStatus.CONTINUE
     assert "max_iterations" in result.reason
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
     assert data["steps"] == {}  # no verdict was ever accepted
@@ -2151,7 +2151,7 @@ def test_problem_repeat_cap_zero_disables_and_max_iterations_governs(config, tas
         first_prompt="go",
     )
 
-    assert result.status is TaskStatus.BLOCKED
+    assert result.status is TaskStatus.CONTINUE
     assert result.reason == "max_iterations reached after 4 turns this run (4 total)"
     assert result.iterations == 4
 
@@ -2188,7 +2188,7 @@ def test_negative_problem_repeat_cap_warns_and_leaves_max_iterations_governing(
         first_prompt="go",
     )
 
-    assert result.status is TaskStatus.BLOCKED
+    assert result.status is TaskStatus.CONTINUE
     assert result.reason == "max_iterations reached after 4 turns this run (4 total)"
     assert result.iterations == 4
 

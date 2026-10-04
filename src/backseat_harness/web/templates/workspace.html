@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}{{ ws_name }} - backseat-harness{% endblock %}
+{% block content %}
+<header>
+  <h2>{{ ws_name }}</h2>
+  <small>{{ ws_path }}</small>
+</header>
+
+<section>
+  <h3>Add Task</h3>
+  <form method="post" action="/ws/{{ ws_id }}/tasks">
+    <label for="task-name">Task name</label>
+    <input id="task-name" name="name" type="text" placeholder="My task" required>
+    <label for="task-goal">Goal prompt</label>
+    <textarea id="task-goal" name="goal" rows="3" placeholder="What should be done?" required></textarea>
+    <button type="submit">Add task</button>
+  </form>
+</section>
+
+<section>
+  <h3>Incomplete Tasks</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Task</th>
+        <th>Status</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in incomplete %}
+      <tr>
+        <td>{{ t.slug }}</td>
+        <td><span class="badge">{{ t.badge }}</span></td>
+        <td><small>{{ t.updated_at | format_datetime }}</small></td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="3">No incomplete tasks.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h3>Top 20 Recent Tasks</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Task</th>
+        <th>Status</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in recent %}
+      <tr>
+        <td>{{ t.slug }}</td>
+        <td><span class="badge">{{ t.badge }}</span></td>
+        <td><small>{{ t.updated_at | format_datetime }}</small></td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="3">No tasks yet.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h3>Top 20 Recent Chats</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Session</th>
+        <th>Preview</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in recent_chats %}
+      <tr>
+        <td>{{ c.native_id }}</td>
+        <td><small>{{ c.preview }}</small></td>
+        <td><small>{{ c.mtime | format_datetime }}</small></td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="3">No recent chats.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

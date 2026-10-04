@@ -183,14 +183,14 @@ def test_result_line_omits_reason_on_complete_only():
     assert _result_line(blocked) == "t: blocked after 2 iterations (which db?)"
     out_of_budget = TaskResult(
         slug="t",
-        status=TaskStatus.BLOCKED,
+        status=TaskStatus.CONTINUE,
         iterations=47,
         reason="max_iterations reached after 30 turns this run (47 total)",
     )
     # The lane total and the run budget disagree by design, so the line has to
     # carry both rather than read as a count that overshot its own limit.
     assert _result_line(out_of_budget) == (
-        "t: blocked after 47 iterations (max_iterations reached after 30 turns this run (47 total))"
+        "t: continue after 47 iterations (max_iterations reached after 30 turns this run (47 total))"
     )
 
 
