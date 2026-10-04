@@ -20,6 +20,15 @@ dependencies = [
     # pid is only trustworthy alongside psutil's create_time() to catch pid
     # reuse, which is what the task-row claim and orphan sweep check against.
     "psutil>=5.9",
+    # Web interface (task web-interface §3 scaffold).
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "jinja2",
+    "httpx",
+    "python-multipart",
+    "pywinpty>=2.0; sys_platform=='win32'",
+    "ptyprocess; sys_platform!='win32'",
 ]
 
 [project.scripts]

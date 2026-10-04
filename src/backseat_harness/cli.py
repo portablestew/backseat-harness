@@ -171,6 +171,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     daemon_stop.set_defaults(func=_cmd_daemon_stop)
 
+    web = sub.add_parser("web", help="run the local web interface (localhost only)")
+    web.add_argument(
+        "--host", default=None, help="bind host (localhost only, default: config or 127.0.0.1)"
+    )
+    web.add_argument(
+        "--port", type=int, default=None, help="bind port (default: config or 8080)"
+    )
+    web.add_argument(
+        "--workspace",
+        default=argparse.SUPPRESS,
+        help="workspace root containing .backseat/ (default: cwd, or -C value)",
+    )
+    web.set_defaults(func=_cmd_web)
+
     return p
 
 
@@ -646,6 +660,17 @@ def _cmd_register_workspace(args) -> int:
         {"path": str(target), "registered": added, "workspaces_version": version},
         text,
     )
+    return 0
+
+
+def _cmd_web(args) -> int:
+    from backseat_harness.web.cli import run_web
+
+    workspace = getattr(args, "workspace", ".")
+    config = load_config(workspace)
+    host = args.host if args.host is not None else config.web.host
+    port = args.port if args.port is not None else config.web.port
+    run_web(host=host, port=port, workspace=workspace)
     return 0
 
 

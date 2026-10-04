@@ -61,6 +61,19 @@ DEFAULT_PROBLEM_REPEAT_CAP = 3
 # count of occurrences, not of retries on top. 1 means no re-ask.
 DEFAULT_OPERATOR_RETRY_BUDGET = 3
 
+# Web interface defaults (task web-interface §3): localhost-only.
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8080
+_ALLOWED_WEB_HOSTS = {"127.0.0.1", "localhost"}
+
+
+@dataclass(frozen=True)
+class WebConfig:
+    """Local web server binding (optional ``[web]`` table)."""
+
+    host: str = DEFAULT_WEB_HOST
+    port: int = DEFAULT_WEB_PORT
+
 
 @dataclass(frozen=True)
 class OperatorConfig:
@@ -128,6 +141,7 @@ class Config:
     # profiles the operator itself, which is never routed per step.
     models: dict[str, str] = field(default_factory=dict)
     operator: OperatorConfig = field(default_factory=OperatorConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 
     # --- Path helpers: the entire .backseat/ contract lives here. ---
 
@@ -320,6 +334,47 @@ def _merge_models(cfg: Config, data: dict[str, Any]) -> dict[str, str]:
     return merged
 
 
+def _merge_web(current: WebConfig, data: dict[str, Any]) -> WebConfig:
+    """Resolve one layer's ``[web]`` table (warn + fall back on malformed)."""
+    raw = data.get("web", None)
+    if raw is None:
+        return current
+    if not isinstance(raw, dict):
+        print(
+            "[warn] config: [web] must be a table with host/port keys; "
+            f"got {type(raw).__name__}, so this layer keeps prior web values",
+            file=sys.stderr,
+        )
+        return current
+    host = current.host
+    port = current.port
+    if "host" in raw:
+        candidate = raw["host"]
+        if isinstance(candidate, str) and candidate in _ALLOWED_WEB_HOSTS:
+            host = candidate
+        else:
+            print(
+                f"[warn] config: dropped [web] host {candidate!r}: "
+                "must be 127.0.0.1 or localhost",
+                file=sys.stderr,
+            )
+    if "port" in raw:
+        candidate = raw["port"]
+        try:
+            port_int = int(candidate)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            port_int = -1
+        if 1 <= port_int <= 65535:
+            port = port_int
+        else:
+            print(
+                f"[warn] config: dropped [web] port {candidate!r}: "
+                "must be an int 1-65535",
+                file=sys.stderr,
+            )
+    return replace(current, host=host, port=port)
+
+
 def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
     harness = data.get("harness", {})
     op_data = data.get("operator", {})
@@ -353,4 +408,5 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         ),
         models=_merge_models(cfg, data),
         operator=operator,
+        web=_merge_web(cfg.web, data),
     )
