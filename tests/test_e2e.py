@@ -99,6 +99,7 @@ def test_e2e_daemon_picks_up_new_goal_and_spawns_run(
                 "-C",
                 str(workspace),
                 "daemon",
+                "run",
             ],
             stdout=out,
             stderr=out,
