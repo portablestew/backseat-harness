@@ -120,7 +120,7 @@ def test_claim_auto_adds_the_workspace_then_never_bumps_again(conn, workspace: P
     assert row["id"] == tid
     assert row["harness_pid"] == 100
     assert row["harness_start"] == 1000.0
-    assert row["provider_pid"] is None and row["provider_start"] is None
+    assert row["provider_pids"] is None
     # A second task claim in the same workspace is not a set change.
     db.claim_task(conn, workspace, "tasks/y", 101, 1001.0)
     assert db.workspaces_version(conn) == 1
@@ -143,7 +143,7 @@ def test_claim_conflicts_while_the_existing_harness_is_live(
 
 def test_claim_replaces_a_row_whose_harness_died(conn, workspace: Path, monkeypatch):
     db.claim_task(conn, workspace, "tasks/x", 100, 1000.0)
-    db.record_provider(conn, workspace, "tasks/x", 555, 4999.0)
+    db.record_provider(conn, workspace, "tasks/x", [555])
 
     def _dead(pid):
         raise db.psutil.NoSuchProcess(pid)
@@ -157,7 +157,7 @@ def test_claim_replaces_a_row_whose_harness_died(conn, workspace: Path, monkeypa
     assert row["harness_pid"] == 200
     assert row["harness_start"] == 2000.0
     # The new run starts with no provider recorded.
-    assert row["provider_pid"] is None and row["provider_start"] is None
+    assert row["provider_pids"] is None
     # Workspace already listed: claims never move the version.
     assert db.workspaces_version(conn) == 1
 
@@ -203,15 +203,14 @@ def test_different_tasks_claim_concurrently_even_while_both_are_live(
 
 def test_record_provider_requires_a_claimed_row(conn, workspace: Path):
     with pytest.raises(db.RegistryError, match="no claimed task row"):
-        db.record_provider(conn, workspace, "tasks/none", 555, 4999.0)
+        db.record_provider(conn, workspace, "tasks/none", [555])
 
 
 def test_record_provider_and_release_roundtrip(conn, workspace: Path):
     db.claim_task(conn, workspace, "tasks/x", 100, 1000.0)
-    db.record_provider(conn, workspace, "tasks/x", 555, 4999.0)
+    db.record_provider(conn, workspace, "tasks/x", [555])
     row = db.get_task(conn, workspace, "tasks/x")
-    assert row["provider_pid"] == 555
-    assert row["provider_start"] == 4999.0
+    assert row["provider_pids"] == "[555]"
     # Release-before-exit semantics: idempotent, no error on a second call.
     assert db.release_task(conn, workspace, "tasks/x") is True
     assert db.get_task(conn, workspace, "tasks/x") is None
@@ -351,7 +350,7 @@ def test_run_conflict_with_a_live_claim_exits_2_and_claims_nothing(
         row = db.get_task(conn, workspace, REL)
     assert row["harness_pid"] == 100
     assert row["harness_start"] == 1000.0
-    assert row["provider_pid"] is None
+    assert row["provider_pids"] is None
 
 
 def test_validation_failure_before_the_hooks_never_touches_the_registry(
@@ -379,15 +378,15 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
     with db.open_db() as conn:
         # Orphaned harness, provider still alive -> confirm and kill (goal:12).
         db.claim_task(conn, other, ".backseat/tasks/a", 111, 111.0)
-        db.record_provider(conn, other, ".backseat/tasks/a", 999, 999.0)
+        db.record_provider(conn, other, ".backseat/tasks/a", [999])
         # Orphaned harness, no provider ever spawned -> row deleted only.
         db.claim_task(conn, other, ".backseat/tasks/b", 300, 300.0)
         # Orphaned harness, provider also dead -> row deleted, nothing killed.
         db.claim_task(conn, other, ".backseat/tasks/c", 500, 500.0)
-        db.record_provider(conn, other, ".backseat/tasks/c", 777, 777.0)
+        db.record_provider(conn, other, ".backseat/tasks/c", [777])
         # Live harness elsewhere -> untouched, live provider included.
         db.claim_task(conn, other, ".backseat/tasks/d", 400, 4000.0)
-        db.record_provider(conn, other, ".backseat/tasks/d", 888, 888.0)
+        db.record_provider(conn, other, ".backseat/tasks/d", [888])
 
     # Absent from the map = NoSuchProcess = dead; a FakeProc = live at its
     # recorded start. Exactly the pids above and no others are consulted.
@@ -412,7 +411,7 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
         alive = db.get_task(conn, other, ".backseat/tasks/d")
     assert alive is not None
     assert alive["harness_pid"] == 400
-    assert alive["provider_pid"] == 888
+    assert alive["provider_pids"] == "[888]"
     assert killed == [999]
 
 
@@ -444,8 +443,9 @@ def test_provider_spawn_during_the_run_lands_in_the_claimed_row(
 
     row = seen["row"]
     assert row is not None
-    assert row["provider_pid"] is not None and row["provider_pid"] > 0
-    assert abs(row["provider_start"] - time.time()) < 60
+    assert row["provider_pids"] is not None
+    pids = json.loads(row["provider_pids"])
+    assert len(pids) > 0 and all(p > 0 for p in pids)
     # The recorder is cleared on the way out -- no leak into the next run.
     assert spawn._provider_recorder.get() is None
 

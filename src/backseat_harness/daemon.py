@@ -53,6 +53,7 @@ process: watchers observe, the pre-run sweep kills.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -241,11 +242,14 @@ def _live_pids(workspace: str) -> list[tuple[int, float | None]]:
             continue
         for pid_key, start_key in (
             ("harness_pid", "harness_start"),
-            ("provider_pid", "provider_start"),
         ):
             pid = row[pid_key]
             if pid is not None and db.pid_live(pid, row[start_key]):
                 live.append((pid, row[start_key]))
+        if row["provider_pids"] is not None:
+            for pid in json.loads(row["provider_pids"]):
+                if db.pid_live(pid):
+                    live.append((pid, None))
     return live
 
 

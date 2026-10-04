@@ -261,8 +261,8 @@ def _cmd_run(args) -> int:
             _emit(args, {"slug": args.slug, "error": str(exc)}, str(exc))
             return 2
         spawn.set_provider_recorder(
-            lambda pid, start: db.record_provider(
-                conn, config.workspace_root, task_relpath, pid, start
+            lambda pids: db.record_provider(
+                conn, config.workspace_root, task_relpath, pids
             )
         )
         try:

@@ -79,13 +79,12 @@ CREATE TABLE IF NOT EXISTS workspaces (
     path TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS tasks (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    workspace_id   INTEGER NOT NULL REFERENCES workspaces(id),
-    task_relpath   TEXT NOT NULL,
-    harness_pid    INTEGER,
-    harness_start  REAL,
-    provider_pid   INTEGER,
-    provider_start REAL,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id  INTEGER NOT NULL REFERENCES workspaces(id),
+    task_relpath  TEXT NOT NULL,
+    harness_pid   INTEGER,
+    harness_start REAL,
+    provider_pids TEXT,
     UNIQUE (workspace_id, task_relpath)
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -409,7 +408,7 @@ def claim_task(
         else:
             conn.execute(
                 "UPDATE tasks SET harness_pid = ?, harness_start = ?, "
-                "provider_pid = NULL, provider_start = NULL "
+                "provider_pids = NULL "
                 "WHERE workspace_id = ? AND task_relpath = ?",
                 (int(harness_pid), float(start), ws_id, task_relpath),
             )
@@ -426,22 +425,21 @@ def record_provider(
     conn: sqlite3.Connection,
     workspace: Path | str,
     task_relpath: str,
-    provider_pid: int,
-    provider_start: float | None = None,
+    provider_pids: list[int],
 ) -> None:
-    """Record the provider CLI pid+start into the claimed row.
+    """Record the provider process tree pids into the claimed row.
 
     Called once per provider spawn (managed turn or operator call): the most
     recent spawn wins. Loud when no row exists — a provider starting for an
     unclaimed task means the claim/release wiring upstream is broken.
     """
-    start = time.time() if provider_start is None else provider_start
+    pids_json = json.dumps([int(p) for p in provider_pids])
     with _txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET provider_pid = ?, provider_start = ? "
+            "UPDATE tasks SET provider_pids = ? "
             "WHERE workspace_id = (SELECT id FROM workspaces WHERE path = ?) "
             "AND task_relpath = ?",
-            (int(provider_pid), float(start), _normalize(workspace), task_relpath),
+            (pids_json, _normalize(workspace), task_relpath),
         )
         if cur.rowcount == 0:
             raise RegistryError(
@@ -477,7 +475,7 @@ def get_task(
     """
     row = conn.execute(
         "SELECT t.id, t.task_relpath, t.harness_pid, t.harness_start, "
-        "t.provider_pid, t.provider_start, w.path AS workspace_path "
+        "t.provider_pids, w.path AS workspace_path "
         "FROM tasks t JOIN workspaces w ON w.id = t.workspace_id "
         "WHERE w.path = ? AND t.task_relpath = ?",
         (_normalize(workspace), task_relpath),
@@ -491,7 +489,7 @@ def list_tasks(conn: sqlite3.Connection) -> list[dict]:
     sweep's worklist."""
     rows = conn.execute(
         "SELECT t.id, t.workspace_id, t.task_relpath, t.harness_pid, "
-        "t.harness_start, t.provider_pid, t.provider_start, "
+        "t.harness_start, t.provider_pids, "
         "w.path AS workspace_path "
         "FROM tasks t LEFT JOIN workspaces w ON w.id = t.workspace_id ORDER BY t.id"
     )
@@ -532,15 +530,15 @@ def sweep_orphans(
         scanned += 1
         if pid_live(row["harness_pid"], row["harness_start"]):
             continue
-        if row["provider_pid"] is not None and pid_live(
-            row["provider_pid"], row["provider_start"]
-        ):
-            try:
-                killer(int(row["provider_pid"]))
-            except Exception:  # noqa: BLE001 - a dead sweep must not kill the run
-                pass
-            else:
-                killed += 1
+        if row["provider_pids"] is not None:
+            for pid in json.loads(row["provider_pids"]):
+                if pid_live(pid):
+                    try:
+                        killer(int(pid))
+                    except Exception:  # noqa: BLE001 - a dead sweep must not kill the run
+                        pass
+                    else:
+                        killed += 1
         cur = conn.execute(
             "DELETE FROM tasks WHERE id = ? AND harness_pid IS ?",
             (row["id"], row["harness_pid"]),

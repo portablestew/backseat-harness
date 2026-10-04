@@ -125,12 +125,14 @@ def test_takeover_opens_session_then_resumes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.spawn, "run_interactive", fake_run_interactive)
     monkeypatch.setattr(cli, "run_task", fake_run_task)
-    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
 
     rc = main(["-C", str(ws), "takeover", "t"])
     assert rc == 0
     assert get_provider("opencode").interactive_command(seen["native_id"]) == [
-        "opencode", "--session", "ses_live",
+        "opencode",
+        "--session",
+        "ses_live",
     ]
     assert seen["native_id"] == "ses_live"
     # Resume with no first_prompt: the operator re-plans from the advanced session.
@@ -188,8 +190,7 @@ def test_result_line_omits_reason_on_complete_only():
     # The lane total and the run budget disagree by design, so the line has to
     # carry both rather than read as a count that overshot its own limit.
     assert _result_line(out_of_budget) == (
-        "t: blocked after 47 iterations "
-        "(max_iterations reached after 30 turns this run (47 total))"
+        "t: blocked after 47 iterations (max_iterations reached after 30 turns this run (47 total))"
     )
 
 
@@ -207,9 +208,7 @@ def _blocked_lane(tmp_path, slug="t", reason="D1: keep the shared budget, or spl
     return paths
 
 
-def test_bare_resume_refuses_a_blocked_lane_and_quotes_the_question(
-    tmp_path, monkeypatch, capsys
-):
+def test_bare_resume_refuses_a_blocked_lane_and_quotes_the_question(tmp_path, monkeypatch, capsys):
     """A bare `run` on a blocked lane must not silently drop the question."""
     import backseat_harness.cli as cli
 
@@ -418,9 +417,7 @@ def test_operator_invoker_passes_the_configured_ceiling(config, monkeypatch):
     import backseat_harness.cli as cli
 
     seen = _capture_operator_spawn(monkeypatch)
-    cli._make_operator_invoker(config, replace(config.operator, timeout_s=42))(
-        "Do the review."
-    )
+    cli._make_operator_invoker(config, replace(config.operator, timeout_s=42))("Do the review.")
     assert seen["timeout_s"] == 42
 
 
@@ -465,8 +462,7 @@ def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
         cli.spawn,
         "run_with_timeout",
         lambda cmd, **kwargs: (
-            seen.update(argv=list(cmd))
-            or spawn.CompletedCall(0, "ok", "", False)
+            seen.update(argv=list(cmd)) or spawn.CompletedCall(0, "ok", "", False)
         ),
     )
     try:
@@ -495,7 +491,7 @@ def test_run_sees_task_layer(tmp_path, monkeypatch):
 
     seen = {}
     monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
-    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
 
     def fake_run_task(**kwargs):
         seen["config"] = kwargs["config"]
@@ -524,7 +520,7 @@ def test_cli_call_sites_pass_slug(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "load_config", spy)
     monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
-    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: (lambda p: ""))
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
     monkeypatch.setattr(
         cli,
         "run_task",
@@ -592,19 +588,19 @@ def test_a_debug_run_announces_and_times_its_steps(tmp_path, capsys, monkeypatch
     def cli_loop(**kwargs):
         """The real loop, with the two spawns faked."""
         kwargs["managed_runner"] = lambda prov, spec: TurnResult(
-            exit_code=0, timed_out=False, duration_s=0.1,
-            native_session_id="sess-1", stdout="", stderr="",
+            exit_code=0,
+            timed_out=False,
+            duration_s=0.1,
+            native_session_id="sess-1",
+            stdout="",
+            stderr="",
         )
         kwargs["operator_invoker"] = lambda p: '{"verdict":"done"}'
         return real_run_task(**kwargs)
 
     monkeypatch.setattr(cli, "run_task", cli_loop)
-    monkeypatch.setattr(
-        "backseat_harness.history.find_session", lambda search, provider: None
-    )
-    monkeypatch.setattr(
-        "backseat_harness.history.fork_session", lambda search, provider: ""
-    )
+    monkeypatch.setattr("backseat_harness.history.find_session", lambda search, provider: None)
+    monkeypatch.setattr("backseat_harness.history.fork_session", lambda search, provider: "")
     monkeypatch.setattr(
         "backseat_harness.history.load_full_transcript", lambda search, provider: ""
     )
@@ -641,6 +637,7 @@ def test_bare_daemon_prints_help_and_exits_2(capsys):
 
 def test_daemon_run_dispatches_to_foreground_handler(monkeypatch):
     import backseat_harness.cli as cli
+
     args = cli._build_parser().parse_args(["daemon", "run"])
     assert args.command == "daemon"
     assert args.daemon_command == "run"
@@ -649,6 +646,7 @@ def test_daemon_run_dispatches_to_foreground_handler(monkeypatch):
 
 def test_daemon_subcommands_parse_with_format_json():
     import backseat_harness.cli as cli
+
     cmds = [
         ["daemon", "status"],
         ["daemon", "stop"],
@@ -663,6 +661,7 @@ def test_daemon_subcommands_parse_with_format_json():
 
 def test_daemon_install_with_uninstall_and_path_override():
     import backseat_harness.cli as cli
+
     args = cli._build_parser().parse_args(
         ["daemon", "install", "--uninstall", "--path-override", "/tmp/custom"]
     )
@@ -676,11 +675,13 @@ def test_daemon_status_running_registered(monkeypatch, capsys):
 
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 1234, "start": 9999.0})
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(
-        platform_mod, "artifact_path",
+        platform_mod,
+        "artifact_path",
         lambda: type("P", (), {"exists": lambda s: True})(),
     )
     rc = main(["--format", "json", "daemon", "status"])
@@ -700,10 +701,12 @@ def test_daemon_status_not_installed(monkeypatch, capsys):
 
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
     monkeypatch.setattr(
-        platform_mod, "artifact_path",
+        platform_mod,
+        "artifact_path",
         lambda: type("P", (), {"exists": lambda s: False})(),
     )
     rc = main(["--format", "json", "daemon", "status"])
@@ -717,10 +720,12 @@ def test_daemon_status_installed_not_running(monkeypatch, capsys):
 
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(
-        platform_mod, "artifact_path",
+        platform_mod,
+        "artifact_path",
         lambda: type("P", (), {"exists": lambda s: True})(),
     )
     rc = main(["--format", "json", "daemon", "status"])
@@ -735,11 +740,13 @@ def test_daemon_status_unmanaged_live(monkeypatch, capsys):
 
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 777, "start": 3000.0})
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
     monkeypatch.setattr(
-        platform_mod, "artifact_path",
+        platform_mod,
+        "artifact_path",
         lambda: type("P", (), {"exists": lambda s: False})(),
     )
     rc = main(["--format", "json", "daemon", "status"])
@@ -756,6 +763,7 @@ def test_daemon_status_unmanaged_live(monkeypatch, capsys):
 
 def test_daemon_stop_registered(monkeypatch, capsys):
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "stop", lambda: None)
     rc = main(["daemon", "stop"])
@@ -765,16 +773,20 @@ def test_daemon_stop_registered(monkeypatch, capsys):
 def test_daemon_stop_unmanaged_live(monkeypatch, capsys):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 9999, "start": 5000.0})
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
     monkeypatch.setattr(
-        platform_mod, "artifact_path",
+        platform_mod,
+        "artifact_path",
         lambda: type("P", (), {"exists": lambda s: False})(),
     )
     called = [False]
+
     def spy_stop():
         called[0] = True
+
     monkeypatch.setattr(platform_mod, "stop", spy_stop)
     rc = main(["daemon", "stop"])
     out = capsys.readouterr().out
@@ -785,20 +797,27 @@ def test_daemon_stop_unmanaged_live(monkeypatch, capsys):
 
 def test_daemon_install_registers_and_starts(monkeypatch, capsys, tmp_path):
     import backseat_harness.platform as platform_mod
+
     registered = [False]
     started = [False]
+
     def spy_register():
         registered[0] = True
+
     def spy_start():
         started[0] = True
+
     monkeypatch.setattr(platform_mod, "register", spy_register)
     monkeypatch.setattr(platform_mod, "start", spy_start)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     monkeypatch.setattr(platform_mod, "uninstall", lambda: None)
     import backseat_harness.db as db_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
     rc = main(["--format", "json", "daemon", "install"])
@@ -813,13 +832,16 @@ def test_daemon_install_registers_and_starts(monkeypatch, capsys, tmp_path):
 def test_daemon_install_foreign_live_daemon_warns(monkeypatch, capsys):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 42, "start": 1.0})
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
     monkeypatch.setattr(platform_mod, "start", lambda: None)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: False)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
@@ -833,15 +855,20 @@ def test_daemon_install_foreign_live_daemon_warns(monkeypatch, capsys):
 def test_daemon_install_start_failure_not_hidden(monkeypatch, capsys):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
+
     def fail_start():
         raise RuntimeError("start failed")
+
     monkeypatch.setattr(platform_mod, "start", fail_start)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
@@ -853,9 +880,12 @@ def test_daemon_install_start_failure_not_hidden(monkeypatch, capsys):
 
 def test_daemon_restart_without_install_exits_2(monkeypatch, capsys):
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: False)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     rc = main(["--format", "json", "daemon", "restart"])
     assert rc == 2
@@ -865,15 +895,20 @@ def test_daemon_restart_without_install_exits_2(monkeypatch, capsys):
 
 def test_daemon_uninstall_removes(monkeypatch, capsys):
     import backseat_harness.platform as platform_mod
+
     removed = [False]
+
     def spy_uninstall():
         removed[0] = True
+
     monkeypatch.setattr(platform_mod, "uninstall", spy_uninstall)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
     monkeypatch.setattr(platform_mod, "start", lambda: None)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     rc = main(["--format", "json", "daemon", "install", "--uninstall"])
     assert rc == 0
@@ -887,13 +922,16 @@ def test_daemon_install_path_override_refreshed(monkeypatch, capsys):
 
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
     monkeypatch.setattr(platform_mod, "start", lambda: None)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     original = os.environ.get("PATH")
     rc = main(["--format", "json", "daemon", "install", "--path-override", "/fake/custom"])
@@ -906,17 +944,22 @@ def test_daemon_install_path_override_refreshed(monkeypatch, capsys):
 def test_daemon_install_reports_linger_without_mutating(monkeypatch, capsys):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
     monkeypatch.setattr(platform_mod, "start", lambda: None)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     import subprocess as sp_mod
+
     def fake_run(cmd, **kwargs):
         return type("R", (), {"returncode": 0, "stdout": "Linger=no\n", "stderr": ""})()
+
     monkeypatch.setattr(sp_mod, "run", fake_run)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
@@ -929,13 +972,16 @@ def test_daemon_install_foreign_live_with_stale_artifact_warns(monkeypatch, caps
     (guard row has no owner link); warn rather than claim installed=True."""
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
+
     monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 99, "start": 500.0})
     monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "register", lambda: None)
     monkeypatch.setattr(platform_mod, "start", lambda: None)
+
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
     monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
@@ -945,3 +991,51 @@ def test_daemon_install_foreign_live_with_stale_artifact_warns(monkeypatch, caps
     assert "live" in payload.get("warn", "").lower()
     assert "ownership undeterminable" in payload.get("warn", "").lower()
     assert "stale" in payload.get("warn", "").lower()
+
+
+def test_daemon_install_idempotent(monkeypatch, capsys):
+    """Install must be idempotent: running it twice with the same args succeeds
+    both times with identical payloads (overwrites with /F on Windows, systemctl
+    reload on Linux, launchctl bootstrap on macOS)."""
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    register_calls = [0]
+    start_calls = [0]
+
+    def spy_register():
+        register_calls[0] += 1
+
+    def spy_start():
+        start_calls[0] += 1
+
+    monkeypatch.setattr(platform_mod, "register", spy_register)
+    monkeypatch.setattr(platform_mod, "start", spy_start)
+
+    def _fake_path_artifact():
+        return __import__("types").SimpleNamespace(exists=lambda s: True)()
+
+    monkeypatch.setattr(platform_mod, "artifact_path", _fake_path_artifact)
+
+    # First install
+    rc1 = main(["--format", "json", "daemon", "install"])
+    assert rc1 == 0
+    payload1 = __import__("json").loads(capsys.readouterr().out)
+    assert payload1["installed"] is True
+
+    # Second install (idempotent)
+    rc2 = main(["--format", "json", "daemon", "install"])
+    assert rc2 == 0
+    payload2 = __import__("json").loads(capsys.readouterr().out)
+    assert payload2["installed"] is True
+
+    # Both register and start should have been called twice
+    assert register_calls[0] == 2
+    assert start_calls[0] == 2
+
+    # Payloads should be equivalent (same keys/values)
+    assert payload1["installed"] == payload2["installed"]
+    assert payload1.get("warn") == payload2.get("warn")

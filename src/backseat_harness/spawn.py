@@ -223,17 +223,29 @@ def run_with_timeout(
             **out_kwargs,
             **group_kwargs,
         )
-        # The one moment the provider's pid exists: tell the claim row (when
+        # Capture the full process tree: on Windows, npm CLIs are launched
+        # through .cmd shims whose direct child exits immediately, leaving
+        # the real provider (and its descendants) running. Record every pid
+        # so cleanup can kill the whole tree.
+        all_pids = [proc.pid]
+        try:
+            import psutil
+            parent = psutil.Process(proc.pid)
+            all_pids.extend(c.pid for c in parent.children(recursive=True))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+        # The one moment the provider's pids exist: tell the claim row (when
         # a run declared a recorder). Recording must never break the spawn --
         # a lost row update is diagnosable later, a killed turn is not -- so
         # a failing callback warns and the call proceeds.
         recorder = _provider_recorder.get()
         if recorder is not None:
             try:
-                recorder(proc.pid, time.time())
+                recorder(all_pids)
             except Exception as exc:  # noqa: BLE001 - recording is best-effort
                 print(
-                    f"[warn] task: could not record provider pid {proc.pid} "
+                    f"[warn] task: could not record provider pids {all_pids} "
                     f"({exc}); continuing",
                     file=sys.stderr,
                 )
@@ -262,6 +274,12 @@ def run_with_timeout(
                     pass
                 stdout, stderr = partial_out, partial_err
             return CompletedCall(-1, _as_text(stdout), _as_text(stderr), True)
+        # Kill any survivors of the process tree (Windows shim case).
+        for pid in all_pids:
+            try:
+                kill_pid_tree(pid)
+            except Exception:  # noqa: BLE001 - cleanup must not break the return
+                pass
         # Normalized: with a log file there are no pipes, so communicate returns
         # None, and CompletedCall promises str. One shape for every consumer --
         # a caller must not have to know whether this call was logged.

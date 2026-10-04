@@ -124,27 +124,32 @@ class _WindowsPlatform(_PlatformImpl):
         wrapper_path = self._wrapper_path()
         wrapper_path.write_text(wrapper_content, encoding="utf-8")
         xml_content = self._build_xml()
-        artifact.write_bytes(b'\xff\xfe' + xml_content.encode('utf-16-le'))
+        artifact.write_bytes(b"\xff\xfe" + xml_content.encode("utf-16-le"))
         cmd = [
             "schtasks",
             "/create",
-            "/XML", str(artifact),
-            "/TN", "backseat-daemon",
+            "/XML",
+            str(artifact),
+            "/TN",
+            "backseat-daemon",
             "/F",
         ]
         result = _run_schtasks(cmd)
         if result.returncode != 0:
-            raise RuntimeError(
-                f"schtasks /create failed (rc={result.returncode}): {result.stderr}"
-            )
+            stderr = result.stderr or ""
+            if "Access is denied" in stderr or result.returncode == 5:
+                raise RuntimeError(
+                    "schtasks /create failed: Access is denied. "
+                    "Task Scheduler registration requires an elevated shell. "
+                    "Re-run the install command from an Administrator PowerShell/CMD."
+                )
+            raise RuntimeError(f"schtasks /create failed (rc={result.returncode}): {stderr}")
 
     def start(self) -> None:
         cmd = ["schtasks", "/run", "/tn", "backseat-daemon"]
         result = _run_schtasks(cmd)
         if result.returncode != 0:
-            raise RuntimeError(
-                f"schtasks /run failed (rc={result.returncode}): {result.stderr}"
-            )
+            raise RuntimeError(f"schtasks /run failed (rc={result.returncode}): {result.stderr}")
 
     def stop(self) -> None:
         cmd = ["schtasks", "/end", "/tn", "backseat-daemon"]
@@ -205,9 +210,7 @@ WantedBy=default.target
         cmd = ["systemctl", "--user", "start", "backseat-daemon"]
         result = _run_systemctl(cmd)
         if result.returncode != 0:
-            raise RuntimeError(
-                f"systemctl start failed (rc={result.returncode}): {result.stderr}"
-            )
+            raise RuntimeError(f"systemctl start failed (rc={result.returncode}): {result.stderr}")
 
     def stop(self) -> None:
         cmd = ["systemctl", "--user", "stop", "backseat-daemon"]
@@ -280,7 +283,9 @@ class _MacOSPlatform(_PlatformImpl):
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text(self._plist_content(), encoding="utf-8")
         cmd = [
-            "launchctl", "bootstrap", _uid_domain(),
+            "launchctl",
+            "bootstrap",
+            _uid_domain(),
             str(artifact),
         ]
         result = _run_launchctl(cmd)
@@ -306,7 +311,9 @@ class _MacOSPlatform(_PlatformImpl):
         _run_launchctl(cmd_stop)
         artifact = self.artifact_path()
         cmd_start = [
-            "launchctl", "bootstrap", _uid_domain(),
+            "launchctl",
+            "bootstrap",
+            _uid_domain(),
             str(artifact),
         ]
         result = _run_launchctl(cmd_start)
