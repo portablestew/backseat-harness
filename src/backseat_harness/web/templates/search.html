@@ -26,7 +26,10 @@
     <tbody>
       {% for r in results %}
       <tr>
-        <td><span class="badge">{{ r.key.split(":")[0] }}</span></td>
+        <td>
+          {% set p = r.key.split(":")[0] %}
+          <a href="/chat/{{ p }}/{{ r.key.split(":")[1] }}"><span class="badge">{{ p }}</span></a>
+        </td>
         <td><small>{{ r.preview }}</small></td>
         <td><small>{{ r.mtime | format_datetime }}</small></td>
         <td><small>{{ r.project or "" }}</small></td>

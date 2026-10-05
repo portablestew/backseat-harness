@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ provider }}:{{ conversation_id }} - backseat-harness{% endblock %}
+{% block content %}
+<header>
+  <h2>{{ provider }} session</h2>
+  <small>{{ conversation_id }}</small>
+  {% if resume_command %}
+  <form id="resume-form" style="margin-top: 8px;">
+    <input type="hidden" name="cmd" value="{{ resume_command|tojson }}">
+    <input type="hidden" name="cwd" value=".">
+    <button type="submit" class="btn">Resume in Shell</button>
+  </form>
+  {% endif %}
+</header>
+
+<section>
+  <h3>Transcript</h3>
+  <pre>{{ transcript }}</pre>
+</section>
+
+{% if resume_command %}
+<script>
+  document.getElementById('resume-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const formData = new FormData(form);
+    const cmd = JSON.parse(formData.get('cmd'));
+    const cwd = formData.get('cwd');
+    
+    try {
+      const response = await fetch('/shell/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cmd, cwd })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        window.location.href = `/shell/${data.session_id}`;
+      } else {
+        alert('Failed to start shell session');
+      }
+    } catch (err) {
+      alert('Error: ' + err.message);
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}

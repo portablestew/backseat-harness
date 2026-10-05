@@ -30,7 +30,7 @@
     <tbody>
       {% for t in incomplete %}
       <tr>
-        <td>{{ t.slug }}</td>
+        <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
         <td><span class="badge">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
@@ -56,7 +56,7 @@
     <tbody>
       {% for t in recent %}
       <tr>
-        <td>{{ t.slug }}</td>
+        <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
         <td><span class="badge">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>

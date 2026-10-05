@@ -1,4 +1,4 @@
-"""Workspace-page task service (step 5.1).
+"""Workspace-page task service (step 5.1, 7.1, 7.3).
 
 Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 
@@ -13,6 +13,10 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
   reads as ``continue`` with the ``goal.md`` mtime.
 - :func:`resolve_workspace` — sqlite ``workspaces.id`` → path (stable
   across path renames).
+- :func:`load_task` — loads goal.md, state.json, checklist.json, and any
+  transcript.md/logs for the read-only task viewer (step 7.1).
+- :func:`run_task_detached` — launches ``backseat-harness run <slug> [brief]``
+  for the task in a detached subprocess (step 7.3).
 """
 
 from __future__ import annotations
@@ -139,3 +143,147 @@ def resolve_workspace(ws_id: int) -> Path | None:
             "SELECT path FROM workspaces WHERE id = ?", (ws_int,)
         ).fetchone()
     return Path(row["path"]) if row is not None else None
+
+
+@dataclass(frozen=True)
+class TaskDetail:
+    """Complete task data for the read-only viewer (step 7.1)."""
+
+    slug: str
+    goal: str
+    status: str
+    badge: str
+    iteration: int
+    generation: int
+    reason: str
+    updated_at: float
+    checklist: dict
+    remarks: list[str]
+    transcript: str | None
+    log_files: list[str]
+
+
+def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
+    """Load all task lane files for the read-only viewer.
+
+    Returns None if the task lane doesn't exist.
+    """
+    ws_path = Path(workspace).expanduser().resolve()
+    task_dir = ws_path / ".backseat" / "tasks" / slug
+    if not task_dir.is_dir():
+        return None
+
+    goal_path = task_dir / "goal.md"
+    checklist_path = task_dir / "checklist.json"
+    transcript_path = task_dir / "transcript.md"
+    logs_dir = task_dir / "logs"
+
+    # Load goal.md (always exists if task dir exists)
+    try:
+        goal = goal_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        goal = ""
+
+    # Load state.json
+    try:
+        from backseat_harness import storage
+        state = storage.load_state(TaskPaths(task_dir), slug)
+        status = state.status.value if hasattr(state.status, "value") else str(state.status)
+        iteration = state.iteration
+        generation = state.generation
+        reason = state.reason
+        updated_at = state.updated_at
+    except Exception:
+        status = TaskStatus.CONTINUE.value
+        iteration = 0
+        generation = 1
+        reason = ""
+        try:
+            updated_at = goal_path.stat().st_mtime
+        except OSError:
+            updated_at = task_dir.stat().st_mtime
+
+    # Load checklist.json
+    try:
+        from backseat_harness import checklist as checklist_mod
+        checklist_obj = checklist_mod.load_checklist(checklist_path)
+        checklist_data = checklist_obj.to_dict()
+    except Exception:
+        checklist_data = {"steps": {}, "remarks": []}
+
+    # Load transcript.md
+    transcript = None
+    if transcript_path.exists():
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    # List log files
+    log_files = []
+    if logs_dir.is_dir():
+        try:
+            log_files = sorted(
+                [f.name for f in logs_dir.iterdir() if f.is_file()],
+                key=lambda f: (logs_dir / f).stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            pass
+
+    return TaskDetail(
+        slug=slug,
+        goal=goal,
+        status=status,
+        badge=badge_for(status),
+        iteration=iteration,
+        generation=generation,
+        reason=reason,
+        updated_at=updated_at,
+        checklist=checklist_data.get("steps", {}),
+        remarks=checklist_data.get("remarks", []),
+        transcript=transcript,
+        log_files=log_files,
+    )
+
+
+def run_task_detached(workspace: Path | str, slug: str, brief: str | None = None) -> None:
+    """Launch ``backseat-harness run <slug> [brief]`` as a detached subprocess.
+
+    The subprocess is started with the workspace as its cwd and its output
+    discarded (or could be piped to a log file). The call returns immediately
+    without waiting for the run to complete.
+
+    Args:
+        workspace: Workspace root path (containing .backseat/)
+        slug: Task slug to run
+        brief: Optional brief text to pass to the run command
+    """
+    import subprocess
+    import sys
+
+    ws_path = Path(workspace).expanduser().resolve()
+
+    # Build the command: python -m backseat_harness.cli run <slug> [brief]
+    # Using -m so it uses the same interpreter as the web server
+    cmd = [sys.executable, "-m", "backseat_harness.cli", "-C", str(ws_path), "run", slug]
+    if brief:
+        cmd.append(brief)
+
+    # Start detached - on Windows use CREATE_NEW_PROCESS_GROUP, on Unix use start_new_session
+    if sys.platform == "win32":
+        subprocess.Popen(
+            cmd,
+            cwd=str(ws_path),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(
+            cmd,
+            cwd=str(ws_path),
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
