@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>backseat-harness shell - {{ session_id }}</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .header {
+            padding: 8px 16px;
+            background: #252526;
+            border-bottom: 1px solid #3c3c3c;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .session-info {
+            font-size: 12px;
+            color: #888;
+            font-family: monospace;
+        }
+        #terminal-container {
+            height: calc(100vh - 48px);
+            width: 100%;
+        }
+        .status-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 24px;
+            background: #007acc;
+            color: white;
+            font-size: 11px;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            z-index: 100;
+        }
+        .status-bar.hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>backseat-harness shell</h1>
+        <span class="session-info">{{ session_id }}</span>
+    </div>
+    <div id="terminal-container"></div>
+    <div class="status-bar hidden" id="status-bar">Connected</div>
+
+    <!-- xterm.js from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+
+    <script>
+        const sessionId = "{{ session_id }}";
+        const wsPath = "{{ ws_path }}";
+
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: '"Cascadia Code", "Fira Code", "Consolas", "Monaco", monospace',
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4',
+                cursor: '#ffffff',
+                selection: '#264f78',
+                black: '#1e1e1e',
+                red: '#f44747',
+                green: '#6a9955',
+                yellow: '#dcdcaa',
+                blue: '#569cd6',
+                magenta: '#c586c0',
+                cyan: '#9cdcfe',
+                white: '#d4d4d4',
+                brightBlack: '#858585',
+                brightRed: '#f44747',
+                brightGreen: '#6a9955',
+                brightYellow: '#dcdcaa',
+                brightBlue: '#569cd6',
+                brightMagenta: '#c586c0',
+                brightCyan: '#9cdcfe',
+                brightWhite: '#ffffff',
+            },
+            convertEol: true,
+            scrollback: 10000,
+        });
+
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+        term.open(document.getElementById('terminal-container'));
+        fitAddon.fit();
+
+        const statusBar = document.getElementById('status-bar');
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}${wsPath}`;
+            ws = new WebSocket(wsUrl);
+
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                statusBar.textContent = 'Connected';
+                statusBar.classList.remove('hidden');
+                reconnectAttempts = 0;
+            };
+
+            ws.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    const decoder = new TextDecoder('utf-8');
+                    const text = decoder.decode(event.data);
+                    term.write(text);
+                } else if (typeof event.data === 'string') {
+                    // Handle text frames (pong, etc.)
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'pong') {
+                            // keepalive response
+                        }
+                    } catch (e) {
+                        term.write(event.data);
+                    }
+                }
+            };
+
+            ws.onclose = () => {
+                statusBar.textContent = 'Disconnected';
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    statusBar.textContent = `Reconnecting... (attempt ${reconnectAttempts}/${maxReconnectAttempts})`;
+                    setTimeout(connect, 1000 * reconnectAttempts);
+                } else {
+                    statusBar.textContent = 'Connection lost';
+                }
+            };
+
+            ws.onerror = (err) => {
+                statusBar.textContent = 'Connection error';
+            };
+        }
+
+        // Send input to PTY
+        term.onData((data) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const b64 = btoa(data);
+                ws.send(JSON.stringify({ type: 'input', data: b64 }));
+            }
+        });
+
+        // Send resize on terminal resize
+        term.onResize(({ cols, rows }) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+            }
+        });
+
+        // Keepalive ping
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000);
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            fitAddon.fit();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const cols = term.cols;
+                const rows = term.rows;
+                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+            }
+        });
+
+        // Initial connect
+        connect();
+    </script>
+</body>
+</html>
