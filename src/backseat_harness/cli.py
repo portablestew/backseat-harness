@@ -349,6 +349,13 @@ def _cmd_takeover(args) -> int:
         if state.status is TaskStatus.BLOCKED and state.reason:
             print(f"This lane is blocked on a question from the operator:\n  {state.reason}")
 
+    with db.open_db() as conn:
+        for row in db.list_tasks(conn):
+            if row["provider_pids"]:
+                for pid in json.loads(row["provider_pids"]):
+                    if db.pid_live(pid):
+                        spawn.kill_pid_tree(pid)
+
     provider = get_provider(config.provider)
     binding = storage.load_binding(paths)
     native_id = binding.current.native_id if binding and binding.current else None
