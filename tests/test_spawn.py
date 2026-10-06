@@ -44,6 +44,24 @@ def test_a_command_that_finishes_is_not_timed_out(tmp_path):
     assert "hello" in call.stdout
 
 
+def test_kill_pid_tree_refuses_to_target_this_process(monkeypatch):
+    """The pid-level twin of POSIX's own-group guard.
+
+    Callers pull pids out of task rows, a recycled pid can resolve to the
+    caller itself, and a self-kill lands where no finally runs -- the daemon
+    guard and the task row both stay behind, undeleted.
+    """
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("kill_pid_tree targeted its own process")
+
+    monkeypatch.setattr(spawn.subprocess, "run", _boom)
+    monkeypatch.setattr(spawn.os, "kill", _boom)
+    if hasattr(spawn.os, "killpg"):
+        monkeypatch.setattr(spawn.os, "killpg", _boom)
+    spawn.kill_pid_tree(os.getpid())
+
+
 def test_prompt_arrives_on_stdin_not_argv(tmp_path):
     """A compacted first prompt can exceed the platform command-line limit, so
     it goes in on stdin. A provider that lost that would break on long forks."""

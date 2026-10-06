@@ -392,6 +392,83 @@ def test_a_live_task_earlys_out_and_registers_one_pid_watcher(
     daemon.stop()  # join the watcher while its pid seam is still faked
 
 
+def test_an_orphaned_provider_is_swept_so_the_lane_can_start(
+    workspace: Path, daemon: Daemon, clock: FakeClock, spawns, monkeypatch
+):
+    """A dead harness's live provider must not pin the workspace busy forever.
+
+    The row would otherwise read as busy and the pre-run sweep (the only
+    killer) is unreachable behind that gate: the check-in sweeps first, so
+    the orphan dies, the row goes, and the lane starts.
+    """
+    ws = _register(workspace)
+    tasks = workspace / ".backseat" / "tasks"
+    _lane(
+        tasks,
+        "resume",
+        state={"slug": "resume", "status": "continue"},
+        mtime=time.time() - 500,
+    )
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, ".backseat/tasks/resume", 4242, 1000.0)
+        db.record_provider(conn, workspace, ".backseat/tasks/resume", [9999])
+
+    def _process(pid):
+        if pid == 4242:
+            raise db.psutil.NoSuchProcess(pid)
+        return FakeProc(1000.0)
+
+    monkeypatch.setattr(db, "_process", _process)
+    killed: list[int] = []
+    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+
+    daemon.discover()
+    daemon.check_in(ws)
+
+    assert killed == [9999]
+    with db.open_db() as conn:
+        assert db.list_tasks(conn) == []
+    assert len(spawns) == 1
+    assert spawns[0][0][-2:] == ["run", "resume"]
+    assert daemon._sched._jobs[checkin_job(ws)].deadline == clock() + 30
+
+
+def test_a_recycled_provider_pid_is_swept_without_killing(
+    workspace: Path, daemon: Daemon, clock: FakeClock, spawns, monkeypatch
+):
+    """The row must not pin the workspace busy, and the stranger that now
+    owns the recorded pid must survive: pid+start reads it dead."""
+    ws = _register(workspace)
+    tasks = workspace / ".backseat" / "tasks"
+    _lane(
+        tasks,
+        "resume",
+        state={"slug": "resume", "status": "continue"},
+        mtime=time.time() - 500,
+    )
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, ".backseat/tasks/resume", 4242, 1000.0)
+        db.record_provider(conn, workspace, ".backseat/tasks/resume", [9999], [1000.0])
+
+    def _process(pid):
+        if pid == 4242:
+            raise db.psutil.NoSuchProcess(pid)
+        return FakeProc(9999.0)  # same pid, different start: recycled
+
+    monkeypatch.setattr(db, "_process", _process)
+    killed: list[int] = []
+    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+
+    daemon.discover()
+    daemon.check_in(ws)
+
+    assert killed == []
+    with db.open_db() as conn:
+        assert db.list_tasks(conn) == []
+    assert len(spawns) == 1
+    assert spawns[0][0][-2:] == ["run", "resume"]
+
+
 # --- file watching (goal:54-62, 2-plan §4) --------------------------------------
 
 

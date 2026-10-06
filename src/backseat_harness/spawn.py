@@ -32,17 +32,20 @@ from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, 
 #: turn a bounded wait back into an unbounded one.
 DEFAULT_KILL_GRACE_S = 5
 
-#: Callback fired the moment a provider CLI process starts: ``(pid,
-#: start_time)``. Set by the CLI around a claimed run (cli._cmd_run) so every
+#: Callback fired the moment a provider CLI process starts:
+#: ``[(pid, start_time_or_None), ...]`` covering the spawn's whole captured
+#: tree. Set by the CLI around a claimed run (cli._cmd_run) so every
 #: spawn -- managed turn and operator call alike -- updates the task's row.
 #: A ContextVar like logs._current, never a module global, so a future
 #: concurrent lane cannot record into another lane's row.
-_provider_recorder: contextvars.ContextVar[Callable[[int, float], None] | None] = (
-    contextvars.ContextVar("backseat_harness_provider_recorder", default=None)
-)
+_provider_recorder: contextvars.ContextVar[
+    Callable[[list[tuple[int, float | None]]], None] | None
+] = contextvars.ContextVar("backseat_harness_provider_recorder", default=None)
 
 
-def set_provider_recorder(fn: Callable[[int, float], None] | None) -> None:
+def set_provider_recorder(
+    fn: Callable[[list[tuple[int, float | None]]], None] | None,
+) -> None:
     """Declare the callback :func:`run_with_timeout` fires on spawn (None clears)."""
     _provider_recorder.set(fn)
 
@@ -91,8 +94,14 @@ def kill_pid_tree(pid: int, *, budget_s: float = DEFAULT_KILL_GRACE_S) -> None:
     provider somehow shares it (a missed tree is recoverable, a self-kill is
     not). ``taskkill`` itself draws on the remaining budget: a helper that
     hangs must not be the thing that blows the ceiling, so it is skipped
-    outright when the budget is already spent.
+    outright when the budget is already spent. And this process's own pid is
+    never a target: the callers read pids out of task rows, a recycled pid
+    can resolve to the caller itself, and a sweep that kills the daemon or
+    harness mid-check-in leaves no finally behind -- the pid-level twin of
+    the own-group guard below, refused on both platforms.
     """
+    if pid == os.getpid():
+        return
     if os.name == "nt":
         if budget_s > 0:
             try:
@@ -226,27 +235,35 @@ def run_with_timeout(
         # Capture the full process tree: on Windows, npm CLIs are launched
         # through .cmd shims whose direct child exits immediately, leaving
         # the real provider (and its descendants) running. Record every pid
-        # so cleanup can kill the whole tree.
-        all_pids = [proc.pid]
+        # with its start time where it can still be read, so cleanup can kill
+        # the whole tree and a later liveliness check can tell the recorded
+        # provider from whatever recycles the pid.
+        entries: list[tuple[int, float | None]] = [(proc.pid, None)]
         try:
             import psutil
+
             parent = psutil.Process(proc.pid)
-            all_pids.extend(c.pid for c in parent.children(recursive=True))
+            entries[0] = (proc.pid, parent.create_time())
+            for child in parent.children(recursive=True):
+                try:
+                    entries.append((child.pid, child.create_time()))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    entries.append((child.pid, None))
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             pass
 
         # The one moment the provider's pids exist: tell the claim row (when
         # a run declared a recorder). Recording must never break the spawn --
-        # a lost row update is diagnosable later, a killed turn is not -- so
-        # a failing callback warns and the call proceeds.
+        # a lost row update is diagnosable later, a killed turn is not, so a
+        # failing callback warns and the call proceeds.
         recorder = _provider_recorder.get()
         if recorder is not None:
             try:
-                recorder(all_pids)
+                recorder(entries)
             except Exception as exc:  # noqa: BLE001 - recording is best-effort
                 print(
-                    f"[warn] task: could not record provider pids {all_pids} "
-                    f"({exc}); continuing",
+                    f"[warn] task: could not record provider pids "
+                    f"{[p for p, _ in entries]} ({exc}); continuing",
                     file=sys.stderr,
                 )
         try:
@@ -275,7 +292,7 @@ def run_with_timeout(
                 stdout, stderr = partial_out, partial_err
             return CompletedCall(-1, _as_text(stdout), _as_text(stderr), True)
         # Kill any survivors of the process tree (Windows shim case).
-        for pid in all_pids:
+        for pid, _start in entries:
             try:
                 kill_pid_tree(pid)
             except Exception:  # noqa: BLE001 - cleanup must not break the return

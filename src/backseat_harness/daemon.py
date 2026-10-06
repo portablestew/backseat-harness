@@ -16,10 +16,13 @@
   ordinary scheduled job, so it joins the sleep math and cannot starve
   (goal:53).
 
-* **Check-in** — per workspace, in goal order (goal:32-46): gather the newest
-  mtime under ``.backseat/tasks/**`` (any file, goal:32) and the workspace's
-  task rows; any pid live at its recorded start means the workspace is busy —
-  single-threaded for auto-scheduled work (goal:34-38) — so register
+* **Check-in** — per workspace, in goal order (goal:32-46): the orphan sweep
+  runs first (a dead harness's live provider would otherwise pin the workspace
+  busy forever, killing it here since the pre-run sweep is unreachable behind
+  the busy gate), then gather the newest mtime under ``.backseat/tasks/**``
+  (any file, goal:32) and the workspace's task rows; any pid live at its
+  recorded start means the workspace is busy — single-threaded for
+  auto-scheduled work (goal:34-38) — so register
   idempotent pid watchers (a completion wakes the pump for the next cycle,
   goal:37) and fall back to the 30-minute default; recent file activity means
   wait for quiescence (now+30s, goal:40-41); otherwise the oldest
@@ -47,13 +50,12 @@
 Two clocks, split by purpose: scheduler deadlines use the scheduler's clock
 (a fake one in tests), while wall epochs — the quiescence gate's file mtimes
 and jobs' cron occurrences — ride ``self._wall`` (``time.time`` in tests
-injected alongside the scheduler's fake). Nothing here ever signals a
-process: watchers observe, the pre-run sweep kills.
+injected alongside the scheduler's fake). Nothing here signals a process
+except the orphan sweep the check-in runs: watchers observe, the sweep kills.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -228,8 +230,10 @@ def _pick_lane(tasks_dir: Path) -> str | None:
 def _live_pids(workspace: str) -> list[tuple[int, float | None]]:
     """Every pid in this workspace's task rows that is live at its recorded start.
 
-    Harness and provider alike: a harness that died mid-turn leaves a live
-    provider, and that still counts as a busy workspace (goal:33-34). Rows of
+    A harness that died mid-turn leaves a live provider, but the check-in's
+    sweep has already removed that row (killing the provider), so what
+    remains here is a live harness and its providers: that still counts as
+    a busy workspace (goal:33-34). Rows of
     unregistered workspaces do not appear (``workspace_path`` is None), which
     matches a workspace discovery has already dropped.
     """
@@ -246,10 +250,9 @@ def _live_pids(workspace: str) -> list[tuple[int, float | None]]:
             pid = row[pid_key]
             if pid is not None and db.pid_live(pid, row[start_key]):
                 live.append((pid, row[start_key]))
-        if row["provider_pids"] is not None:
-            for pid in json.loads(row["provider_pids"]):
-                if db.pid_live(pid):
-                    live.append((pid, None))
+        for pid, start in db.provider_entries(row):
+            if db.pid_live(pid, start):
+                live.append((pid, start))
     return live
 
 
@@ -427,6 +430,13 @@ class Daemon:
         # watcher's now+30s reset, so this one call is both the first load and
         # the refresh — _arm moves a pending deadline in place.
         self._register_jobs(workspace)
+        # Sweep before any gate: a harness that died mid-turn leaves a live
+        # provider whose row would pin this workspace busy forever, and the
+        # pre-run sweep is exactly what the busy gate below blocks.
+        with db.open_db() as conn:
+            swept = db.sweep_orphans(conn)
+        if swept["removed"] or swept["killed"]:
+            _logger.info("orphan sweep workspace=%s %s", workspace, swept)
         tasks_dir = Path(workspace) / ".backseat" / "tasks"
         newest = _newest_mtime(tasks_dir)
 

@@ -261,8 +261,12 @@ def _cmd_run(args) -> int:
             _emit(args, {"slug": args.slug, "error": str(exc)}, str(exc))
             return 2
         spawn.set_provider_recorder(
-            lambda pids: db.record_provider(
-                conn, config.workspace_root, task_relpath, pids
+            lambda entries: db.record_provider(
+                conn,
+                config.workspace_root,
+                task_relpath,
+                [pid for pid, _ in entries],
+                [start for _, start in entries],
             )
         )
         try:
@@ -351,10 +355,9 @@ def _cmd_takeover(args) -> int:
 
     with db.open_db() as conn:
         for row in db.list_tasks(conn):
-            if row["provider_pids"]:
-                for pid in json.loads(row["provider_pids"]):
-                    if db.pid_live(pid):
-                        spawn.kill_pid_tree(pid)
+            for pid, start in db.provider_entries(row):
+                if db.pid_live(pid, start):
+                    spawn.kill_pid_tree(pid)
 
     provider = get_provider(config.provider)
     binding = storage.load_binding(paths)

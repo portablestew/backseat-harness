@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     harness_pid   INTEGER,
     harness_start REAL,
     provider_pids TEXT,
+    provider_starts TEXT,
     UNIQUE (workspace_id, task_relpath)
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -121,6 +122,15 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     # and protected by BUSY_TIMEOUT_MS (5000); deliberate tradeoff.
     # INSERT OR IGNORE: first connect seeds schema-version, later connects
     # leave a possibly-migrated value alone.
+    # CREATE TABLE IF NOT EXISTS never widens an existing table, so registries
+    # predating provider_starts need the column added here (idempotent; the
+    # except covers two connections racing the same upgrade).
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "provider_starts" not in cols:
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN provider_starts TEXT")
+        except sqlite3.OperationalError:
+            pass
     conn.execute(
         "INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)",
         (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
@@ -408,7 +418,7 @@ def claim_task(
         else:
             conn.execute(
                 "UPDATE tasks SET harness_pid = ?, harness_start = ?, "
-                "provider_pids = NULL "
+                "provider_pids = NULL, provider_starts = NULL "
                 "WHERE workspace_id = ? AND task_relpath = ?",
                 (int(harness_pid), float(start), ws_id, task_relpath),
             )
@@ -426,26 +436,58 @@ def record_provider(
     workspace: Path | str,
     task_relpath: str,
     provider_pids: list[int],
+    provider_starts: list[float | None] | None = None,
 ) -> None:
     """Record the provider process tree pids into the claimed row.
 
     Called once per provider spawn (managed turn or operator call): the most
     recent spawn wins. Loud when no row exists — a provider starting for an
     unclaimed task means the claim/release wiring upstream is broken.
+
+    ``provider_starts`` rides a parallel list so liveness can be pid+start and
+    a recycled pid never reads as the recorded provider. Absent or misaligned
+    starts store NULL, which every reader treats as existence-only.
     """
     pids_json = json.dumps([int(p) for p in provider_pids])
+    if provider_starts is not None and len(provider_starts) == len(provider_pids):
+        starts_json: str | None = json.dumps(
+            [None if s is None else float(s) for s in provider_starts]
+        )
+    else:
+        starts_json = None
     with _txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET provider_pids = ? "
+            "UPDATE tasks SET provider_pids = ?, provider_starts = ? "
             "WHERE workspace_id = (SELECT id FROM workspaces WHERE path = ?) "
             "AND task_relpath = ?",
-            (pids_json, _normalize(workspace), task_relpath),
+            (pids_json, starts_json, _normalize(workspace), task_relpath),
         )
         if cur.rowcount == 0:
             raise RegistryError(
                 f"no claimed task row for {task_relpath!r} in {workspace}; "
                 "claim_task must run before a provider spawns"
             )
+
+
+def provider_entries(row: dict) -> list[tuple[int, float | None]]:
+    """The row's ``(pid, start)`` provider pairs; missing starts give ``None``.
+
+    The single reader-side decoder for ``provider_pids``/``provider_starts``:
+    lengths can only disagree for legacy rows (recorded before starts existed),
+    and those degrade per-pid to a None start rather than mispairing.
+    """
+    if not row["provider_pids"]:
+        return []
+    pids = json.loads(row["provider_pids"])
+    raw = row["provider_starts"]
+    starts = json.loads(raw) if raw else []
+    return [
+        (
+            int(pid),
+            float(starts[i]) if i < len(starts) and starts[i] is not None else None,
+        )
+        for i, pid in enumerate(pids)
+    ]
 
 
 def release_task(conn: sqlite3.Connection, workspace: Path | str, task_relpath: str) -> bool:
@@ -475,7 +517,7 @@ def get_task(
     """
     row = conn.execute(
         "SELECT t.id, t.task_relpath, t.harness_pid, t.harness_start, "
-        "t.provider_pids, w.path AS workspace_path "
+        "t.provider_pids, t.provider_starts, w.path AS workspace_path "
         "FROM tasks t JOIN workspaces w ON w.id = t.workspace_id "
         "WHERE w.path = ? AND t.task_relpath = ?",
         (_normalize(workspace), task_relpath),
@@ -489,7 +531,7 @@ def list_tasks(conn: sqlite3.Connection) -> list[dict]:
     sweep's worklist."""
     rows = conn.execute(
         "SELECT t.id, t.workspace_id, t.task_relpath, t.harness_pid, "
-        "t.harness_start, t.provider_pids, "
+        "t.harness_start, t.provider_pids, t.provider_starts, "
         "w.path AS workspace_path "
         "FROM tasks t LEFT JOIN workspaces w ON w.id = t.workspace_id ORDER BY t.id"
     )
@@ -504,17 +546,17 @@ def sweep_orphans(
     *,
     kill: Callable[[int], object] | None = None,
 ) -> dict[str, int]:
-    """Pre-run backstop (goal:11-12): delete rows whose harness is dead,
-    killing any still-live orphaned provider first.
+    """Pre-run and daemon check-in backstop (goal:11-12): delete rows whose
+    harness is dead, killing any still-live orphaned provider first.
 
     Scans **every** tasks-table row regardless of workspace (2-plan §2
     amendment): liveliness is pid+start, so a live task in another workspace
-    is untouched while a crashed harness anywhere is found. Per row whose
+    is untouched while a crashed harness anywhere is found.     Per row whose
     harness pid is dead: when a provider pid was recorded and *confirms* live
-    right now (pid+start re-checked here, never from an earlier read), its
-    tree dies through :func:`spawn.kill_pid_tree` — the same
-    ``taskkill /F /T`` reasoning as the timeout path — then the row is
-    deleted either way.
+    right now (pid+start re-checked here when the row recorded a start, never
+    from an earlier read), its tree dies through :func:`spawn.kill_pid_tree`
+    — the same ``taskkill /F /T`` reasoning as the timeout path — then the
+    row is deleted either way.
 
     Two non-negotiables: a failing kill never raises (the sweep runs at the
     start of a run and must not take that run down), and the delete re-checks
@@ -531,8 +573,8 @@ def sweep_orphans(
         if pid_live(row["harness_pid"], row["harness_start"]):
             continue
         if row["provider_pids"] is not None:
-            for pid in json.loads(row["provider_pids"]):
-                if pid_live(pid):
+            for pid, start in provider_entries(row):
+                if pid_live(pid, start):
                     try:
                         killer(int(pid))
                     except Exception:  # noqa: BLE001 - a dead sweep must not kill the run

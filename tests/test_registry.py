@@ -77,6 +77,20 @@ def test_connect_creates_schema_and_seeds_schema_version(conn):
         again.close()
 
 
+def test_connect_upgrades_a_registry_that_predates_provider_starts(conn):
+    """CREATE TABLE IF NOT EXISTS never widens an existing table; connect does."""
+    conn.execute("ALTER TABLE tasks DROP COLUMN provider_starts")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert "provider_starts" not in cols
+
+    again = db.connect()
+    try:
+        cols = {row[1] for row in again.execute("PRAGMA table_info(tasks)")}
+        assert "provider_starts" in cols
+    finally:
+        again.close()
+
+
 def test_workspaces_version_starts_at_zero(conn):
     assert db.workspaces_version(conn) == 0
     assert db.kv_get(conn, "no-such-key") is None
@@ -415,6 +429,59 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
     assert killed == [999]
 
 
+def test_the_sweep_spares_a_recycled_provider_pid(
+    workspace: Path, tmp_path: Path, monkeypatch
+):
+    """pid+start on the provider side: a pid that came back as a different
+    process reads dead, so the row is deleted without killing the stranger."""
+    import backseat_harness.cli as cli
+    from backseat_harness.cli import main
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    other = tmp_path / "elsewhere"
+    with db.open_db() as conn:
+        # Recycled: the pid is live, but not at the recorded start.
+        db.claim_task(conn, other, ".backseat/tasks/a", 111, 111.0)
+        db.record_provider(conn, other, ".backseat/tasks/a", [999], [1000.0])
+        # The real thing: pid live at its recorded start -> confirm and kill.
+        db.claim_task(conn, other, ".backseat/tasks/b", 222, 222.0)
+        db.record_provider(conn, other, ".backseat/tasks/b", [888], [777.0])
+
+    procs = {999: FakeProc(9999.0), 888: FakeProc(777.0)}
+
+    def _process(pid):
+        if pid in procs:
+            return procs[pid]
+        raise db.psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(db, "_process", _process)
+    killed: list[int] = []
+    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+    monkeypatch.setattr(cli, "run_task", _complete)
+
+    assert main(["-C", str(workspace), "run", "t"]) == 0
+
+    with db.open_db() as conn:
+        assert db.get_task(conn, other, ".backseat/tasks/a") is None
+        assert db.get_task(conn, other, ".backseat/tasks/b") is None
+    assert killed == [888]
+
+
+def test_record_provider_keeps_starts_aligned_with_pids(conn, workspace: Path):
+    db.claim_task(conn, workspace, "tasks/x", 10, 1000.0)
+    db.record_provider(conn, workspace, "tasks/x", [1, 2], [100.5, None])
+    row = db.get_task(conn, workspace, "tasks/x")
+    assert row["provider_pids"] == "[1, 2]"
+    assert row["provider_starts"] == "[100.5, null]"
+
+    # A misaligned start list is worse than none: store NULL, never a pair
+    # that would make pid_live vouch for the wrong process.
+    db.record_provider(conn, workspace, "tasks/x", [3], [1.0, 2.0])
+    row = db.get_task(conn, workspace, "tasks/x")
+    assert row["provider_pids"] == "[3]"
+    assert row["provider_starts"] is None
+
+
 def test_provider_spawn_during_the_run_lands_in_the_claimed_row(
     workspace: Path, monkeypatch
 ):
@@ -446,6 +513,10 @@ def test_provider_spawn_during_the_run_lands_in_the_claimed_row(
     assert row["provider_pids"] is not None
     pids = json.loads(row["provider_pids"])
     assert len(pids) > 0 and all(p > 0 for p in pids)
+    # Starts ride the same shape: one entry per pid (None only if the
+    # process was gone before psutil could read it back).
+    starts = json.loads(row["provider_starts"])
+    assert len(starts) == len(pids)
     # The recorder is cleared on the way out -- no leak into the next run.
     assert spawn._provider_recorder.get() is None
 
