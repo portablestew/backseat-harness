@@ -1,4 +1,6 @@
-"""Web app tests (step 9.1-9.4): allowlist, homepage, add-task, search, shell.
+"""Web app tests (steps 9.1-9.4, 11.1-11.4): allowlist, homepage, add-task,
+search, shell, plus the step-11 gap closures (auto-suggest, workspace page
+tables, task viewer controls, chat viewer resume + fork prompt).
 
 Hermetic: tests/conftest.py's autouse home pin routes ``config._default_home``
 -- through which ``db.db_path`` resolves on every call -- at a throwaway dir,
@@ -12,9 +14,14 @@ Shell tests drive the real PTYSessionManager and a real child process.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -249,6 +256,13 @@ def test_search_page_classifies_sessions_and_renders_one_action_per_row(monkeypa
     assert '["opencode", "--session", "ses_plain"]' in resume_row
     assert ">Resume<" in resume_row
     assert "Fork" not in resume_row  # exactly one action per row
+    # Strict browser-style parse: the cmd attribute must survive attribute
+    # extraction as one JSON value (the double-quoted tojson bug).
+    assert json.loads(_hidden_input(resume_row, "cmd")) == [
+        "opencode",
+        "--session",
+        "ses_plain",
+    ]
 
     # (a3) non-supported provider renders Fork instead, carrying the row key.
     fork_row = next(r for r in rows if "sess_k1" in r)
@@ -456,5 +470,437 @@ def test_shell_websocket_rejects_foreign_origin_and_host(tmp_path: Path):
             with pytest.raises(WebSocketDisconnect):
                 with client.websocket_connect(url, headers={"host": "evil.com"}):
                     pass
+        finally:
+            _kill_session(session_id)
+
+
+# --- step 11a: homepage auto-suggest -------------------------------------------
+
+
+def test_homepage_suggest_offers_only_unregistered_chat_dirs(
+    monkeypatch, tmp_path: Path
+):
+    """GET /workspaces/suggest -- the homepage's Suggestions button -- lists
+    chat-bearing dirs that are not registered, and nothing else."""
+    candidate = tmp_path / "candidate-ws"
+    registered = tmp_path / "already-registered"
+    vanished = tmp_path / "never-created"
+    candidate.mkdir()
+    registered.mkdir()
+    with db.open_db() as conn:
+        assert db.add_workspace(conn, registered) is True
+
+    refs = [
+        _Ref("opencode:ses_in_candidate", mtime=300.0, project=str(candidate)),
+        _Ref("claude_code:ses_in_registered", mtime=200.0, project=str(registered)),
+        _Ref("opencode:ses_vanished", mtime=100.0, project=str(vanished)),
+    ]
+    _stub_chat_history(monkeypatch, refs, {})
+
+    with _client() as client:
+        page = client.get("/")
+        resp = client.get("/workspaces/suggest")
+
+    # The homepage Suggestions section is wired to this endpoint.
+    assert 'hx-get="/workspaces/suggest"' in page.text
+
+    assert resp.status_code == 200
+    body = resp.text
+    # Offered: the unregistered dir with chats, as a button that POSTs its path.
+    assert f">{candidate}</button>" in body
+    assert 'hx-post="/workspaces"' in body
+    # Filtered out: already-registered workspaces and dirs that don't exist.
+    assert str(registered) not in body
+    assert str(vanished) not in body
+
+
+# --- step 11b: workspace page listings -----------------------------------------
+
+
+def _write_lane(
+    workspace: Path,
+    slug: str,
+    *,
+    updated_at: float,
+    status: str | None = None,
+    reason: str = "",
+) -> None:
+    """Create a task lane. ``status=None`` means no state.json, so the lane
+    reads as ``continue`` ordered by goal.md's mtime."""
+    lane = workspace / ".backseat" / "tasks" / slug
+    lane.mkdir(parents=True, exist_ok=True)
+    goal = lane / "goal.md"
+    goal.write_text(f"goal for {slug}\n", encoding="utf-8")
+    if status is None:
+        os.utime(goal, (updated_at, updated_at))
+    else:
+        (lane / "state.json").write_text(
+            json.dumps(
+                {
+                    "slug": slug,
+                    "status": status,
+                    "iteration": 0,
+                    "generation": 1,
+                    "reason": reason,
+                    "updated_at": updated_at,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+def _section(html: str, heading: str) -> str:
+    """Body of the ``<section>`` that starts at ``heading``."""
+    start = html.index(heading)
+    return html[start : html.index("</section>", start)]
+
+
+def test_workspace_page_sections_tasks_status_and_chat_filtering(
+    monkeypatch, workspace: Path
+):
+    ws_id = _register_workspace(workspace)
+
+    # Status lanes: blocked -> "needs attention", continue -> "in-progress",
+    # complete -> dropped from the incomplete table but listed as complete.
+    _write_lane(
+        workspace,
+        "blocked-lane",
+        status="blocked",
+        reason="Pick a palette color",
+        updated_at=1_700_000_300.0,
+    )
+    _write_lane(
+        workspace, "continue-lane", status="continue", updated_at=1_700_000_100.0
+    )
+    _write_lane(
+        workspace, "done-lane", status="complete", updated_at=1_700_000_200.0
+    )
+    # 22 continue lanes (no state.json) so the top-20 cap is exercised; their
+    # goal mtimes keep them below the three status lanes in the ordering.
+    for i in range(22):
+        _write_lane(
+            workspace, f"filler-{i:02d}", status=None, updated_at=1_700_000_000.0 + i
+        )
+
+    other = workspace.parent / "some-other-project"
+    other.mkdir()
+    refs = [
+        _Ref("opencode:ses_ws_new", mtime=300.0, project=str(workspace)),
+        _Ref("opencode:ses_ws_marker", mtime=400.0, project=str(workspace)),
+        _Ref("claude_code:ses_ws_old", mtime=200.0, project=str(workspace)),
+        _Ref("opencode:ses_elsewhere", mtime=500.0, project=str(other)),
+    ]
+    transcripts = {
+        "opencode:ses_ws_new": "chatting about widgets",
+        "opencode:ses_ws_marker": f"managed {_MARKER}",
+        "claude_code:ses_ws_old": "chatting about gadgets",
+        "opencode:ses_elsewhere": "other project chatter",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+    assert resp.status_code == 200
+
+    incomplete = _section(resp.text, "<h3>Incomplete Tasks</h3>")
+    recent = _section(resp.text, "<h3>Top 20 Recent Tasks</h3>")
+    chats = _section(resp.text, "<h3>Top 20 Recent Chats</h3>")
+
+    # Incomplete: badge text per status, complete lane excluded.
+    inc_rows = _data_rows(incomplete)
+    assert len(inc_rows) == 24  # 25 lanes minus the complete one
+    blocked_row = next(r for r in inc_rows if ">blocked-lane<" in r)
+    assert '<span class="badge">needs attention</span>' in blocked_row
+    continue_row = next(r for r in inc_rows if ">continue-lane<" in r)
+    assert '<span class="badge">in-progress</span>' in continue_row
+    assert all("done-lane" not in r for r in inc_rows)
+
+    # Top-20 recent tasks: capped at 20, newest first, complete included.
+    rec_rows = _data_rows(recent)
+    assert len(rec_rows) == 20
+    assert ">blocked-lane<" in rec_rows[0]
+    assert ">done-lane<" in recent
+    assert ">filler-21<" in recent
+    assert ">filler-05<" in recent
+    assert ">filler-04<" not in recent  # the five oldest fall off the cap
+    assert ">filler-00<" not in recent
+    assert ">filler-00<" in incomplete  # ...but stay in the incomplete table
+
+    # Recent chats: workspace-scoped, <meta> marker sessions excluded,
+    # newest first.
+    chat_rows = _data_rows(chats)
+    assert len(chat_rows) == 2
+    assert "chatting about widgets" in chat_rows[0]
+    assert "chatting about gadgets" in chat_rows[1]
+    assert "ses_ws_marker" not in chats
+    assert "managed" not in chats
+    assert "ses_elsewhere" not in chats
+    assert "other project chatter" not in chats
+
+
+# --- step 11c: task viewer Run and Takeover controls ---------------------------
+
+
+class _InputParser(HTMLParser):
+    """Collect input name -> value the way a browser's form parser would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: dict[str, str | None] = {}
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag == "input":
+            d = dict(attrs)
+            if "name" in d:
+                self.inputs[d["name"]] = d.get("value")
+
+
+def _hidden_input(html: str, name: str) -> str:
+    """Strict attribute parse of one hidden input (raises if absent/malformed)."""
+    parser = _InputParser()
+    parser.feed(html)
+    return parser.inputs[name]
+
+
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def _strip_ansi(data: bytes) -> bytes:
+    """Drop terminal control sequences, as a terminal renders them away."""
+    return _ANSI_RE.sub(b"", data)
+
+
+def _session_buffer(session_id: str) -> bytes:
+    session = _shell_manager().get_session(session_id)
+    if session is None:
+        return b""
+    with session.lock:
+        return b"".join(session.buffer)
+
+
+def _wait_stripped(session_id: str, needle: bytes, timeout: float = 30.0) -> bytes:
+    """Poll the ring buffer (ANSI-stripped) until ``needle`` lands in it."""
+    deadline = time.monotonic() + timeout
+    snapshot = b""
+    while time.monotonic() < deadline:
+        snapshot = _strip_ansi(_session_buffer(session_id))
+        if needle in snapshot:
+            return snapshot
+        time.sleep(0.05)
+    raise AssertionError(f"{needle!r} never reached the PTY; buffer={snapshot!r}")
+
+
+def _wait_exit(session_id: str, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    manager = _shell_manager()
+    while time.monotonic() < deadline:
+        if not manager.is_alive(session_id):
+            return
+        time.sleep(0.05)
+    raise AssertionError("the shell's child process never exited")
+
+
+def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: Path):
+    ws_id = _register_workspace(workspace)
+    assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
+    slug = "viewer-task"
+    ws_arg = str(workspace.resolve())
+
+    # Process-boundary stub: record the exact argv the CLI would be spawned with.
+    spawned: list[tuple[list[str], dict]] = []
+
+    def _record_popen(cmd, **kwargs):  # noqa: ANN001
+        spawned.append((cmd, kwargs))
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", _record_popen)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/{slug}")
+        assert page.status_code == 200
+        assert f'action="/ws/{ws_id}/tasks/{slug}/run"' in page.text
+        assert ">Run task<" in page.text
+
+        with_brief = client.post(
+            f"/ws/{ws_id}/tasks/{slug}/run",
+            data={"brief": "also fix the flaky test"},
+            follow_redirects=False,
+        )
+        assert with_brief.status_code == 303
+        assert with_brief.headers["location"] == f"/ws/{ws_id}/tasks/{slug}"
+
+        no_brief = client.post(
+            f"/ws/{ws_id}/tasks/{slug}/run", follow_redirects=False
+        )
+        assert no_brief.status_code == 303
+
+    assert len(spawned) == 2
+    cmd, kwargs = spawned[0]
+    assert cmd == [
+        sys.executable,
+        "-m",
+        "backseat_harness.cli",
+        "-C",
+        ws_arg,
+        "run",
+        slug,
+        "also fix the flaky test",
+    ]
+    assert kwargs["cwd"] == ws_arg
+    # Without a brief the argv stops at the slug.
+    assert spawned[1][0] == [
+        sys.executable, "-m", "backseat_harness.cli", "-C", ws_arg, "run", slug
+    ]
+
+
+def test_task_viewer_takeover_starts_shell_running_takeover_cli(
+    monkeypatch, workspace: Path, fake_home: Path
+):
+    ws_id = _register_workspace(workspace)
+    assert _post_task(ws_id, "Takeover Lane", "needs a decision").status_code == 303
+    slug = "takeover-lane"
+    ws_arg = str(workspace.resolve())
+
+    # The button spawns the real CLI, so make that run hermetic and
+    # deterministic: the child inherits an isolated home (empty registry ->
+    # nothing to kill) and a workspace config whose provider cannot resolve,
+    # which stops the takeover before any interactive TUI could start.
+    (workspace / ".backseat" / "config.toml").write_text(
+        '[harness]\nprovider = "definitely-not-installed"\n', encoding="utf-8"
+    )
+    (workspace / ".backseat" / "tasks" / slug / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": slug,
+                "status": "blocked",
+                "iteration": 0,
+                "generation": 1,
+                "reason": "Pick a palette color",
+                "updated_at": 1_700_000_300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/{slug}")
+        assert page.status_code == 200
+        assert ">Takeover<" in page.text
+
+        # The button's payload is browser-parseable JSON of the exact argv.
+        argv = json.loads(_hidden_input(page.text, "cmd"))
+        assert argv == [
+            sys.executable,
+            "-m",
+            "backseat_harness.cli",
+            "-C",
+            ws_arg,
+            "takeover",
+            slug,
+        ]
+        assert _hidden_input(page.text, "cwd") == "."
+
+        session_id = _start_session(client, argv, Path("."))
+        try:
+            assert client.get(f"/shell/{session_id}").status_code == 200
+
+            # Real CLI output: it loaded this lane and reported the block.
+            out = _wait_stripped(
+                session_id,
+                b"This lane is blocked on a question from the operator:",
+            )
+            assert b"Pick a palette color" in out
+
+            # ...and then failed fast at provider resolution, before any
+            # interactive handoff could happen.
+            _wait_stripped(session_id, b"unknown provider")
+            _wait_exit(session_id)
+            final = _strip_ansi(_session_buffer(session_id))
+            assert b"definitely-not-installed" in final
+            assert b"Handing you" not in final
+        finally:
+            _kill_session(session_id)
+
+
+# --- step 11d: chat viewer resume + fork prompt --------------------------------
+
+
+def test_chat_viewer_renders_resume_argv_for_native_cli(monkeypatch):
+    from backseat_harness import history
+
+    transcript = "User: fix the flaky test\nAssistant: done, the test is stable"
+    monkeypatch.setattr(
+        history, "load_full_transcript", lambda key, provider: transcript
+    )
+
+    with _client() as client:
+        resp = client.get("/chat/opencode/ses_resume")
+
+    assert resp.status_code == 200
+    assert "fix the flaky test" in resp.text
+    assert ">Resume in Shell<" in resp.text
+    # Browser-parseable argv for the web-shell resume.
+    assert json.loads(_hidden_input(resp.text, "cmd")) == [
+        "opencode",
+        "--session",
+        "ses_resume",
+    ]
+    assert _hidden_input(resp.text, "cwd") == "."
+
+    # A provider with no interactive resume gets the transcript, no button.
+    monkeypatch.setattr(
+        history, "load_full_transcript", lambda key, provider: "ide-side chat"
+    )
+    with _client() as client:
+        resp2 = client.get("/chat/kiro_ide/sess_x")
+    assert resp2.status_code == 200
+    assert "ide-side chat" in resp2.text
+    assert "Resume in Shell" not in resp2.text
+
+
+def test_search_fork_sends_fork_prompt_into_the_pty(monkeypatch, tmp_path: Path):
+    # One unsupported-provider chat: pick_fork_provider skips the Kiro-IDE and
+    # most-recent-supported rules and falls to the PATH scan, which we pin to a
+    # fake "opencode" (rule 3 of the goal's fork-provider selection).
+    refs = [_Ref("cursor:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"cursor:sess_cur": "cursor chat"})
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_opencode = fake_bin / "opencode.exe"
+    shutil.copy2(sys.executable, fake_opencode)
+    shutil.copy2(Path(sys.prefix) / "pyvenv.cfg", fake_bin / "pyvenv.cfg")
+
+    def _which(command: str, path: str | None = None) -> str | None:
+        # pick_fork_provider scans for the CLI, and pywinpty's spawn resolves
+        # argv[0] through shutil.which too -- both land on the fake binary.
+        return str(fake_opencode) if command == "opencode" else None
+
+    monkeypatch.setattr("shutil.which", _which)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
+
+    with _client() as client:
+        resp = client.post(
+            "/search/fork",
+            data={
+                "conversation_id": "sess_cur",
+                "current_session_key": "cursor:sess_cur",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303, resp.text
+        location = resp.headers["location"]
+        assert re.fullmatch(r"/shell/[0-9a-f]{12}", location)
+        session_id = location.rsplit("/", 1)[1]
+        try:
+            assert client.get(f"/shell/{session_id}").status_code == 200
+            # The route writes "Please fork chat id <id>\n" into the PTY 0.5s
+            # after spawn; the fake TUI is a real child whose terminal renders
+            # the line back, so the full prompt must land in the ring buffer.
+            _wait_stripped(
+                session_id, b"Please fork chat id sess_cur", timeout=45.0
+            )
         finally:
             _kill_session(session_id)

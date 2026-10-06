@@ -37,7 +37,7 @@
         <td>
           {% if r.resume_command %}
           <form class="resume-form" style="display: inline;">
-            <input type="hidden" name="cmd" value="{{ r.resume_command|tojson }}">
+            <input type="hidden" name="cmd" value='{{ r.resume_command|tojson }}'>
             <input type="hidden" name="cwd" value=".">
             <button type="submit" class="btn btn-sm">Resume</button>
           </form>

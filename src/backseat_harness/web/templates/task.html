@@ -6,7 +6,7 @@
   <small>Updated: {{ task.updated_at | format_datetime }}</small>
   {% if takeover_cmd %}
   <form id="takeover-form" style="margin-top: 8px;">
-    <input type="hidden" name="cmd" value="{{ takeover_cmd|tojson }}">
+    <input type="hidden" name="cmd" value='{{ takeover_cmd|tojson }}'>
     <input type="hidden" name="cwd" value=".">
     <button type="submit" class="btn">Takeover</button>
   </form>

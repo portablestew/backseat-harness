@@ -6,7 +6,7 @@
   <small>{{ conversation_id }}</small>
   {% if resume_command %}
   <form id="resume-form" style="margin-top: 8px;">
-    <input type="hidden" name="cmd" value="{{ resume_command|tojson }}">
+    <input type="hidden" name="cmd" value='{{ resume_command|tojson }}'>
     <input type="hidden" name="cwd" value=".">
     <button type="submit" class="btn">Resume in Shell</button>
   </form>
