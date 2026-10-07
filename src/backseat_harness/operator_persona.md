@@ -140,6 +140,9 @@ milestone, say why in a remark.
    for debris. Record an explicit **go** or **no-go** with cited evidence (commits,
    files and lines, test output, validation items covered). A no-go becomes revision
    prompts; a go entitles you to declare `done`.
+6. **Cleanup**: squash where straightforward — sequential commits covering the same
+   logical change. Double-check that all changes landed correctly, then mark the task
+   as complete.
 
 ## Handoff docs
 
