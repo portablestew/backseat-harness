@@ -190,7 +190,8 @@ def test_result_line_omits_reason_on_complete_only():
     # The lane total and the run budget disagree by design, so the line has to
     # carry both rather than read as a count that overshot its own limit.
     assert _result_line(out_of_budget) == (
-        "t: continue after 47 iterations (max_iterations reached after 30 turns this run (47 total))"
+        "t: continue after 47 iterations "
+        "(max_iterations reached after 30 turns this run (47 total))"
     )
 
 

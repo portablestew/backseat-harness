@@ -22,10 +22,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from backseat_harness import __version__, db, logs, progress, spawn, storage
+import psutil
+
+from backseat_harness import __version__, db, exitwatch, logs, progress, spawn, storage
 from backseat_harness import platform as platform_mod
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
 from backseat_harness.daemon import Daemon
@@ -134,6 +138,15 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon_run = daemon_sub.add_parser(
         "run",
         help="run the background scheduler in the foreground until interrupted",
+    )
+    # SUPPRESS so the root --debug value survives when this one is absent;
+    # argparse subparser defaults would otherwise overwrite it with False.
+    daemon_run.add_argument(
+        "--debug",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="forward --debug to daemon-spawned runs ([dbg] step lines in "
+        "each lane's daemon.log); also accepted before the daemon subcommand",
     )
     daemon_run.set_defaults(func=_cmd_daemon)
 
@@ -260,16 +273,30 @@ def _cmd_run(args) -> int:
         except db.ClaimConflict as exc:
             _emit(args, {"slug": args.slug, "error": str(exc)}, str(exc))
             return 2
-        spawn.set_provider_recorder(
-            lambda entries: db.record_provider(
-                conn,
-                config.workspace_root,
-                task_relpath,
-                [pid for pid, _ in entries],
-                [start for _, start in entries],
-            )
+
+        def _note(line: str) -> None:
+            print(f"[run] {line}", file=sys.stderr, flush=True)
+
+        # Diagnostics from here to teardown land in stderr, which the daemon
+        # redirects into the lane's daemon.log: the claim stamp, every exit
+        # signal, and the 60s heartbeat prove which of pid/ppid/providers was
+        # still alive right up to a silent death.
+        restore_exitwatch = exitwatch.install(_note)
+        _note(
+            f"start pid={os.getpid()} ppid={os.getppid()} task={task_relpath} "
+            f"debug={progress.debug_enabled()}"
         )
+        stop_heartbeat = _start_run_heartbeat(config, task_relpath, _note)
         try:
+            spawn.set_provider_recorder(
+                lambda entries: db.record_provider(
+                    conn,
+                    config.workspace_root,
+                    task_relpath,
+                    [pid for pid, _ in entries],
+                    [start for _, start in entries],
+                )
+            )
             result = run_task(
                 slug=args.slug,
                 config=config,
@@ -280,12 +307,54 @@ def _cmd_run(args) -> int:
                 owner_brief=brief,
             )
         finally:
+            stop_heartbeat()
             # Clear first: a spawn during teardown must not write through a
             # connection that release_task is about to make stale.
             spawn.set_provider_recorder(None)
+            _note("teardown: releasing task row")
             db.release_task(conn, config.workspace_root, task_relpath)
+            _note("teardown: row released")
+            restore_exitwatch()
     _emit(args, result.to_dict(), _result_line(result))
     return 0 if result.status.value in {"complete", "blocked"} else 1
+
+
+def _start_run_heartbeat(
+    config: Config, task_relpath: str, note: Callable[[str], None]
+) -> Callable[[], None]:
+    """Stamp liveness every 60s until the returned stop() is called.
+
+    The run's log can legitimately go silent for the length of a provider
+    call (up to the operator ceiling), so this is the run's half of the
+    daemon's heartbeat: pid, parent (did the daemon go first?), and which
+    recorded providers still answer as live.
+    """
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def _beat() -> None:
+        while not stop.wait(60.0):
+            try:
+                ppid = os.getppid()
+                ppid_live = psutil.pid_exists(ppid)
+                with db.open_db() as conn:
+                    row = db.get_task(conn, config.workspace_root, task_relpath)
+                live = (
+                    [p for p, s in db.provider_entries(row) if db.pid_live(p, s)]
+                    if row
+                    else []
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed beat still reports
+                note(f"heartbeat: failed ({exc})")
+                continue
+            note(
+                f"heartbeat uptime={int(time.monotonic() - started)}s "
+                f"pid={os.getpid()} ppid={ppid} ppid_live={ppid_live} "
+                f"providers_live={live}"
+            )
+
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop.set
 
 
 def _resume_block(paths: TaskPaths, slug: str) -> str | None:
@@ -427,7 +496,7 @@ def _cmd_daemon(args) -> int:
     here the ``finally`` in ``run`` has already joined the watchers and
     released the guard, so both exits report the same stopped payload.
     """
-    instance = Daemon()
+    instance = Daemon(debug=getattr(args, "debug", False))
     try:
         instance.run()
     except db.DaemonAlreadyRunning as exc:

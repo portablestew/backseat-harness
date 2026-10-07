@@ -37,7 +37,6 @@ tests replace to script wakes.
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterable

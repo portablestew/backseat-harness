@@ -17,6 +17,7 @@ import os
 import subprocess
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -90,7 +91,7 @@ def spawns(monkeypatch):
 
     def fake_popen(argv, **kwargs):
         records.append((list(argv), kwargs))
-        return object()
+        return types.SimpleNamespace(pid=4242)
 
     monkeypatch.setattr("backseat_harness.daemon.subprocess.Popen", fake_popen)
     return records
@@ -247,6 +248,9 @@ def test_run_claims_before_pumping_and_clears_the_guard_on_the_way_out():
         with db.open_db() as conn:
             raw = db.kv_get(conn, db.DAEMON_KEY)
         seen.append(json.loads(raw) if raw else None)
+        # ...and run() must have armed the 60s liveness stamp alongside
+        # discovery before pumping: a silent death needs a last heartbeat.
+        assert "heartbeat" in daemon._sched._jobs
         daemon.stop()
         return True
 
@@ -257,6 +261,50 @@ def test_run_claims_before_pumping_and_clears_the_guard_on_the_way_out():
     # ...and after run() returns, nothing is left holding the guard.
     with db.open_db() as conn:
         assert db.kv_get(conn, db.DAEMON_KEY) is None
+
+
+# --- --debug forwarding ------------------------------------------------------
+
+
+def test_run_argv_forwards_debug_only_when_asked():
+    from backseat_harness.daemon import _run_argv
+
+    quiet = _run_argv("C:/ws", "slug")
+    assert "--debug" not in quiet
+    assert quiet[-2:] == ["run", "slug"]
+
+    loud = _run_argv("C:/ws", "slug", debug=True)
+    assert "--debug" in loud
+    assert loud[loud.index("--debug") + 1 :] == ["run", "slug"]
+
+
+def test_daemon_run_debug_parses_in_both_positions():
+    import backseat_harness.cli as cli
+
+    parser = cli._build_parser()
+    assert parser.parse_args(["--debug", "daemon", "run"]).debug is True
+    assert parser.parse_args(["daemon", "run", "--debug"]).debug is True
+    # The subparser's SUPPRESS default must not clobber the root flag.
+    assert parser.parse_args(["daemon", "run"]).debug is False
+
+
+def test_cmd_daemon_forwards_debug_to_the_instance(monkeypatch):
+    import backseat_harness.cli as cli
+
+    seen: list[bool] = []
+
+    class FakeDaemon:
+        def __init__(self, **kwargs):
+            seen.append(bool(kwargs.get("debug")))
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "Daemon", FakeDaemon)
+    parser = cli._build_parser()
+    assert cli._cmd_daemon(parser.parse_args(["--debug", "daemon", "run"])) == 0
+    assert cli._cmd_daemon(parser.parse_args(["daemon", "run"])) == 0
+    assert seen == [True, False]
 
 
 # --- discovery (goal:47-53) ---------------------------------------------------
@@ -346,6 +394,8 @@ def test_a_quiet_workspace_backgrounds_the_oldest_runnable_lane(
     argv, kwargs = spawns[0]
     assert argv[-2:] == ["run", "old"]
     assert "-C" in argv and ws in argv
+    # Gated: this daemon was not started with --debug, so the run is not either.
+    assert "--debug" not in argv
     assert kwargs["cwd"] == ws
     assert kwargs["stderr"] == subprocess.STDOUT
     assert Path(kwargs["stdout"].name) == prior

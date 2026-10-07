@@ -298,7 +298,7 @@ def test_partial_lane_without_goal_md_ignored_by_guard(workspace: Path):
     partial.mkdir(parents=True)
     # No goal.md, no state.json => interrupted debris; ignored by guard.
     # A completed lane exists alongside, so fire should succeed.
-    complete_lane = _lane(tasks, "job-report-20260101-060000", status=TaskStatus.COMPLETE)
+    _lane(tasks, "job-report-20260101-060000", status=TaskStatus.COMPLETE)
     result = jobs.fire(workspace, "report", now=_utc(2026, 1, 3, 6))
     assert result is not None
     # The partial debris remains but does not block.

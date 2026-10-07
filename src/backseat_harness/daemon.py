@@ -66,7 +66,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from backseat_harness import db, jobs, storage
+from backseat_harness import config, db, exitwatch, jobs, storage
 from backseat_harness.config import TaskPaths
 from backseat_harness.models import TaskStatus
 from backseat_harness.scheduler import FILE_POLL_S, Scheduler
@@ -83,27 +83,37 @@ QUIESCENCE_S = 30
 #: and falls back to the default (goal:46).
 AFTER_SPAWN_S = 30
 
+#: How often the pump proves it is alive and shows what it sees. Without
+#: this, a silent death is only bracketed by the last event and the next
+#: check-in (up to 30 minutes later).
+HEARTBEAT_S = 60
+
 #: One pending job id for the workspace set; joins the sleep math (goal:53).
 DISCOVERY_JOB = "discovery"
 
 #: The scheduler watch key covering the registry's own mtime (goal:60-62).
 DB_WATCH_KEY = "sqlite"
 
+#: The scheduler job id carrying the periodic liveness stamp.
+HEARTBEAT_JOB = "heartbeat"
+
 #: The only filenames whose edits reset a check-in (goal:55-58). ``daemon.log``
 #: and everything else under tasks/jobs is noise the filter drops.
 _WATCHED_NAMES = frozenset({"goal.md", "job.toml"})
 
 # Logging: durable log under ~/.backseat; setup deferred to Daemon.run so
-# importing daemon.py is side-effect free (tests must not touch the real file).
-_LOG_PATH = Path.home() / ".backseat" / "daemon.log"
+# importing daemon.py is side-effect free. The path is resolved at setup
+# time through the pinned home seam, so tests installing handlers write to
+# the fake home and never touch the real file.
 _logger = logging.getLogger("daemon")
 _logger.setLevel(logging.INFO)
 
 
 def _setup_daemon_logging() -> None:
-    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log_path = config._default_home() / ".backseat" / "daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     _logger.handlers.clear()
-    handler = logging.FileHandler(str(_LOG_PATH), mode="a")
+    handler = logging.FileHandler(str(log_path), mode="a")
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     _logger.addHandler(handler)
 
@@ -256,12 +266,19 @@ def _live_pids(workspace: str) -> list[tuple[int, float | None]]:
     return live
 
 
-def _run_argv(workspace: str, slug: str) -> list[str]:
+def _run_argv(workspace: str, slug: str, *, debug: bool = False) -> list[str]:
     """argv for the backgrounded run: the console script when it is on PATH,
-    else the very same CLI through the current interpreter."""
+    else the very same CLI through the current interpreter.
+
+    ``debug`` forwards this daemon's own --debug: with it, the lane's
+    daemon.log carries the per-step timing lines, so a run that dies
+    between two steps shows exactly which step it was in rather than only
+    the last iteration header.
+    """
     exe = shutil.which("backseat-harness")
     base = [exe] if exe else [sys.executable, "-m", "backseat_harness.cli"]
-    return [*base, "-C", workspace, "run", slug]
+    flags = ["--debug"] if debug else []
+    return [*base, "-C", workspace, *flags, "run", slug]
 
 
 class Daemon:
@@ -275,6 +292,7 @@ class Daemon:
         start: float | None = None,
         file_interval: float = FILE_POLL_S,
         wall: Callable[[], float] = time.time,
+        debug: bool = False,
     ) -> None:
         self._sched = sched if sched is not None else Scheduler()
         self._pid = os.getpid() if pid is None else int(pid)
@@ -285,6 +303,9 @@ class Daemon:
         # Wall epochs: cron occurrences, fire-stamp names, quiescence. The one
         # seam tests fake beside the scheduler's clock (they run in lockstep).
         self._wall = wall
+        # Forwarded to daemon-spawned runs as --debug ([dbg] step lines in the
+        # lane's daemon.log) iff this daemon itself was started with --debug.
+        self._debug = bool(debug)
         # None means "never scanned"; 0 (no workspaces ever) is a real answer.
         self._version: int | None = None
         self._workspaces: set[str] = set()
@@ -314,8 +335,16 @@ class Daemon:
         """
         self.claim()
         _setup_daemon_logging()
+        # Claim/start logged here, not inside claim(): handlers do not exist
+        # until this point, so claim()'s own line was always dropped.
+        _logger.info("guard claimed pid=%s start=%s", self._pid, self._start)
+        _logger.info("daemon start argv=%s", " ".join(sys.argv))
+        restore_exitwatch = exitwatch.install(
+            lambda line: _logger.warning("exit: %s", line)
+        )
 
         def _shutdown(signum, frame):
+            _logger.warning("exit: signal SIGBREAK (Ctrl-Break); stopping pump")
             self.stop()
 
         if os.name == "nt":
@@ -327,6 +356,9 @@ class Daemon:
             # Startup discovery: goal:48 sets its timestamp to now, so the
             # first pump pass adopts the workspace set before sleeping.
             self._sched.schedule(DISCOVERY_JOB, self._sched.now(), self.discover)
+            self._sched.schedule(
+                HEARTBEAT_JOB, self._sched.now() + HEARTBEAT_S, self._heartbeat
+            )
             self._sched.run()
         finally:
             self._sched.stop()
@@ -334,10 +366,48 @@ class Daemon:
                 db.clear_daemon(conn, self._pid, self._start)
             _logger.info("guard released pid=%s start=%s", self._pid, self._start)
             _logger.info("shutdown")
+            restore_exitwatch()
 
     def stop(self) -> None:
         """Stop the pump and join the watcher threads (idempotent)."""
         self._sched.stop()
+
+    # --- liveness -----------------------------------------------------------
+
+    def _heartbeat(self) -> None:
+        """One stamp per HEARTBEAT_S: this pid, the armed jobs, the live pids.
+
+        The death of a silent process is otherwise only bracketed by its last
+        log line and the next scheduled wake. Exceptions are logged and
+        swallowed -- a heartbeat that can crash is one that stops proving
+        liveness -- and the re-arm happens on every path.
+        """
+        try:
+            live: list[int] = []
+            for workspace in sorted(self._workspaces):
+                try:
+                    live.extend(pid for pid, _ in _live_pids(workspace))
+                except Exception as exc:  # noqa: BLE001 - one bad scan, not a dead beat
+                    _logger.warning(
+                        "heartbeat: liveness scan failed workspace=%s err=%s",
+                        workspace,
+                        exc,
+                    )
+            jobs = getattr(self._sched, "_jobs", {})
+            next_in: float | None = None
+            if jobs:
+                next_in = min(job.deadline for job in jobs.values()) - self._sched.now()
+            _logger.info(
+                "heartbeat pid=%s armed=%d next_in=%s live_pids=%s",
+                self._pid,
+                len(jobs),
+                "n/a" if next_in is None else f"{next_in:.0f}s",
+                sorted(live),
+            )
+        except Exception as exc:  # noqa: BLE001 - log, re-arm, keep proving liveness
+            _logger.warning("heartbeat: failed err=%s", exc)
+        finally:
+            self._arm(HEARTBEAT_JOB, self._sched.now() + HEARTBEAT_S, self._heartbeat)
 
     # --- discovery ---------------------------------------------------------
 
@@ -442,7 +512,11 @@ class Daemon:
 
         busy = _live_pids(workspace)
         if busy:
-            _logger.info("check-in workspace=%s branch=busy pids=%s", workspace, [p for p, _ in busy])
+            _logger.info(
+                "check-in workspace=%s branch=busy pids=%s",
+                workspace,
+                [p for p, _ in busy],
+            )
             # Arm first, then watch: a pid dying between the two must find a
             # pending job to move (watchers only ever move pending jobs), and
             # the default is the fallback when the pid outlives a full period.
@@ -671,12 +745,15 @@ class Daemon:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log = log_path.open("ab")
         try:
-            subprocess.Popen(
-                _run_argv(workspace, slug),
+            proc = subprocess.Popen(
+                _run_argv(workspace, slug, debug=self._debug),
                 cwd=str(workspace),
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+            )
+            _logger.info(
+                "spawned run workspace=%s slug=%s child_pid=%s", workspace, slug, proc.pid
             )
         finally:
             # The child holds its own inherited copy; ours closes either way.

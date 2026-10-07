@@ -116,7 +116,8 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")  # D — deliberate: 5s busy absorbs DDL+INSERT contention
+    # D — deliberate: 5s busy absorbs DDL+INSERT contention
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     conn.executescript(_SCHEMA_SQL)
     # D — durable reasoning: per-connection DDL + INSERT OR IGNORE is idempotent
     # and protected by BUSY_TIMEOUT_MS (5000); deliberate tradeoff.
