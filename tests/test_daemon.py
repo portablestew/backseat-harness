@@ -307,6 +307,37 @@ def test_cmd_daemon_forwards_debug_to_the_instance(monkeypatch):
     assert seen == [True, False]
 
 
+def test_cmd_daemon_without_web_never_starts_the_web_stack(monkeypatch):
+    """``daemon run`` with no ``--web`` keeps daemon and web separate
+    (2-plan 3a/B4): the web branch is never entered, so no port is opened and
+    the lazy web import never fires."""
+    import backseat_harness.cli as cli
+    import backseat_harness.web.cli as web_cli
+
+    class FakeDaemon:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self) -> None:
+            return None
+
+    started: list[tuple] = []
+
+    def _boom(*args, **kwargs):
+        started.append((args, kwargs))
+        raise AssertionError("the web server must not start without --web")
+
+    monkeypatch.setattr(cli, "Daemon", FakeDaemon)
+    monkeypatch.setattr(web_cli, "start_web_in_thread", _boom)
+
+    parser = cli._build_parser()
+    # No --web: the SUPPRESS default means args has no ``web`` attribute.
+    args = parser.parse_args(["daemon", "run"])
+    assert getattr(args, "web", False) is False
+    assert cli._cmd_daemon(args) == 0
+    assert started == []
+
+
 # --- discovery (goal:47-53) ---------------------------------------------------
 
 

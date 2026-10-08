@@ -1039,6 +1039,46 @@ def test_add_workspace_nonexistent_path_is_400(tmp_path: Path):
     assert "HX-Trigger" not in resp.headers
 
 
+def test_add_task_duplicate_name_is_400(workspace: Path):
+    """Adding a lane whose slug already exists is refused (400) and the first
+    lane's goal is left untouched (2-plan §B edge case: duplicate add-task
+    name)."""
+    ws_id = _register_workspace(workspace)
+
+    first = _post_task(ws_id, "Dup Lane", "first goal")
+    assert first.status_code == 303
+
+    second = _post_task(ws_id, "Dup Lane", "second goal")
+    assert second.status_code == 400
+    assert "already exists" in second.text
+
+    goal = workspace / ".backseat" / "tasks" / "dup-lane" / "goal.md"
+    assert goal.read_text(encoding="utf-8") == "first goal\n"
+
+
+def test_unknown_workspace_and_task_ids_are_404(workspace: Path):
+    """Unknown registry ids, unknown task slugs and POSTs to unknown
+    workspaces all 404 rather than crashing (2-plan §B edge cases: nonexistent
+    ws_id)."""
+    ws_id = _register_workspace(workspace)
+    bogus_id = ws_id + 9999
+
+    with _client() as client:
+        assert client.get(f"/ws/{bogus_id}").status_code == 404
+        assert (
+            client.get(f"/ws/{bogus_id}/tasks/anything").status_code == 404
+        )
+        # A real workspace with an unknown slug is also a 404.
+        assert client.get(f"/ws/{ws_id}/tasks/no-such-lane").status_code == 404
+        assert (
+            client.post(
+                f"/ws/{bogus_id}/tasks",
+                data={"name": "x", "goal": "y"},
+            ).status_code
+            == 404
+        )
+
+
 # --- step 11b: workspace page listings -----------------------------------------
 
 
@@ -1650,6 +1690,26 @@ def test_chat_page_falls_back_to_fork_without_resume_command(monkeypatch):
     assert _hidden_input(resp.text, "conversation_id") == "sess_fork"
     assert _hidden_input(resp.text, "current_session_key") == "cline:sess_fork"
     assert ">Fork<" in resp.text
+
+
+def test_unknown_chat_provider_and_session_are_404(monkeypatch):
+    """Unknown provider names and known providers with no transcript both 404
+    (2-plan §B edge case: unknown chat / provider)."""
+    from backseat_harness import history
+
+    # A known provider whose loader finds nothing for the requested key.
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {}
+    )
+
+    with _client() as client:
+        bad_provider = client.get("/chat/not_a_provider/ses_x")
+        missing_session = client.get("/chat/opencode/ses_missing")
+
+    assert bad_provider.status_code == 404
+    assert "not_a_provider" in bad_provider.text
+    assert missing_session.status_code == 404
+    assert "not found" in missing_session.text.lower()
 
 
 def test_search_fork_sends_fork_prompt_into_the_pty(monkeypatch, tmp_path: Path):
