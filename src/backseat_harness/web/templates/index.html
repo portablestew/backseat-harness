@@ -12,9 +12,9 @@
     <p>No workspaces registered yet.</p>
     {% endfor %}
   </div>
-  <details id="add-workspace" class="add-workspace"
+  <details id="add-workspace" class="expander"
            hx-get="/workspaces/suggest" hx-trigger="toggle" hx-target="#ws-suggestions" hx-swap="innerHTML">
-    <summary class="add-workspace-plus" title="Add workspace" aria-label="Add workspace">+</summary>
+    <summary class="expander-plus" title="Add workspace" aria-label="Add workspace">+</summary>
     <form hx-post="/workspaces" hx-target="#toast" hx-swap="innerHTML">
       <label for="ws-path">Path</label>
       <input id="ws-path" name="path" type="text" list="ws-suggestions"

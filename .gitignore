@@ -36,3 +36,5 @@ TODO.md
 # OS / editor
 .DS_Store
 Thumbs.db
+# Playwright MCP browser artifacts (disposable snapshots/logs)
+.playwright-mcp/

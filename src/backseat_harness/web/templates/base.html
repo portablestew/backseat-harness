@@ -35,6 +35,52 @@
     body {
       background: var(--bg);
       color: var(--text);
+      font-size: 14px;
+    }
+    /* Threaded-chat header (goal G6): sticky row at the top of the chat page
+       -- opaque background so the transcript scrolls under it; prompt excerpt
+       on the left, continue/fork button on the right. */
+    .chat-header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      background: var(--bg);
+      padding: 0.5rem 0 0.65rem;
+      margin: 0 0 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .chat-header-prompt {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+    /* The back link lives inside the sticky row so the header can pin at
+       top: 0 from the first scroll pixel (rect.top equal before/after). */
+    .chat-header-back {
+      color: var(--muted);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .chat-header-back:hover {
+      color: var(--text);
+    }
+    .chat-header-prompt small {
+      color: var(--muted);
+    }
+    .chat-header .chat-continue-form {
+      margin: 0;
+      flex-shrink: 0;
+    }
+
+    /* Back-links: "< Workspaces" from a workspace, "< [workspace name]" from
+       a task. */
+    .nav-back {
+      margin: 0 0 0.75rem;
     }
     a {
       color: var(--accent);
@@ -129,18 +175,20 @@
       color: var(--muted);
     }
 
-    /* Add-workspace "+" control and its expanded panel. Collapsed the control
-       is just the round "+"; expanded the same element becomes a bounded
-       panel with the "+" pinned at its top-left and the path field + Add
-       button inside it (owner brief). The panel is sized well under the page
-       width via the form's fixed width. */
-    .add-workspace {
+    /* Expander: a disclosure whose collapsed control is a round "+" and whose
+       expanded state becomes a bounded panel with the "+" pinned at its
+       top-left and its body content inside it (used for add-workspace and
+       add-task). Collapsed the control is just the round "+"; the panel is
+       sized well under the page width. */
+    .expander {
       margin-top: 0.75rem;
     }
-    .add-workspace-plus {
+    .expander-plus {
       display: inline-flex;
+      place-items: center;
       align-items: center;
       justify-content: center;
+      padding: 0;
       width: 2.1rem;
       height: 2.1rem;
       border: 1px solid var(--border);
@@ -159,20 +207,20 @@
        inline-flex control it lands as a second flex item, which both shows a
        caret and knocks the "+" off-center. Suppress it, plus the native
        marker the UA would draw, so the round control holds just the "+". */
-    .add-workspace-plus::after {
+    .expander-plus::after {
       content: none;
       display: none;
     }
-    .add-workspace-plus::-webkit-details-marker {
+    .expander-plus::-webkit-details-marker {
       display: none;
     }
-    .add-workspace-plus:hover {
+    .expander-plus:hover {
       background: var(--accent);
       border-color: var(--accent);
       color: var(--accent-ink);
       box-shadow: var(--shadow);
     }
-    .add-workspace[open] {
+    .expander[open] {
       display: inline-block;
       max-width: 100%;
       padding: 0.7rem 0.9rem 0.95rem;
@@ -181,13 +229,13 @@
       background: var(--surface);
       box-shadow: var(--shadow);
     }
-    .add-workspace[open] .add-workspace-plus {
+    .expander[open] .expander-plus {
       background: var(--accent);
       border-color: var(--accent);
       color: var(--accent-ink);
       margin-bottom: 0.6rem;
     }
-    .add-workspace form {
+    .expander form {
       margin: 0;
       padding: 0;
       width: 26rem;
@@ -207,6 +255,25 @@
       color: var(--muted);
       font-size: 0.75rem;
       font-weight: 600;
+    }
+    /* Status colors (goal G5): complete green, in-progress (continue) amber,
+       blocked red; unknown statuses keep the grey default above. The color
+       rides ``data-status`` off the lane's raw status value, so badge text
+       mapping (services/task.badge_for) stays untouched. */
+    .badge[data-status="complete"] {
+      color: #3fb950;
+      border-color: rgba(63, 185, 80, 0.55);
+      background: rgba(63, 185, 80, 0.12);
+    }
+    .badge[data-status="continue"] {
+      color: #e3b341;
+      border-color: rgba(227, 179, 65, 0.55);
+      background: rgba(227, 179, 65, 0.12);
+    }
+    .badge[data-status="blocked"] {
+      color: #f85149;
+      border-color: rgba(248, 81, 73, 0.55);
+      background: rgba(248, 81, 73, 0.12);
     }
 
     /* Toasts */
@@ -237,7 +304,7 @@
 </head>
 <body>
   <main class="container">
-    <header><h1>backseat-harness</h1></header>
+    {% block nav %}{% endblock %}
     <div id="toast" aria-live="polite"></div>
     {% block content %}{% endblock %}
   </main>

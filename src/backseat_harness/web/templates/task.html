@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ task.slug }} - {{ ws_name }} - backseat-harness{% endblock %}
 {% block content %}
+{% block nav %}<p class="nav-back"><a href="/ws/{{ ws_id }}">← {{ ws_name }}</a></p>{% endblock %}
 <header>
   <h2>{{ ws_name }} / {{ task.slug }}</h2>
   <small>Updated: {{ task.updated_at | format_datetime }}</small>
@@ -50,7 +51,7 @@
   <h3>Status</h3>
   <dl>
     <dt>Status</dt>
-    <dd><span class="badge">{{ task.badge }}</span> ({{ task.status }})</dd>
+    <dd><span class="badge" data-status="{{ task.status }}">{{ task.badge }}</span> ({{ task.status }})</dd>
     <dt>Iteration</dt>
     <dd>{{ task.iteration }}</dd>
     <dt>Generation</dt>

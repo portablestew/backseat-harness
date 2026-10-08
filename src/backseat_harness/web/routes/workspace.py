@@ -37,15 +37,22 @@ def _resolve_or_404(ws_id: int) -> Path | None:
 
 @router.get("/ws/{ws_id}", response_class=HTMLResponse)
 def workspace_page(request: Request, ws_id: int):
-    """Workspace page: header, add-task form, incomplete table, recent tasks, recent chats."""
+    """Workspace page: Active/Completed/Recent tasks, Recent/Other chats.
+
+    One ``list_recent_chats`` fetch (plan 3e) is split into the ten newest
+    non-task chats ("Recent chats") and "Other chats" (the rest, collapsed).
+    """
     ws_path = _resolve_or_404(ws_id)
     if ws_path is None:
         return HTMLResponse("Workspace not found", status_code=404)
 
     name = ws_path.name
     incomplete = task_service.list_incomplete(ws_path)
+    complete = task_service.list_complete(ws_path)
     recent = task_service.list_recent(ws_path)
-    recent_chats = chat_search_service.list_recent_chats(ws_path)
+    chats = chat_search_service.list_recent_chats(ws_path, limit=50)
+    recent_chats = chats[:10]
+    other_chats = chats[10:]
 
     return templates.TemplateResponse(
         request,
@@ -55,8 +62,10 @@ def workspace_page(request: Request, ws_id: int):
             "ws_name": name,
             "ws_path": str(ws_path),
             "incomplete": incomplete,
+            "complete": complete,
             "recent": recent,
             "recent_chats": recent_chats,
+            "other_chats": other_chats,
         },
     )
 

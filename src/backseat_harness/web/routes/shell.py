@@ -31,9 +31,15 @@ def get_manager() -> PTYSessionManager:
 
 
 class ShellStartRequest(BaseModel):
-    """Request body for starting a shell session."""
+    """Request body for starting a shell session.
+
+    ``cols/rows`` (plan 3g) optionally set the PTY's initial size at spawn.
+    """
+
     cmd: list[str]
     cwd: str
+    cols: int | None = None
+    rows: int | None = None
 
 
 class ShellStartResponse(BaseModel):
@@ -45,7 +51,7 @@ class ShellStartResponse(BaseModel):
 def shell_start(req: ShellStartRequest):
     """Start a new PTY shell session and return its ID."""
     manager = get_manager()
-    session_id = manager.create_session(req.cmd, Path(req.cwd))
+    session_id = manager.create_session(req.cmd, Path(req.cwd), cols=req.cols, rows=req.rows)
     return ShellStartResponse(session_id=session_id)
 
 

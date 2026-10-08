@@ -9,6 +9,7 @@ Also provides fork-provider selection helper (step 6.3).
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,6 +28,41 @@ class ChatInfo:
     project: str | None
     mtime: float
     preview: str
+    prompt: str
+
+
+_META_LINE_RE = re.compile(r"^\s*<meta>.*</meta>\s*$")
+
+
+def _prompt_excerpt(text: str, limit: int = 120) -> str:
+    """The chat's prompt string, per plan §0b: the first 120 characters of the
+    user's prompt, with newlines and tabs replaced by spaces.
+
+    1. Drop leading ``<meta>…</meta>`` marker line(s).
+    2. Prefer the body of the first ``## USER`` turn (after the header up to
+       the next ``## `` header or end of text); without a header, the whole
+       remaining text.
+    3. Collapse runs of whitespace into single spaces.
+    4. Hard-cut to ``limit`` characters (no ellipsis).
+    """
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    start = 0
+    while start < len(lines) and _META_LINE_RE.match(lines[start]):
+        start += 1
+    body = "\n".join(lines[start:])
+
+    header = re.search(r"^## USER\s*$", body, re.MULTILINE)
+    if header:
+        body = body[header.end() :]
+        nxt = re.search(r"^## ", body, re.MULTILINE)
+        if nxt:
+            body = body[: nxt.start()]
+
+    collapsed = re.sub(r"\s+", " ", body).strip()
+    return collapsed[:limit]
 
 
 @dataclass(frozen=True)
@@ -165,6 +201,7 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
             project=getattr(ref, "project", None),
             mtime=getattr(ref, "mtime", 0),
             preview=preview,
+            prompt=_prompt_excerpt(text),
         ))
 
     return results

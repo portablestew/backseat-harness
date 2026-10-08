@@ -21,6 +21,7 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -87,6 +88,22 @@ class TaskInfo:
     updated_at: float
 
 
+def _raw_state_status(task_dir: Path) -> str | None:
+    """Raw ``status`` string from ``state.json`` if it parses as JSON.
+
+    ``TaskState.from_dict`` raises when a status value is not one of the enum
+    members, which would coerce the lane to ``continue`` and hide the real
+    value from the ``data-status`` hook; this fallback keeps unknown statuses
+    visible (goal G5: unknown keeps the grey badge default).
+    """
+    try:
+        raw = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = raw.get("status") if isinstance(raw, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 def _lane_info(task_dir: Path) -> TaskInfo:
     slug = task_dir.name
     goal_path = task_dir / "goal.md"
@@ -100,7 +117,7 @@ def _lane_info(task_dir: Path) -> TaskInfo:
             except OSError:
                 pass
     except Exception:
-        status = TaskStatus.CONTINUE
+        status = _raw_state_status(task_dir) or TaskStatus.CONTINUE
         try:
             updated_at = goal_path.stat().st_mtime
         except OSError:
@@ -121,12 +138,19 @@ def list_tasks(workspace: Path | str) -> list[TaskInfo]:
 
 
 def list_incomplete(workspace: Path | str) -> list[TaskInfo]:
-    """Lanes whose status is not ``complete`` (V10 table)."""
+    """Active lanes: every lane whose status is not ``complete`` (V10 table,
+    uncapped -- the original design lists all incomplete work)."""
     return [i for i in list_tasks(workspace) if i.status != TaskStatus.COMPLETE.value]
 
 
-def list_recent(workspace: Path | str, limit: int = 20) -> list[TaskInfo]:
-    """All lanes, newest first, capped at ``limit`` (V11)."""
+def list_complete(workspace: Path | str) -> list[TaskInfo]:
+    """Completed lanes: the analogue of ``list_incomplete`` for the
+    "Completed tasks" section (goal G6)."""
+    return [i for i in list_tasks(workspace) if i.status == TaskStatus.COMPLETE.value]
+
+
+def list_recent(workspace: Path | str, limit: int = 10) -> list[TaskInfo]:
+    """The newest lanes across statuses, capped (V11; 10 per goal G6)."""
     return list_tasks(workspace)[:limit]
 
 
@@ -194,7 +218,7 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         reason = state.reason
         updated_at = state.updated_at
     except Exception:
-        status = TaskStatus.CONTINUE.value
+        status = _raw_state_status(task_dir) or TaskStatus.CONTINUE.value
         iteration = 0
         generation = 1
         reason = ""

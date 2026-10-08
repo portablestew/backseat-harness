@@ -38,14 +38,23 @@ class PTYSessionManager:
         self._sessions: dict[str, PTYSession] = {}
         self._lock = threading.Lock()
 
-    def create_session(self, cmd: list[str], cwd: str | Path) -> str:
+    def create_session(
+        self,
+        cmd: list[str],
+        cwd: str | Path,
+        cols: int | None = None,
+        rows: int | None = None,
+    ) -> str:
         """Create a new PTY session and start its reader thread.
+
+        ``cols/rows`` (plan 3g) set the initial terminal size at spawn so the
+        first paint matches the page before the client's resize frame arrives.
 
         Returns the session ID.
         """
         session_id = uuid.uuid4().hex[:12]
         backend = get_pty_backend()
-        backend.spawn(cmd, cwd)
+        backend.spawn(cmd, cwd, cols=cols, rows=rows)
 
         session = PTYSession(id=session_id, backend=backend)
         with self._lock:

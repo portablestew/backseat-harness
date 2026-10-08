@@ -106,12 +106,26 @@
         term.loadAddon(new WebLinksAddon.WebLinksAddon());
 
         term.open(document.getElementById('terminal-container'));
-        fitAddon.fit();
 
+        // Declare the socket up front (the resize handler below runs during
+        // the first fit(), before connect()).
         const statusBar = document.getElementById('status-bar');
         let ws = null;
         let reconnectAttempts = 0;
         const maxReconnectAttempts = 5;
+
+        // Register the resize handler BEFORE fit() (plan 3g): fit() fires
+        // onResize synchronously, so that first frame carries the real
+        // page-width metrics instead of being dropped before any handler
+        // existed.
+        // Send resize on terminal resize
+        term.onResize(({ cols, rows }) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+            }
+        });
+
+        fitAddon.fit();
 
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -124,6 +138,10 @@
                 statusBar.textContent = 'Connected';
                 statusBar.classList.remove('hidden');
                 reconnectAttempts = 0;
+                // Announce the real terminal size right after connecting
+                // (plan 3g): the PTY stops defaulting to 80 columns and the
+                // first output renders at page width.
+                ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
             };
 
             ws.onmessage = (event) => {

@@ -83,7 +83,15 @@ class WinPTYBackend(BasePTYBackend):
         self._process = None
         self._pty = None
 
-    def spawn(self, cmd: list[str], cwd: str | Path) -> None:
+    def spawn(
+        self, cmd: list[str], cwd: str | Path,
+        cols: int | None = None, rows: int | None = None,
+    ) -> None:
+        """Spawn ``cmd`` in a PTY at ``cwd``; ``cols/rows`` set the initial
+        terminal size (plan 3g) so the first paint matches the page width.
+
+        The size is applied via the existing :meth:`set_size` right after the
+        spawn, before the reader thread starts."""
         try:
             import winpty
         except ImportError as e:
@@ -95,6 +103,8 @@ class WinPTYBackend(BasePTYBackend):
         # Pass argv list directly to winpty; it handles list2cmdline internally
         self._pty = winpty.PtyProcess.spawn(cmd, cwd=str(cwd))
         self._process = self._pty
+        if cols is not None and rows is not None:
+            self.set_size(cols, rows)
 
     def read(self, size: int = 1024) -> bytes:
         if self._pty is None:
@@ -152,7 +162,12 @@ class PosixPTYBackend(BasePTYBackend):
     def __init__(self) -> None:
         self._process = None
 
-    def spawn(self, cmd: list[str], cwd: str | Path) -> None:
+    def spawn(
+        self, cmd: list[str], cwd: str | Path,
+        cols: int | None = None, rows: int | None = None,
+    ) -> None:
+        """Spawn ``cmd`` in a PTY at ``cwd``; ``cols/rows`` set the initial
+        terminal size (plan 3g), applied via :meth:`set_size` after the spawn."""
         try:
             import ptyprocess
         except ImportError as e:
@@ -162,6 +177,8 @@ class PosixPTYBackend(BasePTYBackend):
             ) from e
 
         self._process = ptyprocess.PtyProcessUnicode.spawn(cmd, cwd=str(cwd))
+        if cols is not None and rows is not None:
+            self.set_size(cols, rows)
 
     def read(self, size: int = 1024) -> bytes:
         if self._process is None:

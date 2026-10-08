@@ -1,24 +1,14 @@
 {% extends "base.html" %}
 {% block title %}{{ ws_name }} - backseat-harness{% endblock %}
 {% block content %}
+{% block nav %}<p class="nav-back"><a href="/">← Workspaces</a></p>{% endblock %}
 <header>
   <h2>{{ ws_name }}</h2>
   <small>{{ ws_path }}</small>
 </header>
 
 <section>
-  <h3>Add Task</h3>
-  <form method="post" action="/ws/{{ ws_id }}/tasks">
-    <label for="task-name">Task name</label>
-    <input id="task-name" name="name" type="text" placeholder="My task" required>
-    <label for="task-goal">Goal prompt</label>
-    <textarea id="task-goal" name="goal" rows="3" placeholder="What should be done?" required></textarea>
-    <button type="submit">Add task</button>
-  </form>
-</section>
-
-<section>
-  <h3>Incomplete Tasks</h3>
+  <h3>Active tasks</h3>
   <table>
     <thead>
       <tr>
@@ -31,12 +21,49 @@
       {% for t in incomplete %}
       <tr>
         <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
-        <td><span class="badge">{{ t.badge }}</span></td>
+        <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
       {% else %}
       <tr>
-        <td colspan="3">No incomplete tasks.</td>
+        <td colspan="3">No active tasks.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<details id="add-task" class="expander add-task">
+  <summary class="expander-plus" title="Add task" aria-label="Add task">+</summary>
+  <form method="post" action="/ws/{{ ws_id }}/tasks">
+    <label for="task-name">Task name</label>
+    <input id="task-name" name="name" type="text" placeholder="My task" required>
+    <label for="task-goal">Goal prompt</label>
+    <textarea id="task-goal" name="goal" rows="3" placeholder="What should be done?" required></textarea>
+    <button type="submit">Add task</button>
+  </form>
+</details>
+
+<section>
+  <h3>Completed tasks</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Task</th>
+        <th>Status</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in complete %}
+      <tr>
+        <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
+        <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
+        <td><small>{{ t.updated_at | format_datetime }}</small></td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="3">No completed tasks.</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -44,7 +71,7 @@
 </section>
 
 <section>
-  <h3>Top 20 Recent Tasks</h3>
+  <h3>Recent tasks</h3>
   <table>
     <thead>
       <tr>
@@ -57,7 +84,7 @@
       {% for t in recent %}
       <tr>
         <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
-        <td><span class="badge">{{ t.badge }}</span></td>
+        <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
       {% else %}
@@ -70,28 +97,50 @@
 </section>
 
 <section>
-  <h3>Top 20 Recent Chats</h3>
+  <h3>Recent chats</h3>
   <table>
     <thead>
       <tr>
-        <th>Session</th>
-        <th>Preview</th>
+        <th>Prompt</th>
         <th>Updated</th>
       </tr>
     </thead>
     <tbody>
       {% for c in recent_chats %}
       <tr>
-        <td>{{ c.native_id }}</td>
-        <td><small>{{ c.preview }}</small></td>
+        <td><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
         <td><small>{{ c.mtime | format_datetime }}</small></td>
       </tr>
       {% else %}
       <tr>
-        <td colspan="3">No recent chats.</td>
+        <td colspan="2">No recent chats.</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
 </section>
+
+<details id="other-chats">
+  <summary>Other chats</summary>
+  <table>
+    <thead>
+      <tr>
+        <th>Prompt</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in other_chats %}
+      <tr>
+        <td><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
+        <td><small>{{ c.mtime | format_datetime }}</small></td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="2">No other chats.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
 {% endblock %}
