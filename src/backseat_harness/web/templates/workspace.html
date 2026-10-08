@@ -1,11 +1,10 @@
-{% extends "base.html" %}
+{% extends "_chat_page.html" %}
 {% block title %}{{ ws_name }} - backseat-harness{% endblock %}
-{% block nav %}<p class="nav-back"><a href="/">← Workspaces</a></p>{% endblock %}
-{% block content %}
-<header>
-  <h3>{{ ws_name }}</h3>
-  <small>{{ ws_path }}</small>
-</header>
+{% block main_attrs %} data-auto-refresh="60"{% endblock %}
+{% block back %}<a class="chat-header-back" href="/">← Workspaces</a>{% endblock %}
+{% block heading %}{{ ws_name }}{% endblock %}
+{% block sub %}<small>{{ ws_path }}</small>{% endblock %}
+{% block body %}
 
 <section>
   <h4>Active tasks</h4>
@@ -25,7 +24,7 @@
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
       {% else %}
-      <tr>
+      <tr class="empty-row">
         <td colspan="3">No active tasks.</td>
       </tr>
       {% endfor %}
@@ -40,9 +39,37 @@
     <input id="task-name" name="name" type="text" placeholder="My task" required>
     <label for="task-goal">Goal prompt</label>
     <textarea id="task-goal" name="goal" rows="3" placeholder="What should be done?" required></textarea>
-    <button type="submit">Add task</button>
+    <button type="submit" id="add-task-submit" disabled>Add task</button>
   </form>
 </details>
+
+<script>
+  (function () {
+    var name = document.getElementById('task-name');
+    var goal = document.getElementById('task-goal');
+    var submit = document.getElementById('add-task-submit');
+    if (!name || !goal || !submit) return;
+    // Mirror services.task.sanitize_slug: NFKD-fold to ASCII, lowercase,
+    // collapse every other run to '-', trim leading/trailing '-_', and require
+    // something usable to remain; the button also needs a non-empty goal.
+    var slug = function (value) {
+      return value
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\x00-\x7F]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^[-_]+|[-_]+$/g, '')
+        .replace(/-{2,}/g, '-');
+    };
+    var sync = function () {
+      submit.disabled = !(slug(name.value).length > 0 && goal.value.trim().length > 0);
+    };
+    name.addEventListener('input', sync);
+    goal.addEventListener('input', sync);
+    sync();
+  })();
+</script>
 
 <section>
   <h4>Completed tasks</h4>
@@ -62,7 +89,7 @@
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
       {% else %}
-      <tr>
+      <tr class="empty-row">
         <td colspan="3">No completed tasks.</td>
       </tr>
       {% endfor %}
@@ -76,18 +103,20 @@
     <thead>
       <tr>
         <th>Prompt</th>
+        <th>Provider</th>
         <th>Updated</th>
       </tr>
     </thead>
     <tbody>
       {% for c in chats %}
-      <tr data-href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">
-        <td class="prompt"><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
+      <tr data-href="/chat/{{ c.provider }}/{{ c.native_id }}?ws={{ ws_id }}">
+        <td class="prompt"><a href="/chat/{{ c.provider }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
+        <td>{{ c.provider }}</td>
         <td><small>{{ c.mtime | format_datetime }}</small></td>
       </tr>
       {% else %}
-      <tr>
-        <td colspan="2">No other chats.</td>
+      <tr class="empty-row">
+        <td colspan="3">No other chats.</td>
       </tr>
       {% endfor %}
     </tbody>

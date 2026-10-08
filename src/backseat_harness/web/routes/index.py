@@ -15,6 +15,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from backseat_harness.web.services import task as task_service
 from backseat_harness.web.services import workspace as workspace_service
 
 router = APIRouter()
@@ -32,11 +33,40 @@ _POLL_ATTRS = (
 
 
 def _entries() -> list[dict[str, object]]:
-    """Workspace rows for templates: id + trailing name + full path (V4)."""
-    return [
-        {"id": ws_id, "name": workspace_service.display_name(p), "path": p}
-        for ws_id, p in workspace_service.list_workspaces_with_ids()
-    ]
+    """Workspace rows for templates: id + trailing name + full path (V4).
+
+    Also carries the homepage "Tasks" column: the newest task links (by task
+    directory mtime) and how many were left out (goal.md:25).
+    """
+    entries: list[dict[str, object]] = []
+    for ws_id, p in workspace_service.list_workspaces_with_ids():
+        slugs, more = task_service.list_recent_task_dirs(p)
+        entries.append(
+            {
+                "id": ws_id,
+                "name": workspace_service.display_name(p),
+                "path": p,
+                "tasks_html": _tasks_cell(ws_id, slugs, more),
+            }
+        )
+    return entries
+
+
+def _tasks_cell(ws_id: object, slugs: list[str], more: int) -> str:
+    """The homepage "Tasks" cell: task links plus a trailing "... and N more".
+
+    Built here so the full page (``index.html``) and the polled fragment
+    (``_fragment_html``) render byte-identical cells.
+    """
+    links = " ".join(
+        f'<a href="/ws/{ws_id}/tasks/{html.escape(slug, quote=True)}">'
+        f"{html.escape(slug)}</a>"
+        for slug in slugs
+    )
+    if more > 0:
+        more_text = f"... and {more} more"
+        links = f"{links} {more_text}" if links else more_text
+    return links
 
 
 def _toast_html(ok: bool, message: str) -> str:
@@ -50,12 +80,14 @@ def _fragment_html(entries: list[dict[str, object]]) -> str:
             f'          <tr data-href="/ws/{e["id"]}">'
             f'<td><a href="/ws/{e["id"]}">'
             f"<strong>{html.escape(str(e['name']))}</strong></a></td>"
-            f"<td><small>{html.escape(str(e['path']))}</small></td></tr>"
+            f"<td><small>{html.escape(str(e['path']))}</small></td>"
+            f'<td>{e["tasks_html"]}</td></tr>'
             for e in entries
         )
         body = (
             '    <table class="data-table">\n'
-            "      <thead><tr><th>Workspace</th><th>Path</th></tr></thead>\n"
+            "      <thead><tr><th>Workspace</th><th>Path</th><th>Tasks</th>"
+            "</tr></thead>\n"
             f"      <tbody>\n{rows}\n      </tbody>\n"
             "    </table>"
         )

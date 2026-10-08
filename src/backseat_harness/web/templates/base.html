@@ -59,6 +59,16 @@
       flex-direction: column;
       gap: 0.15rem;
     }
+    /* Top line (workspace name / task slug / chat prompt head) is modestly
+       larger; a long prompt excerpt collapses to one ellipsised line so it
+       cannot overflow the sticky bar. */
+    .chat-header-prompt > strong {
+      font-size: 1.15rem;
+      line-height: 1.25;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     /* The back link lives inside the sticky row so the header can pin at
        top: 0 from the first scroll pixel (rect.top equal before/after). It is
        styled blue like the back links on the other pages. */
@@ -73,8 +83,11 @@
     .chat-header-prompt small {
       color: var(--muted);
     }
+    /* Push the Continue/Fork/Takeover control to the bottom of the header so
+       it never overlaps the back link at the top of the prompt column. */
     .chat-header .chat-continue-form {
-      margin: 0;
+      align-self: flex-end;
+      margin: 0.6rem 0 0;
       flex-shrink: 0;
     }
     /* The Continue/Fork button: compact, so it does not tower over the
@@ -90,14 +103,15 @@
     .transcript {
       padding: 0.85rem 1rem;
       margin: 0.5rem 0 1rem;
+      /* Pico's <pre> has no max-height, so this box grew to the full transcript
+         height and captured the scroll with nothing to pan. Bound it so it
+         scrolls vertically itself; overscroll-behavior stays auto so
+         wheel/drag chains to the page once an edge is reached. */
+      max-height: 70vh;
       overflow: auto;
+      overscroll-behavior: auto;
     }
 
-    /* Back-links: "< Workspaces" from a workspace, "< [workspace name]" from
-       a task. */
-    .nav-back {
-      margin: 0 0 0.75rem;
-    }
     a {
       color: var(--accent);
     }
@@ -166,6 +180,10 @@
     textarea::placeholder {
       color: var(--muted);
     }
+    /* Compact text edit boxes shared by the run brief and the add forms. */
+    textarea {
+      font-size: 0.85rem;
+    }
 
     /* One table style for the home Workspaces list and the workspace Tasks /
        chats lists: a clean table with whole-row navigation and a hover
@@ -175,20 +193,36 @@
     .data-table {
       width: 100%;
     }
+    /* Only populated rows highlight. Empty listings are a single colspan cell
+       flagged .empty-row, so the hover never fires on them. */
     .data-table tbody tr[data-href] {
       cursor: pointer;
     }
-    .data-table tbody tr[data-href]:hover {
+    .data-table tbody tr:not(.empty-row):hover {
       background: var(--surface-hover);
     }
     .data-table td {
       vertical-align: middle;
     }
-    /* Prompts read best in a clean fixed-width face so truncation aligns. */
+    /* In-table links are quiet at rest and light up, underlined, only while
+       their row is hovered. */
+    .data-table a {
+      text-decoration: none;
+    }
+    .data-table tbody tr:not(.empty-row):hover a {
+      text-decoration: underline;
+      color: var(--accent-hover);
+    }
+    /* The Other-chats prompt reads beside the Updated date, so both take one
+       size (0.8em == the <small> date cell). The prompt keeps its clean
+       fixed-width face so truncation aligns. */
+    .data-table small,
+    .prompt {
+      font-size: 0.8em;
+    }
     .prompt {
       font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
         "Liberation Mono", monospace;
-      font-size: 0.85rem;
     }
 
     /* Expander: a disclosure whose collapsed control is a round "+" and whose
@@ -231,6 +265,11 @@
       position: absolute;
       top: 50%;
       left: 50%;
+      /* Pico's details summary::after carries a margin-inline-start that
+         shifted the vertical bar right (the old "-|" glyph); clear it and the
+         float so both strokes share one centre and cross. */
+      margin: 0;
+      float: none;
       width: 0.7rem;
       height: 2px;
       border-radius: 1px;
@@ -362,9 +401,32 @@
       window.location.href = row.getAttribute('data-href');
     });
   </script>
+  <script>
+    // Opt-in auto-refresh (goal.md:3): a page sets data-auto-refresh="<seconds>"
+    // on <main> (or via the main_attrs block) to reload itself on a timer. This
+    // script runs in <head>, before <main> exists, so it waits for
+    // DOMContentLoaded before querying the attribute. It pauses while the user
+    // is typing in a field or has a + expander open, then reschedules rather
+    // than reloading mid-edit.
+    document.addEventListener('DOMContentLoaded', function () {
+      var root = document.querySelector('[data-auto-refresh]');
+      if (!root) return;
+      var seconds = parseInt(root.getAttribute('data-auto-refresh'), 10);
+      if (!seconds || seconds < 1) seconds = 60;
+      var schedule = function () { window.setTimeout(tick, seconds * 1000); };
+      var tick = function () {
+        var el = document.activeElement;
+        var typing = el && /^(input|textarea|select)$/i.test(el.tagName);
+        var openPanel = document.querySelector('details.expander[open]');
+        if (typing || openPanel) { schedule(); return; }
+        window.location.reload();
+      };
+      schedule();
+    });
+  </script>
 </head>
 <body>
-  <main class="container">
+  <main class="container"{% block main_attrs %}{% endblock %}>
     {% block nav %}{% endblock %}
     {% block content %}{% endblock %}
     <div id="toast" aria-live="polite"></div>

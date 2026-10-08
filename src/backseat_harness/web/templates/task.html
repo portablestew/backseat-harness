@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ task.slug }} - {{ ws_name }} - backseat-harness{% endblock %}
+{% block main_attrs %} data-auto-refresh="60"{% endblock %}
 {% block content %}
 <style>
   /* Task page: mirror the chat page's flush sticky header, and lay Status
@@ -19,14 +20,18 @@
       grid-template-columns: 1fr;
     }
   }
-  /* Iteration / Generation / Reason: a header-less table (no <thead>). */
+  /* Iteration / Generation / Reason: a header-less table (no <thead>) styled
+     like the checklist .data-table -- an outer margin and a divider under each
+     row -- while the key/value rows stay non-hoverable. */
   .task-meta {
     width: 100%;
-    margin: 0;
+    margin: 0.5rem 0 1rem;
+    border-collapse: collapse;
   }
   .task-meta td {
     border: 0;
-    padding: 0.15rem 0;
+    border-bottom: 1px solid var(--border);
+    padding: 0.35rem 0;
   }
   .task-meta td:first-child {
     color: var(--muted);
@@ -116,10 +121,10 @@
     <h4>Run</h4>
     <form class="run-form" method="post" action="/ws/{{ ws_id }}/tasks/{{ task.slug }}/run">
       <label for="brief">
-        {% if task.status == "continue" %}Interrupt this task with an added instruction{% else %}Restart this task with an added instruction{% endif %}
+        {{ task.run_action }} this task with an added instruction
       </label>
       <textarea id="brief" name="brief" rows="2" placeholder="Additional instruction for this run..." required></textarea>
-      <button type="submit" id="run-submit" disabled>Run task</button>
+      <button type="submit" id="run-submit" disabled>{{ task.run_action }} task</button>
     </form>
   </section>
 </div>

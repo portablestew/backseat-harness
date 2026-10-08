@@ -25,6 +25,7 @@ class ChatInfo:
     """One chat session for the workspace page listing."""
 
     key: str
+    provider: str
     native_id: str
     project: str | None
     mtime: float
@@ -33,6 +34,9 @@ class ChatInfo:
 
 
 _META_LINE_RE = re.compile(r"^\s*<meta>.*</meta>\s*$")
+# chat_fork quotes USER/ASSISTANT lines with a leading blockquote marker; drop
+# one marker (and a single following space) so the listing shows the prompt.
+_QUOTE_PREFIX_RE = re.compile(r"^\s*>\s?")
 
 
 def _prompt_excerpt(text: str, limit: int = 120) -> str:
@@ -43,10 +47,13 @@ def _prompt_excerpt(text: str, limit: int = 120) -> str:
     2. Prefer the body of the first ``## USER`` turn (after the header up to
        the next ``## `` header or end of text); without a header, the whole
        remaining text.
-    3. Skip leading empty lines and a bare ``USER`` role label, so the excerpt
+    3. Strip a leading ``"> "`` (or a bare ``">"``) from every line --
+       chat_fork quotes the USER/ASSISTANT messages, which is noise in a
+       listing.
+    4. Skip leading empty lines and a bare ``USER`` role label, so the excerpt
        starts at the actual prompt text.
-    4. Collapse runs of whitespace into single spaces.
-    5. Cut to ``limit`` characters and append ``"..."`` when text was dropped.
+    5. Collapse runs of whitespace into single spaces.
+    6. Cut to ``limit`` characters and append ``"..."`` when text was dropped.
     """
     if not text:
         return ""
@@ -64,7 +71,7 @@ def _prompt_excerpt(text: str, limit: int = 120) -> str:
         if nxt:
             body = body[: nxt.start()]
 
-    body_lines = body.splitlines()
+    body_lines = [_QUOTE_PREFIX_RE.sub("", line) for line in body.splitlines()]
     i = 0
     while i < len(body_lines):
         stripped = body_lines[i].strip()
@@ -243,6 +250,7 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
 
             results.append(ChatInfo(
                 key=ref.key,
+                provider=_extract_provider_from_key(ref.key) or "",
                 native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
                 project=project_dir,
                 mtime=getattr(ref, "mtime", 0),

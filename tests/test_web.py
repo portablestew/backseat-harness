@@ -128,6 +128,128 @@ def test_homepage_without_workspaces_says_so():
     assert "No workspaces registered yet." in resp.text
 
 
+def _home_row(html: str, ws_id: int) -> str:
+    """The homepage ``<tr>`` for ``ws_id`` (row navigation via ``data-href``)."""
+    marker = html.index(f'data-href="/ws/{ws_id}"')
+    start = html.rindex("<tr", 0, marker)
+    return html[start : html.index("</tr>", marker) + len("</tr>")]
+
+
+def _home_tasks_cell(html: str, ws_id: int) -> str:
+    """Inner HTML of the "Tasks" ``<td>`` on that row (last cell)."""
+    row = _home_row(html, ws_id)
+    return re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)[-1]
+
+
+def test_add_workspace_button_label_and_disabled_until_path():
+    """The homepage add control reads "Add workspace", starts disabled, and a
+    small inline script re-evaluates on every input event, so a path that is
+    empty after trimming keeps it disabled (goal.md:7 / plan 3b)."""
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    body = page.text
+    button = re.search(
+        r"<button\b[^>]*id=\"add-workspace-submit\"[^>]*>(.*?)</button>",
+        body,
+        re.S,
+    )
+    assert button is not None
+    assert button.group(1).strip() == "Add workspace"
+    assert "disabled" in button.group(0)
+    assert ">Add<" not in body
+    # The enabling JS is keyed off the path input and listens for input events.
+    assert "getElementById('ws-path')" in body
+    assert "getElementById('add-workspace-submit')" in body
+    assert "addEventListener('input'" in body
+    assert "input.value.trim().length === 0" in body
+
+
+@pytest.mark.parametrize(
+    ("count", "more_text"),
+    [(0, None), (3, None), (4, "... and 1 more")],
+)
+def test_homepage_tasks_column_latest_three_plus_more(workspace, count, more_text):
+    """The homepage Tasks column links up to three task pages and appends
+    "... and N more"; a workspace with 0 tasks renders an empty cell. Page and
+    polled fragment render the same cell (goal.md:25)."""
+    slugs = ["lane-a", "lane-b", "lane-c", "lane-d"][:count]
+    tasks_root = workspace / ".backseat" / "tasks"
+    for i, slug in enumerate(slugs):
+        when = 1_700_000_000.0 + i
+        _write_lane(workspace, slug, status="continue", updated_at=when)
+        os.utime(tasks_root / slug, (when, when))
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get("/")
+        fragment = client.get("/workspaces/fragment")
+
+    assert page.status_code == 200
+    assert fragment.status_code == 200
+    for html in (page.text, fragment.text):
+        cell = _home_tasks_cell(html, ws_id)
+        links = re.findall(r'<a href="(/ws/\d+/tasks/[^"]+)">([^<]+)</a>', cell)
+        assert len(links) == min(count, 3)
+        if count == 0:
+            assert cell.strip() == ""
+        if more_text:
+            assert more_text in cell
+        else:
+            assert "more" not in cell
+
+
+def test_homepage_tasks_column_orders_by_task_dir_mtime(workspace):
+    """The Tasks column orders by each task directory's own ``st_mtime``,
+    newest first, and drops all but the newest three -- set explicitly here
+    with ``os.utime`` since the state's ``updated_at`` is a different clock
+    (goal.md:25 / plan decision 3)."""
+    lanes = {
+        "oldest": 1_700_000_000.0,
+        "older": 1_700_000_100.0,
+        "newer": 1_700_000_200.0,
+        "newest": 1_700_000_300.0,
+    }
+    tasks_root = workspace / ".backseat" / "tasks"
+    for slug, when in lanes.items():
+        _write_lane(workspace, slug, status="continue", updated_at=when)
+        os.utime(tasks_root / slug, (when, when))
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    cell = _home_tasks_cell(page.text, ws_id)
+    shown = re.findall(r'<a href="/ws/\d+/tasks/([^"]+)">', cell)
+    assert shown == ["newest", "newer", "older"]
+    assert "... and 1 more" in cell
+    assert "oldest" not in cell
+
+
+def test_homepage_task_links_inherit_row_hover_and_open_the_task(workspace):
+    """The Tasks-column links sit inside the same ``.data-table`` row, so they
+    inherit 3a's row hover + underline, and the delegated row-click handler
+    bails on anchors, so the link's own task URL wins over the row's workspace
+    URL (goal.md:9-11, 25)."""
+    _write_lane(workspace, "lane-a", status="continue", updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get("/")
+
+    body = page.text
+    row = _home_row(body, ws_id)
+    assert f'href="/ws/{ws_id}/tasks/lane-a"' in row
+    assert f'data-href="/ws/{ws_id}"' in row
+    # 3a: only populated rows highlight; in-cell links underline on row hover.
+    assert "tbody tr:not(.empty-row):hover" in body
+    assert "tr:not(.empty-row):hover a" in body
+    # The click handler bails on anchors, so the task link's href wins.
+    assert "closest('a, button, form, input, textarea, select')" in body
+
+
 def test_base_uses_dark_theme():
     """The shared layout is unconditionally dark: Pico's ``data-theme="dark"``
     pins the palette regardless of the OS and ``color-scheme: dark`` locks
@@ -1030,7 +1152,8 @@ def test_page_and_section_headers_are_one_level_smaller(
     assert "<h3>Workspaces</h3>" in home.text
     assert "<h2>Workspaces</h2>" not in home.text
     assert "<h3>Session Search</h3>" in search.text
-    assert f"<h3>{workspace.name}</h3>" in page.text
+    # The workspace page title is the chat-style header <strong>, not a heading.
+    assert f"<h3>{workspace.name}</h3>" not in page.text
     assert "<h4>Active tasks</h4>" in page.text
     assert "<h4>Completed tasks</h4>" in page.text
     assert "<h4>Other chats</h4>" in page.text
@@ -1042,9 +1165,8 @@ def test_workspace_page_back_nav_and_add_task_expander_after_active(
 ):
     """The workspace page gets exactly one back-link to ``/`` and the add-task
     form becomes a ``+`` expander placed after the (incomplete/Active) tasks
-    table, still POSTing to ``/ws/{id}/tasks`` (goal G4 / plan 3c; the doubled
-    back-link from nesting the ``nav`` block inside ``content`` is fixed by the
-    owner brief)."""
+    table, still POSTing to ``/ws/{id}/tasks`` (goal G4 / plan 3c; the back link
+    now rides the shared chat-style header)."""
     ws_id = _register_workspace(workspace)
 
     with _client() as client:
@@ -1052,9 +1174,9 @@ def test_workspace_page_back_nav_and_add_task_expander_after_active(
 
     assert resp.status_code == 200
     page = resp.text
-    assert '<p class="nav-back"><a href="/">← Workspaces</a></p>' in page
+    assert '<a class="chat-header-back" href="/">← Workspaces</a>' in page
     # Exactly one: the link is not rendered twice (stacked).
-    assert page.count('<p class="nav-back">') == 1
+    assert page.count('class="chat-header-back"') == 1
 
     # Form moved into the expander, after the incomplete (Active) table. The
     # glyph is drawn by the stylesheet, not a literal summary character.
@@ -1071,6 +1193,66 @@ def test_workspace_page_back_nav_and_add_task_expander_after_active(
     active_table_end = page.index("</table>", page.index("Active tasks"))
     assert start > active_table_end
     assert start < page.index("Completed tasks")
+
+
+def test_workspace_header_matches_chat_style_without_actions(workspace: Path):
+    """The workspace page reuses the shared chat-page header: one back link,
+    workspace name as the top line over the workspace dir, and no fork or
+    takeover control (goal.md:13, 27 / plan 3c)."""
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+
+    assert resp.status_code == 200
+    html = resp.text
+    assert '<header class="chat-header">' in html
+    assert html.count('class="chat-header-back"') == 1
+    assert '<a class="chat-header-back" href="/">← Workspaces</a>' in html
+
+    header = html[html.index('class="chat-header">') : html.index("</header>")]
+    name = f"<strong>{workspace.name}</strong>"
+    path = f"<small>{workspace.resolve()}</small>"
+    assert name in header
+    assert path in header
+    # Name is the top line; the workspace dir sits beneath it.
+    assert header.index(name) < header.index(path)
+
+    # No fork/takeover controls anywhere on this page.
+    assert ">Fork<" not in html
+    assert ">Takeover<" not in html
+    assert "/search/fork" not in html
+    assert 'class="chat-continue-form"' not in html
+
+
+def test_workspace_page_auto_refreshes_every_60s(workspace: Path):
+    """The workspace page opts into the shared 1-minute auto-refresh; the
+    homepage keeps its own HTMX poll and does not carry the hook. The helper
+    pauses while typing or an expander is open (goal.md:3 / plan 3c)."""
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+        home = client.get("/")
+
+    assert page.status_code == 200
+    assert '<main class="container" data-auto-refresh="60">' in page.text
+    # The shared helper lives in the base layout and times a reload.
+    body = page.text
+    assert "window.location.reload()" in body
+    assert "details.expander[open]" in body
+    # The script sits in <head>, before <main> is parsed, so it must wait for
+    # DOMContentLoaded before querying the attribute -- otherwise root is null
+    # and the page never refreshes.
+    refresh_at = body.index("[data-auto-refresh]")
+    script_start = body.rindex("<script>", 0, refresh_at)
+    script = body[script_start : body.index("</script>", refresh_at)]
+    dom_ready = script.index("document.addEventListener('DOMContentLoaded'")
+    assert dom_ready < script.index("[data-auto-refresh]")
+    assert dom_ready < script.index("window.location.reload()")
+    # Homepage keeps the HTMX poll instead of the reload hook.
+    assert home.status_code == 200
+    assert 'data-auto-refresh="60"' not in home.text
 
 
 def test_home_and_workspace_lists_share_clickable_table_style(
@@ -1095,7 +1277,7 @@ def test_home_and_workspace_lists_share_clickable_table_style(
     assert f'data-href="/ws/{ws_id}/tasks/lane-a"' in page.text
     # Whole-row navigation and the hover highlight live in the shared layout.
     assert "tr[data-href]" in home.text
-    assert "tbody tr[data-href]:hover" in home.text
+    assert "tbody tr:not(.empty-row):hover" in home.text
     assert "closest('tr[data-href]')" in home.text
 
 
@@ -1232,6 +1414,158 @@ def test_task_page_run_copy_restarts_when_not_in_progress(workspace: Path):
     assert "Interrupt this task" not in page.text
     status = _section(page.text, "<h4>Status ")
     assert "(complete)" not in status and "(continue)" not in status
+
+
+def test_task_page_auto_refreshes_every_60s(workspace: Path):
+    """The task page opts into the shared 1-minute auto-refresh (goal.md:3 /
+    plan 3d), reusing the DOMContentLoaded-safe helper (e703a7b)."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "refresh-lane", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/refresh-lane")
+
+    assert page.status_code == 200
+    body = page.text
+    assert '<main class="container" data-auto-refresh="60">' in body
+    assert "window.location.reload()" in body
+    # Same ordering guard as the workspace page: the helper lives in <head> and
+    # must wait for DOMContentLoaded before reading the attribute.
+    refresh_at = body.index("[data-auto-refresh]")
+    script_start = body.rindex("<script>", 0, refresh_at)
+    script = body[script_start : body.index("</script>", refresh_at)]
+    assert script.index("document.addEventListener('DOMContentLoaded'") < script.index(
+        "[data-auto-refresh]"
+    )
+
+
+def test_task_status_table_has_margin_and_dividers(workspace: Path):
+    """Goal 7 / plan 3d: the header-less Iteration/Generation/Reason table gets
+    an outer margin and a divider under each row, like the checklist table."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(
+        workspace,
+        "meta-lane",
+        status="blocked",
+        reason="waiting",
+        updated_at=1_700_000_000.0,
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/meta-lane")
+
+    assert page.status_code == 200
+    html = page.text
+    meta_start = html.index('<table class="task-meta">')
+    meta = html[meta_start : html.index("</table>", meta_start)]
+    assert "<thead>" not in meta
+    assert "<th>" not in meta
+
+    rule = html[html.index(".task-meta {") :]
+    rule = rule[: rule.index("}")]
+    assert "margin: 0.5rem 0 1rem" in rule
+    cell = html[html.index(".task-meta td {") :]
+    cell = cell[: cell.index("}")]
+    assert "border-bottom: 1px solid var(--border)" in cell
+
+
+def test_workspace_expander_control_uses_shared_crossed_glyph(workspace: Path):
+    """Goal 2 / plan 3d: the add-task control renders as the shared
+    ``.expander-plus`` (no literal glyph character) whose strokes cross at the
+    centre -- the workspace page carries both the control and the rule."""
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    html = page.text
+    assert 'class="expander-plus"' in html
+    assert ">+</summary>" not in html
+    start = html.index(".expander-plus::before,")
+    rule = html[start : html.index("}", start)]
+    assert "top: 50%" in rule
+    assert "left: 50%" in rule
+    assert "translate(-50%, -50%)" in rule
+    assert "scaleY(0)" in html
+
+
+def test_back_links_are_not_underlined(workspace: Path):
+    """Goal 5 / plan 3d: the shared header back link is not underlined,
+    consistent across the workspace and task pages; the orphaned .nav-back
+    offset rule is gone."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "back-lane", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        css = client.get("/").text
+        ws_page = client.get(f"/ws/{ws_id}")
+        task_page = client.get(f"/ws/{ws_id}/tasks/back-lane")
+
+    rule = css[css.index(".chat-header-back {") :]
+    rule = rule[: rule.index("}")]
+    assert "text-decoration: none" in rule
+    assert '<a class="chat-header-back" href="/">← Workspaces</a>' in ws_page.text
+    assert 'class="chat-header-back"' in task_page.text
+    # The old back-link offset rule (workspace.html pre-3c) is gone.
+    assert ".nav-back" not in css
+
+
+def test_add_task_button_disabled_until_valid_name_and_goal(workspace: Path):
+    """Goal 9 / plan 3d: the add-task submit starts disabled, and a small inline
+    script re-checks on every input -- enabling only when the name sanitizes to
+    a usable slug and the goal has non-whitespace text (mirroring
+    services.task.sanitize_slug), like the homepage's Add workspace control."""
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    body = page.text
+    button = re.search(
+        r"<button\b[^>]*id=\"add-task-submit\"[^>]*>(.*?)</button>", body, re.S
+    )
+    assert button is not None
+    assert button.group(1).strip() == "Add task"
+    assert "disabled" in button.group(0)
+    # The enabling JS is keyed off both fields and mirrors sanitize_slug.
+    assert "getElementById('task-name')" in body
+    assert "getElementById('task-goal')" in body
+    assert "getElementById('add-task-submit')" in body
+    assert "addEventListener('input'" in body
+    assert ".normalize('NFKD')" in body
+    assert "[^a-z0-9_-]+" in body
+    assert "goal.value.trim().length > 0" in body
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (None, "Run"),
+        ("continue", "Interrupt"),
+        ("blocked", "Restart"),
+        ("complete", "Restart"),
+        ("mystery", "Restart"),
+    ],
+)
+def test_run_button_text_matches_task_state(workspace: Path, status, expected):
+    """Goal 15 / plan 3d: the Run block's label and button share one rule --
+    Run for a lane that has never run (no state.json), Interrupt while it is in
+    progress, Restart otherwise."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "state-lane", status=status, updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/state-lane")
+
+    assert page.status_code == 200
+    body = page.text
+    assert (
+        f'<button type="submit" id="run-submit" disabled>{expected} task</button>'
+        in body
+    )
+    assert f"{expected} this task with an added instruction" in body
 
 
 def _write_transcript_lane(workspace: Path, slug: str, body: str) -> None:
@@ -1604,6 +1938,103 @@ def test_workspace_page_other_chats_is_one_capped_list(
     assert "<th>Session</th>" not in resp.text
 
 
+def test_other_chats_strips_quote_prefix_in_rendered_prompt(
+    monkeypatch, workspace: Path
+):
+    """Goal 6 / plan 3e: a multi-line quoted prompt renders without any ``>``
+    marker -- the collapsed text lands in the prompt cell, and no escaped
+    ``&gt;`` survives in the table."""
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_quoted", mtime=300.0, project=str(workspace))]
+    transcripts = {
+        "opencode:ses_quoted": (
+            "## USER\n> plan the widget\n> then ship it\n"
+            "## ASSISTANT\n> done"
+        )
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    chats = _other_chats_section(page.text)
+    row = _data_rows(chats)[0]
+    assert "plan the widget then ship it" in row
+    assert "&gt;" not in row  # the quoting marker is gone entirely
+
+
+def test_other_chats_table_has_provider_column(monkeypatch, workspace: Path):
+    """Goal 16 / plan 3e: a Provider column sits between Prompt and Updated,
+    read from the row's own provider (the key prefix), exact per row."""
+    ws_id = _register_workspace(workspace)
+    refs = [
+        _Ref("opencode:ses_col_a", mtime=300.0, project=str(workspace)),
+        _Ref("kiro_ide_v2:sess_col_b", mtime=200.0, project=str(workspace)),
+    ]
+    _stub_chat_history(
+        monkeypatch,
+        refs,
+        {"opencode:ses_col_a": "chat a", "kiro_ide_v2:sess_col_b": "chat b"},
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    chats = _other_chats_section(page.text)
+    # Order: Prompt, Provider, Updated.
+    assert (
+        chats.index("<th>Prompt</th>")
+        < chats.index("<th>Provider</th>")
+        < chats.index("<th>Updated</th>")
+    )
+    rows = _data_rows(chats)  # newest first
+    assert "<td>opencode</td>" in rows[0]
+    assert "<td>kiro_ide_v2</td>" in rows[1]
+    assert 'href="/chat/opencode/ses_col_a?ws=' in rows[0]
+
+
+def test_other_chats_empty_state_spans_three_columns(monkeypatch, workspace: Path):
+    """Goal 16 / plan 3e: with no chats the empty-state row spans the new
+    three-column table."""
+    ws_id = _register_workspace(workspace)
+    _stub_chat_history(monkeypatch, [], {})
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    chats = _other_chats_section(page.text)
+    assert '<td colspan="3">No other chats.</td>' in chats
+
+
+def test_other_chats_prompt_font_matches_date(monkeypatch, workspace: Path):
+    """Goal 6 / plan 3e: the Other-chats prompt takes the date cell's size
+    (one shared ``0.8em`` rule for ``.data-table small`` and ``.prompt``); the
+    prompt keeps only its fixed-width family."""
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_size", mtime=300.0, project=str(workspace))]
+    _stub_chat_history(monkeypatch, refs, {"opencode:ses_size": "chat body"})
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    html = page.text
+    shared = html.index(".data-table small,")
+    rule_end = html.index("}", shared)
+    shared_rule = html[shared:rule_end]
+    assert ".prompt" in shared_rule
+    assert "font-size: 0.8em" in shared_rule
+
+    # The prompt's own rule keeps the family and no longer sets a size.
+    prompt_start = html.index(".prompt {", rule_end)
+    prompt_rule = html[prompt_start : html.index("}", prompt_start)]
+    assert "font-family: ui-monospace" in prompt_rule
+    assert "font-size" not in prompt_rule
+
+
 def test_other_chats_recovers_workspace_from_provider_store(
     monkeypatch, workspace: Path
 ):
@@ -1720,6 +2151,23 @@ def test_prompt_excerpt_normalizes_and_truncates():
     # A bare "USER" leading line and leading empty lines are skipped.
     assert excerpt("USER\n\nhello there") == "hello there"
     assert excerpt("\n\n  \nUSER\ncontent") == "content"
+
+
+def test_prompt_excerpt_strips_blockquote_prefix():
+    """Goal 6 / plan 3e: chat_fork quotes USER/ASSISTANT lines with a leading
+    ``> ``; the excerpt drops that marker from *every* line before collapsing,
+    so the listing shows the prompt text rather than the quoting."""
+    excerpt = chat_search_service._prompt_excerpt
+
+    quoted = (
+        "## USER\n> first line\n> second line\n> third line\n"
+        "## ASSISTANT\n> a reply"
+    )
+    assert excerpt(quoted) == "first line second line third line"
+    # A bare ">" (no space) and quoted blank lines carry no prompt text.
+    assert excerpt("## USER\n>\n>\n> hello") == "hello"
+    # A headerless transcript is stripped line by line too.
+    assert excerpt("> one\n> two") == "one two"
 
 
 def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: Path):
@@ -2253,3 +2701,137 @@ def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch)
         "--prompt",
         "Please fork kilo chat session sess_k",
     ]
+
+
+# --- step 3a: shared polish ----------------------------------------------------
+
+
+def test_data_table_rows_hover_and_links_underline_only_on_hover():
+    """Goal 4: populated rows highlight; in-table links stay quiet (no
+    underline) until their row is hovered, then underline and accent-light."""
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    css = page.text
+    assert ".data-table tbody tr:not(.empty-row):hover" in css
+
+    a_start = css.index(".data-table a {")
+    a_rule = css[a_start : css.index("}", a_start)]
+    assert "text-decoration: none" in a_rule
+
+    h_start = css.index(".data-table tbody tr:not(.empty-row):hover a {")
+    h_rule = css[h_start : css.index("}", h_start)]
+    assert "text-decoration: underline" in h_rule
+    assert "color: var(--accent-hover)" in h_rule
+
+
+def test_workspace_empty_and_chat_rows_use_shared_hover(monkeypatch, workspace: Path):
+    """Empty listings are inert .empty-row rows; Other chats rows are populated
+    and navigable, so they get the shared hover (goal 4)."""
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_hover", mtime=300.0, project=str(workspace))]
+    _stub_chat_history(monkeypatch, refs, {"opencode:ses_hover": "chat body"})
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    html = page.text
+    assert '<tr class="empty-row">' in html
+    chats = _other_chats_section(html)
+    assert 'data-href="/chat/opencode/ses_hover?ws=' in chats
+    assert ".data-table tbody tr:not(.empty-row):hover" in html
+
+
+def test_task_checklist_rows_hover_but_status_table_does_not(workspace: Path):
+    """The checklist is the shared .data-table, so its data-href-less rows
+    hover; the key/value .task-meta status table is not, so it never does
+    (goal 4)."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "hover-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal\n", encoding="utf-8")
+    (lane / "checklist.json").write_text(
+        json.dumps({"steps": {"1-a": {"title": "A", "status": "done"}}, "remarks": []}),
+        encoding="utf-8",
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/hover-lane")
+
+    assert page.status_code == 200
+    html = page.text
+    assert '<table class="task-meta">' in html
+    meta_start = html.index('<table class="task-meta">')
+    meta = html[meta_start : html.index("</table>", meta_start)]
+    assert 'class="data-table"' not in meta
+    cl_start = html.index('<table class="data-table">')
+    checklist = html[cl_start : html.index("</table>", cl_start)]
+    assert "<td>1-a</td>" in checklist
+    assert ".data-table tbody tr:not(.empty-row):hover" in html
+
+
+def test_expander_glyph_strokes_share_centre_and_collapse_to_minus():
+    """Goal 2: Pico's summary::after margin/float are cleared so both strokes
+    cross at the centre (was "-|"); expanded collapses to a clean minus."""
+    with _client() as client:
+        css = client.get("/").text
+
+    start = css.index(".expander-plus::before,")
+    rule = css[start : css.index("}", start)]
+    assert "position: absolute" in rule
+    assert "top: 50%" in rule
+    assert "left: 50%" in rule
+    assert "translate(-50%, -50%)" in rule
+    assert "margin: 0" in rule
+    assert "float: none" in rule
+    assert "scaleY(0)" in css
+
+
+def test_transcript_box_is_height_bounded_and_scrolls_vertically():
+    """Goal 14: the transcript box has a bounded height so it scrolls
+    vertically itself, and overscroll stays auto so it chains to the page."""
+    with _client() as client:
+        css = client.get("/").text
+
+    start = css.index(".transcript {")
+    rule = css[start : css.index("}", start)]
+    assert "max-height" in rule
+    assert "overflow: auto" in rule
+    assert "overscroll-behavior: auto" in rule
+
+
+def test_textareas_use_compact_font():
+    """Goal 8: one shared compact textarea size, so the run brief matches the
+    add forms rather than inheriting the 14px body size."""
+    with _client() as client:
+        html = client.get("/").text
+
+    assert "    textarea {\n      font-size: 0.85rem;\n    }" in html
+
+
+def test_top_header_text_larger_and_prompt_cannot_overflow():
+    """Goal 12: the top header line is modestly larger, and a long chat prompt
+    excerpt is clipped with an ellipsis so it fits the sticky bar."""
+    with _client() as client:
+        css = client.get("/").text
+
+    start = css.index(".chat-header-prompt > strong {")
+    rule = css[start : css.index("}", start)]
+    assert "font-size: 1.15rem" in rule
+    assert "overflow: hidden" in rule
+    assert "text-overflow: ellipsis" in rule
+    assert "white-space: nowrap" in rule
+
+
+def test_header_action_button_sits_below_back_link():
+    """Goal 13: the Continue/Fork/Takeover form is bottom-aligned and offset so
+    it cannot overlap the back link."""
+    with _client() as client:
+        css = client.get("/").text
+
+    start = css.index(".chat-header .chat-continue-form {")
+    rule = css[start : css.index("}", start)]
+    assert "align-self: flex-end" in rule
+    assert "margin: 0.6rem 0 0" in rule

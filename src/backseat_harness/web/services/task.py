@@ -78,6 +78,22 @@ def badge_for(status: TaskStatus | str) -> str:
     return "in progress"
 
 
+def run_action_for(task_dir: Path, status: str) -> str:
+    """Verb for the Run block, from the lane's state (goal.md:35).
+
+    A lane with no ``state.json`` has never run, so the control starts it
+    ("Run"). ``continue`` means it is still in flight, so running again
+    interrupts it with the new brief ("Interrupt"). Anything else is restarted
+    ("Restart"). One rule feeds both the label and the button so they cannot
+    drift.
+    """
+    if not (task_dir / "state.json").exists():
+        return "Run"
+    if status == TaskStatus.CONTINUE.value:
+        return "Interrupt"
+    return "Restart"
+
+
 @dataclass(frozen=True)
 class TaskInfo:
     """One task lane for the workspace page listings."""
@@ -154,6 +170,33 @@ def list_recent(workspace: Path | str, limit: int = 10) -> list[TaskInfo]:
     return list_tasks(workspace)[:limit]
 
 
+def list_recent_task_dirs(
+    workspace: Path | str, limit: int = 3
+) -> tuple[list[str], int]:
+    """Newest task-lane directory names by the directory's **own** mtime.
+
+    Returns ``(slugs, more)``: up to ``limit`` slugs, newest first, plus how
+    many lanes were left out. The homepage "Tasks" column orders by the task
+    directory's ``st_mtime`` as the goal asks, not ``TaskInfo.updated_at``
+    (goal.md:25).
+    """
+    tasks_dir = Path(workspace).expanduser().resolve() / ".backseat" / "tasks"
+    if not tasks_dir.is_dir():
+        return [], 0
+    lanes: list[tuple[float, str]] = []
+    for lane in tasks_dir.iterdir():
+        if not lane.is_dir():
+            continue
+        try:
+            mtime = lane.stat().st_mtime
+        except OSError:
+            continue
+        lanes.append((mtime, lane.name))
+    lanes.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    slugs = [name for _, name in lanes]
+    return slugs[:limit], max(0, len(slugs) - limit)
+
+
 def resolve_workspace(ws_id: int) -> Path | None:
     """Workspace path for a sqlite ``workspaces.id`` (URL key), or None."""
     from backseat_harness import db
@@ -177,6 +220,7 @@ class TaskDetail:
     goal: str
     status: str
     badge: str
+    run_action: str
     iteration: int
     generation: int
     reason: str
@@ -246,6 +290,7 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         goal=goal,
         status=status,
         badge=badge_for(status),
+        run_action=run_action_for(task_dir, status),
         iteration=iteration,
         generation=generation,
         reason=reason,
