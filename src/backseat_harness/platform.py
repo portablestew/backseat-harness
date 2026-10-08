@@ -77,7 +77,7 @@ class _WindowsPlatform(_PlatformImpl):
         return self.artifact_path().with_suffix(".bat")
 
     def _command_line(self) -> str:
-        return f'"{sys.executable}" -m backseat_harness.cli daemon run'
+        return f'"{sys.executable}" -m backseat_harness.cli daemon run --web'
 
     def _build_xml(self) -> str:
         wrapper = self._wrapper_path()
@@ -188,7 +188,7 @@ class _LinuxPlatform(_PlatformImpl):
         return f"""[Unit]
 Description=backseat-harness daemon
 [Service]
-ExecStart={sys.executable} -m backseat_harness.cli daemon run
+ExecStart={sys.executable} -m backseat_harness.cli daemon run --web
 Restart=always
 Environment=PATH={frozen_path}
 [Install]
@@ -267,6 +267,7 @@ class _MacOSPlatform(_PlatformImpl):
     <string>backseat_harness.cli</string>
     <string>daemon</string>
     <string>run</string>
+    <string>--web</string>
   </array>
   <key>KeepAlive</key>
   <true/>

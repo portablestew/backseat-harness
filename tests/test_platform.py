@@ -79,7 +79,11 @@ def test_windows_artifact_is_valid_task_xml_with_wrapper(monkeypatch, tmp_path):
     assert wrapper.exists(), "Wrapper .bat must exist with frozen PATH"
     wrapper_text = wrapper.read_text(encoding="utf-8")
     assert frozen_path in wrapper_text, "Wrapper must contain frozen PATH"
-    assert "-m backseat_harness.cli daemon run" in wrapper_text, "Wrapper must invoke daemon run"
+    # The launch line is the wrapper's last non-empty line: --web must be on it.
+    launch_line = [line for line in wrapper_text.splitlines() if line.strip()][-1]
+    assert launch_line == f'"{sys.executable}" -m backseat_harness.cli daemon run --web', (
+        "Wrapper must launch daemon run --web"
+    )
 
     # 3. Command-line assertions: no /SC /RL /IT alongside /XML
     calls = getattr(platform, "_SCHTASKS_CALLS", [])
@@ -131,7 +135,8 @@ def test_linux_service_artifact_and_systemctl_calls(monkeypatch, tmp_path):
     content = artifact.read_text(encoding="utf-8")
     assert "Restart=always" in content
     assert f"Environment=PATH={frozen_path}" in content
-    assert f"ExecStart={sys.executable} -m backseat_harness.cli daemon run" in content
+    exec_start = f"ExecStart={sys.executable} -m backseat_harness.cli daemon run --web"
+    assert exec_start in content.splitlines()
     assert "[Unit]" in content
     assert "[Service]" in content
     assert "[Install]" in content
@@ -177,8 +182,19 @@ def test_macos_plist_artifact_and_launchctl_calls(monkeypatch, tmp_path):
     assert f"<string>{frozen_path}</string>" in content
     assert "backseat-daemon" in content
     assert "ProgramArguments" in content
-    assert "daemon" in content
-    assert "run" in content
+    # ProgramArguments must be exactly the daemon run --web invocation.
+    root = ET.fromstring(content)
+    top = list(root.find("dict"))
+    values = dict(zip((k.text for k in top[::2]), top[1::2], strict=True))
+    program_args = [s.text for s in values["ProgramArguments"].findall("string")]
+    assert program_args == [
+        sys.executable,
+        "-m",
+        "backseat_harness.cli",
+        "daemon",
+        "run",
+        "--web",
+    ]
 
     assert any("bootstrap" in c for c in launchctl_calls), \
         "Expected bootstrap call"
@@ -205,3 +221,30 @@ def test_macos_plist_artifact_and_launchctl_calls(monkeypatch, tmp_path):
     restart_last = restart_verb[-1]
     assert "kickstart" not in " ".join(str(x) for x in [restart_last]), \
         "Restart must not use kickstart"
+
+
+def test_windows_register_twice_keeps_web_flag(monkeypatch, tmp_path):
+    """A second register (reinstall) rewrites the wrapper and keeps --web."""
+    win = platform._WindowsPlatform()
+    monkeypatch.setattr(win, "artifact_path", lambda: tmp_path / "backseat-daemon.xml")
+    monkeypatch.setattr(win, "_wrapper_path", lambda: tmp_path / "backseat-daemon-wrapper.bat")
+
+    win.register()
+    win.register()
+
+    wrapper_text = (tmp_path / "backseat-daemon-wrapper.bat").read_text(encoding="utf-8")
+    launch_line = [line for line in wrapper_text.splitlines() if line.strip()][-1]
+    assert launch_line.endswith(" -m backseat_harness.cli daemon run --web")
+
+
+def test_linux_register_twice_keeps_web_flag(monkeypatch, tmp_path):
+    """A second register (reinstall) rewrites the unit and keeps --web."""
+    linux = platform._LinuxPlatform()
+    monkeypatch.setattr(linux, "artifact_path", lambda: tmp_path / "backseat-daemon.service")
+
+    linux.register()
+    linux.register()
+
+    content = (tmp_path / "backseat-daemon.service").read_text(encoding="utf-8")
+    exec_start = f"ExecStart={sys.executable} -m backseat_harness.cli daemon run --web"
+    assert exec_start in content.splitlines()
