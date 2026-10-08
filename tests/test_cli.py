@@ -139,6 +139,98 @@ def test_takeover_opens_session_then_resumes(tmp_path, monkeypatch):
     assert resumed["first_prompt"] is None
 
 
+def test_takeover_prefers_binding_provider_over_config(tmp_path, monkeypatch):
+    """The binding's own provider wins over config for an existing chain.
+
+    Resuming a native session under a different CLI fails outright (an opencode
+    ``ses_`` id means nothing to ``claude --resume``), so a config switch may
+    not change the CLI out from under a bound session -- not for the
+    interactive handoff, and not for the resume that follows it.
+    """
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.config import load_config
+    from backseat_harness.models import Binding, Generation, TaskResult, TaskStatus
+
+    ws = tmp_path
+    (ws / ".backseat").mkdir()
+    (ws / ".backseat" / "config.toml").write_text(
+        '[harness]\nprovider = "claude"\n', encoding="utf-8"
+    )
+    config = load_config(ws)
+    paths = config.task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+    binding = Binding(root_uuid="root-1", provider="opencode")
+    binding.generations.append(Generation(n=1, native_id="ses_live"))
+    storage.save_binding(paths, binding)
+
+    seen = {}
+
+    def fake_run_interactive(provider, native_id, cwd):
+        seen["provider"] = provider.name
+        seen["native_id"] = native_id
+        return 0
+
+    def fake_run_task(**kwargs):
+        seen["resume_provider"] = kwargs["provider"].name
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli.spawn, "run_interactive", fake_run_interactive)
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
+
+    rc = main(["-C", str(ws), "takeover", "t"])
+    assert rc == 0
+    # Config says claude, the chain is opencode's: the binding's CLI must win.
+    assert seen["provider"] == "opencode"
+    assert seen["native_id"] == "ses_live"
+    assert seen["resume_provider"] == "opencode"
+
+
+def test_takeover_falls_back_when_binding_provider_unregistered(
+    tmp_path, monkeypatch, capsys
+):
+    """A binding whose provider this build no longer registers cannot win:
+    config decides, and the mismatch is named on stderr rather than swallowed.
+    """
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.config import load_config
+    from backseat_harness.models import Binding, Generation, TaskResult, TaskStatus
+
+    ws = tmp_path
+    config = load_config(ws)
+    paths = config.task_paths("t")
+    paths.root.mkdir(parents=True)
+    paths.goal.write_text("Goal\n", encoding="utf-8")
+    binding = Binding(root_uuid="root-1", provider="ghost")
+    binding.generations.append(Generation(n=1, native_id="ses_dead"))
+    storage.save_binding(paths, binding)
+
+    seen = {}
+
+    def fake_run_interactive(provider, native_id, cwd):
+        seen["provider"] = provider.name
+        return 0
+
+    def fake_run_task(**kwargs):
+        seen["resume_provider"] = kwargs["provider"].name
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli.spawn, "run_interactive", fake_run_interactive)
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
+
+    rc = main(["-C", str(ws), "takeover", "t"])
+    assert rc == 0
+    assert seen["provider"] == "opencode"
+    assert seen["resume_provider"] == "opencode"
+    err = capsys.readouterr().err
+    assert "binding provider 'ghost' is not registered" in err
+    assert "using configured provider 'opencode'" in err
+
+
 def test_takeover_no_resume_skips_loop(tmp_path, monkeypatch, capsys):
     import backseat_harness.cli as cli
     from backseat_harness.config import load_config
@@ -502,6 +594,44 @@ def test_run_sees_task_layer(tmp_path, monkeypatch):
     rc = main(["-C", str(ws), "run", "t", "Goal"])
     assert rc == 0
     assert seen["config"].provider == "claude"
+
+
+def test_run_prefers_binding_provider_over_config(tmp_path, monkeypatch):
+    """`run` resumes an existing chain under the binding's own provider.
+
+    The task-layer config may say claude while the chain was born on opencode;
+    the binding is what knows which CLI can resume that session, so it wins
+    for the managed side (config still resolves -- and is reported -- as
+    configured).
+    """
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.config import load_config
+    from backseat_harness.models import Binding, TaskResult, TaskStatus
+
+    ws = tmp_path
+    (ws / ".backseat").mkdir()
+    (ws / ".backseat" / "config.toml").write_text(
+        '[harness]\nprovider = "claude"\n', encoding="utf-8"
+    )
+    config = load_config(ws)
+    paths = config.task_paths("t")
+    paths.root.mkdir(parents=True)
+    storage.save_binding(paths, Binding(root_uuid="root-1", provider="opencode"))
+
+    seen = {}
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
+
+    def fake_run_task(**kwargs):
+        seen["provider"] = kwargs["provider"].name
+        seen["config_provider"] = kwargs["config"].provider
+        return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    rc = main(["-C", str(ws), "run", "t", "Goal"])
+    assert rc == 0
+    assert seen["config_provider"] == "claude"
+    assert seen["provider"] == "opencode"
 
 
 def test_cli_call_sites_pass_slug(tmp_path, monkeypatch, capsys):

@@ -34,10 +34,10 @@ from backseat_harness import platform as platform_mod
 from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
 from backseat_harness.daemon import Daemon
 from backseat_harness.loop import OperatorReply, run_task
-from backseat_harness.models import TaskStatus
+from backseat_harness.models import Binding, TaskStatus
 from backseat_harness.operator import load_persona
 from backseat_harness.providers import get_provider
-from backseat_harness.providers.base import Provider, SpawnSpec
+from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec
 from backseat_harness.spawn import run_turn
 
 
@@ -210,6 +210,29 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _managed_provider(config: Config, binding: Binding | None) -> Provider:
+    """Resolve the managed provider, preferring an existing binding's own.
+
+    A binding records which CLI owns its session chain (``Binding.provider``),
+    and resuming that chain under a different CLI fails outright: an opencode
+    ``ses_`` id means nothing to ``claude --resume``. So when a binding exists
+    and this build still registers its provider, that provider wins -- config
+    decides only for a fresh lane (no binding) or a binding whose provider has
+    left the registry, where falling back keeps the lane drivable and the
+    warning names the mismatch.
+    """
+    if binding is not None:
+        try:
+            return get_provider(binding.provider)
+        except ProviderError:
+            print(
+                f"[warn] binding provider {binding.provider!r} is not registered; "
+                f"using configured provider {config.provider!r}",
+                file=sys.stderr,
+            )
+    return get_provider(config.provider)
+
+
 def _cmd_init(args) -> int:
     config = load_config(args.workspace, args.slug)
     # Register the workspace first (goal:3-5): the row must exist before any
@@ -261,7 +284,7 @@ def _cmd_run(args) -> int:
             _emit(args, {"slug": args.slug, "error": block}, block)
             return 2
 
-    provider = get_provider(config.provider)
+    provider = _managed_provider(config, storage.load_binding(paths))
     managed_runner = run_turn
     operator_invoker = _make_operator_invoker(config, config.operator)
 
@@ -437,8 +460,8 @@ def _cmd_takeover(args) -> int:
                 if db.pid_live(pid, start):
                     spawn.kill_pid_tree(pid)
 
-    provider = get_provider(config.provider)
     binding = storage.load_binding(paths)
+    provider = _managed_provider(config, binding)
     native_id = binding.current.native_id if binding and binding.current else None
 
     where = f"session {native_id}" if native_id else "a fresh session"
