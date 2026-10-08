@@ -37,10 +37,12 @@ def _resolve_or_404(ws_id: int) -> Path | None:
 
 @router.get("/ws/{ws_id}", response_class=HTMLResponse)
 def workspace_page(request: Request, ws_id: int):
-    """Workspace page: Active/Completed/Recent tasks, Recent/Other chats.
+    """Workspace page: Active/Completed tasks and one capped "Other chats" list.
 
-    One ``list_recent_chats`` fetch (plan 3e) is split into the ten newest
-    non-task chats ("Recent chats") and "Other chats" (the rest, collapsed).
+    One ``list_recent_chats`` fetch feeds the single non-task "Other chats"
+    table (ten rows max, plan 3e superseded by the owner brief): there is no
+    separate "Recent chats" listing and no expandable overflow, and the old
+    "Recent tasks" section (which duplicated "Completed tasks") is gone.
     """
     ws_path = _resolve_or_404(ws_id)
     if ws_path is None:
@@ -49,10 +51,7 @@ def workspace_page(request: Request, ws_id: int):
     name = ws_path.name
     incomplete = task_service.list_incomplete(ws_path)
     complete = task_service.list_complete(ws_path)
-    recent = task_service.list_recent(ws_path)
-    chats = chat_search_service.list_recent_chats(ws_path, limit=50)
-    recent_chats = chats[:10]
-    other_chats = chats[10:]
+    chats = chat_search_service.list_recent_chats(ws_path, limit=10)
 
     return templates.TemplateResponse(
         request,
@@ -63,9 +62,7 @@ def workspace_page(request: Request, ws_id: int):
             "ws_path": str(ws_path),
             "incomplete": incomplete,
             "complete": complete,
-            "recent": recent,
-            "recent_chats": recent_chats,
-            "other_chats": other_chats,
+            "chats": chats,
         },
     )
 

@@ -2,7 +2,7 @@
 {% block title %}Session Search - backseat-harness{% endblock %}
 {% block content %}
 <header>
-  <h2>Session Search</h2>
+  <h3>Session Search</h3>
   <form method="get" action="/search">
     <label for="q">Query</label>
     <input id="q" name="q" type="text" value="{{ query }}" placeholder="Search sessions...">
@@ -11,7 +11,7 @@
 </header>
 
 <section>
-  <h3>Results ({{ results|length }})</h3>
+  <h4>Results ({{ results|length }})</h4>
   <table>
     <thead>
       <tr>

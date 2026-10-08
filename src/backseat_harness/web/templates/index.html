@@ -2,19 +2,29 @@
 {% block title %}Workspaces - backseat-harness{% endblock %}
 {% block content %}
 <section>
-  <h2>Workspaces</h2>
+  <h3>Workspaces</h3>
   <div id="workspace-list" hx-get="/workspaces/fragment" hx-trigger="every 60s, workspaceAdded from:body" hx-swap="outerHTML">
-    {% for ws in workspaces %}
-    <a class="workspace-card" href="/ws/{{ ws.id }}">
-      <strong>{{ ws.name }}</strong><br><small>{{ ws.path }}</small>
-    </a>
+    {% if workspaces %}
+    <table class="data-table">
+      <thead>
+        <tr><th>Workspace</th><th>Path</th></tr>
+      </thead>
+      <tbody>
+        {% for ws in workspaces %}
+        <tr data-href="/ws/{{ ws.id }}">
+          <td><a href="/ws/{{ ws.id }}"><strong>{{ ws.name }}</strong></a></td>
+          <td><small>{{ ws.path }}</small></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
     {% else %}
     <p>No workspaces registered yet.</p>
-    {% endfor %}
+    {% endif %}
   </div>
   <details id="add-workspace" class="expander"
            hx-get="/workspaces/suggest" hx-trigger="toggle" hx-target="#ws-suggestions" hx-swap="innerHTML">
-    <summary class="expander-plus" title="Add workspace" aria-label="Add workspace">+</summary>
+    <summary class="expander-plus" title="Add workspace" aria-label="Add workspace"></summary>
     <form hx-post="/workspaces" hx-target="#toast" hx-swap="innerHTML">
       <label for="ws-path">Path</label>
       <input id="ws-path" name="path" type="text" list="ws-suggestions"

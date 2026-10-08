@@ -60,14 +60,15 @@
       gap: 0.15rem;
     }
     /* The back link lives inside the sticky row so the header can pin at
-       top: 0 from the first scroll pixel (rect.top equal before/after). */
+       top: 0 from the first scroll pixel (rect.top equal before/after). It is
+       styled blue like the back links on the other pages. */
     .chat-header-back {
-      color: var(--muted);
+      color: var(--accent);
       text-decoration: none;
       font-weight: 600;
     }
     .chat-header-back:hover {
-      color: var(--text);
+      color: var(--accent-hover);
     }
     .chat-header-prompt small {
       color: var(--muted);
@@ -75,6 +76,21 @@
     .chat-header .chat-continue-form {
       margin: 0;
       flex-shrink: 0;
+    }
+    /* The Continue/Fork button: compact, so it does not tower over the
+       back link in the sticky row (owner brief: less tall, no overlap). */
+    .chat-header .chat-continue-form button {
+      width: auto;
+      padding: 0.3rem 0.85rem;
+      font-size: 0.85rem;
+      line-height: 1.3;
+    }
+    /* Transcript (and other read-only text) boxes: breathing room so the text
+       does not touch the walls or sit under the horizontal scrollbar. */
+    .transcript {
+      padding: 0.85rem 1rem;
+      margin: 0.5rem 0 1rem;
+      overflow: auto;
     }
 
     /* Back-links: "< Workspaces" from a workspace, "< [workspace name]" from
@@ -151,51 +167,52 @@
       color: var(--muted);
     }
 
-    /* Workspace cards */
-    .workspace-card {
-      display: block;
-      padding: 0.9rem 1.1rem;
-      margin-bottom: 0.6rem;
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      background: var(--surface);
-      color: var(--text);
-      text-decoration: none;
+    /* One table style for the home Workspaces list and the workspace Tasks /
+       chats lists: a clean table with whole-row navigation and a hover
+       highlight. A row carries ``data-href``; the delegated click handler at
+       the bottom of the page navigates, while in-cell links keep their own
+       behavior. */
+    .data-table {
+      width: 100%;
+    }
+    .data-table tbody tr[data-href] {
       cursor: pointer;
-      transition: background 0.15s ease, border-color 0.15s ease,
-        transform 0.05s ease, box-shadow 0.15s ease;
     }
-    .workspace-card:hover {
-      background: var(--surface-2);
-      border-color: var(--accent);
-      box-shadow: var(--shadow);
-      transform: translateY(-1px);
+    .data-table tbody tr[data-href]:hover {
+      background: var(--surface-hover);
     }
-    .workspace-card small {
-      color: var(--muted);
+    .data-table td {
+      vertical-align: middle;
+    }
+    /* Prompts read best in a clean fixed-width face so truncation aligns. */
+    .prompt {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+      font-size: 0.85rem;
     }
 
     /* Expander: a disclosure whose collapsed control is a round "+" and whose
-       expanded state becomes a bounded panel with the "+" pinned at its
+       expanded state becomes a bounded panel with the control pinned at its
        top-left and its body content inside it (used for add-workspace and
        add-task). Collapsed the control is just the round "+"; the panel is
        sized well under the page width. */
     .expander {
-      margin-top: 0.75rem;
+      margin-top: 0.5rem;
     }
     .expander-plus {
+      position: relative;
       display: inline-flex;
       place-items: center;
       align-items: center;
       justify-content: center;
       padding: 0;
-      width: 2.1rem;
-      height: 2.1rem;
+      width: 1.7rem;
+      height: 1.7rem;
       border: 1px solid var(--border);
       border-radius: 50%;
       background: var(--surface-2);
       color: var(--text);
-      font-size: 1.3rem;
+      font-size: 1.15rem;
       line-height: 1;
       list-style: none;
       cursor: pointer;
@@ -203,21 +220,39 @@
       transition: background 0.15s ease, border-color 0.15s ease,
         color 0.15s ease, box-shadow 0.15s ease;
     }
-    /* Pico draws its own disclosure triangle on summary::after; inside this
-       inline-flex control it lands as a second flex item, which both shows a
-       caret and knocks the "+" off-center. Suppress it, plus the native
-       marker the UA would draw, so the round control holds just the "+". */
+    /* The glyph is drawn as two bars centered on the control's exact midpoint,
+       so it centers geometrically rather than by font metrics, and collapses
+       to a minus while the panel is open. Pico draws its own disclosure
+       triangle on summary::after; these rules replace it, plus the native UA
+       marker, so the control holds just the glyph. */
+    .expander-plus::before,
     .expander-plus::after {
-      content: none;
-      display: none;
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 0.7rem;
+      height: 2px;
+      border-radius: 1px;
+      background: currentColor;
+      transform: translate(-50%, -50%);
+    }
+    .expander-plus::after {
+      width: 2px;
+      height: 0.7rem;
+    }
+    .expander[open] .expander-plus::after {
+      transform: translate(-50%, -50%) scaleY(0);
     }
     .expander-plus::-webkit-details-marker {
       display: none;
     }
+    /* Expanded and hover states stay on the surface palette (a barely lighter
+       panel) instead of the loud accent fill. */
     .expander-plus:hover {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: var(--accent-ink);
+      background: var(--surface-hover);
+      border-color: var(--border-hover);
+      color: var(--text);
       box-shadow: var(--shadow);
     }
     .expander[open] {
@@ -230,10 +265,10 @@
       box-shadow: var(--shadow);
     }
     .expander[open] .expander-plus {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: var(--accent-ink);
-      margin-bottom: 0.6rem;
+      background: var(--surface-hover);
+      border-color: var(--border-hover);
+      color: var(--text);
+      margin-bottom: 0.5rem;
     }
     .expander form {
       margin: 0;
@@ -243,6 +278,17 @@
       border: 0;
       background: transparent;
       box-shadow: none;
+    }
+    /* Compact forms inside an expander (Add workspace / Add task): smaller
+       input text and a smaller submit button (owner brief). */
+    .expander input,
+    .expander textarea {
+      font-size: 0.85rem;
+      padding: 0.35rem 0.6rem;
+    }
+    .expander button[type="submit"] {
+      font-size: 0.85rem;
+      padding: 0.35rem 0.8rem;
     }
 
     /* Badges */
@@ -256,16 +302,20 @@
       font-size: 0.75rem;
       font-weight: 600;
     }
-    /* Status colors (goal G5): complete green, in-progress (continue) amber,
+    /* Status colors (goal G5): complete green, in progress (continue) amber,
        blocked red; unknown statuses keep the grey default above. The color
-       rides ``data-status`` off the lane's raw status value, so badge text
-       mapping (services/task.badge_for) stays untouched. */
-    .badge[data-status="complete"] {
+       rides ``data-status`` off the raw status value, so badge text mapping
+       (services/task.badge_for) stays untouched. Checklist step statuses reuse
+       the same palette: done -> green, active -> amber (owner brief: checklist
+       capsules colored by state). */
+    .badge[data-status="complete"],
+    .badge[data-status="done"] {
       color: #3fb950;
       border-color: rgba(63, 185, 80, 0.55);
       background: rgba(63, 185, 80, 0.12);
     }
-    .badge[data-status="continue"] {
+    .badge[data-status="continue"],
+    .badge[data-status="active"] {
       color: #e3b341;
       border-color: rgba(227, 179, 65, 0.55);
       background: rgba(227, 179, 65, 0.12);
@@ -301,12 +351,23 @@
       }
     });
   </script>
+  <script>
+    // Whole-row navigation for the shared table style: a row with data-href
+    // navigates when clicked anywhere that is not already an interactive
+    // element (in-cell links, buttons and form fields keep their own behavior).
+    document.addEventListener('click', (evt) => {
+      const row = evt.target.closest('tr[data-href]');
+      if (!row) return;
+      if (evt.target.closest('a, button, form, input, textarea, select')) return;
+      window.location.href = row.getAttribute('data-href');
+    });
+  </script>
 </head>
 <body>
   <main class="container">
     {% block nav %}{% endblock %}
-    <div id="toast" aria-live="polite"></div>
     {% block content %}{% endblock %}
+    <div id="toast" aria-live="polite"></div>
   </main>
 </body>
 </html>

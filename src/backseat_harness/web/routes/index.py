@@ -46,16 +46,22 @@ def _toast_html(ok: bool, message: str) -> str:
 
 def _fragment_html(entries: list[dict[str, object]]) -> str:
     if entries:
-        cards = "\n".join(
-            f"    <a class=\"workspace-card\" href=\"/ws/{e['id']}\">\n"
-            f"      <strong>{html.escape(str(e['name']))}</strong>"
-            f"<br><small>{html.escape(str(e['path']))}</small>\n"
-            "    </a>"
+        rows = "\n".join(
+            f'          <tr data-href="/ws/{e["id"]}">'
+            f'<td><a href="/ws/{e["id"]}">'
+            f"<strong>{html.escape(str(e['name']))}</strong></a></td>"
+            f"<td><small>{html.escape(str(e['path']))}</small></td></tr>"
             for e in entries
         )
+        body = (
+            '    <table class="data-table">\n'
+            "      <thead><tr><th>Workspace</th><th>Path</th></tr></thead>\n"
+            f"      <tbody>\n{rows}\n      </tbody>\n"
+            "    </table>"
+        )
     else:
-        cards = "    <p>No workspaces registered yet.</p>"
-    return f"<div id=\"workspace-list\" {_POLL_ATTRS}>\n{cards}\n</div>"
+        body = "    <p>No workspaces registered yet.</p>"
+    return f"<div id=\"workspace-list\" {_POLL_ATTRS}>\n{body}\n</div>"
 
 
 def _suggest_html(suggestions: list[str]) -> str:

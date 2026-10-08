@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -301,8 +300,13 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
 
 
 def _data_rows(html: str) -> list[str]:
-    """Body rows of the results table (header row uses <th>, not <td>)."""
-    return [row for row in re.findall(r"<tr>.*?</tr>", html, re.S) if "<td>" in row]
+    """Body rows of a table (header rows use <th>, not <td>); rows may carry
+    attributes such as the shared style's ``data-href``."""
+    return [
+        row
+        for row in re.findall(r"<tr\b[^>]*>.*?</tr>", html, re.S)
+        if "<td>" in row
+    ]
 
 
 def test_search_page_classifies_sessions_and_renders_one_action_per_row(monkeypatch):
@@ -835,10 +839,13 @@ def test_homepage_has_add_workspace_plus_control():
     assert page.status_code == 200
     assert fragment.status_code == 200
 
-    # The ``+`` control and its datalist-fed path input.
+    # The round control and its datalist-fed path input. The glyph is drawn by
+    # the stylesheet (two centered bars) so it centers exactly and becomes a
+    # minus while the panel is open.
     assert 'class="expander"' in page.text
     assert 'class="expander-plus"' in page.text
-    assert ">+</summary>" in page.text
+    assert ".expander-plus::before" in page.text
+    assert ">+</summary>" not in page.text
     assert 'name="path"' in page.text
     assert 'list="ws-suggestions"' in page.text
     assert '<datalist id="ws-suggestions"' in page.text
@@ -916,9 +923,31 @@ def test_add_workspace_plus_css_centers_glyph():
     assert "line-height: 1" in rule
     assert "list-style: none" in rule
     assert "padding: 0" in rule
+    # Smaller than before (owner brief).
+    assert "width: 1.7rem" in rule
+    assert "height: 1.7rem" in rule
+    # The glyph is two bars pinned to the control's exact midpoint, so its
+    # vertical centering does not depend on font metrics (owner brief: the
+    # glyph sat slightly below center).
+    bar_start = css.index(".expander-plus::before,")
+    bar_rule = css[bar_start : css.index("}", bar_start)]
+    assert "position: absolute" in bar_rule
+    assert "top: 50%" in bar_rule
+    assert "left: 50%" in bar_rule
+    assert "translate(-50%, -50%)" in bar_rule
     # Belt-and-braces: the UA's webkit disclosure marker stays suppressed.
     assert ".expander-plus::-webkit-details-marker" in css
     assert ".expander-plus::after" in css
+    # Expanded/hover no longer fill with the loud accent; they stay on the
+    # surface palette, and the open state collapses the vertical bar (minus).
+    hover_start = css.index(".expander-plus:hover")
+    hover_rule = css[hover_start : css.index("}", hover_start)]
+    assert "background: var(--surface-hover)" in hover_rule
+    assert "--accent" not in hover_rule
+    open_start = css.index(".expander[open] .expander-plus {")
+    open_rule = css[open_start : css.index("}", open_start)]
+    assert "background: var(--surface-hover)" in open_rule
+    assert "scaleY(0)" in css
 
 
 def test_base_has_no_global_h1_and_smaller_font():
@@ -935,12 +964,49 @@ def test_base_has_no_global_h1_and_smaller_font():
     assert "font-size: 14px" in body_css
 
 
+def test_toast_status_sits_at_the_bottom():
+    """Owner brief: the add-workspace status ("ok: Initialized and registered
+    workspace ...") is shown at the bottom of the page, so ``#toast`` renders
+    after the content block rather than above it."""
+    with _client() as client:
+        home = client.get("/")
+
+    assert home.status_code == 200
+    assert 'id="toast"' in home.text
+    assert home.text.index('id="toast"') > home.text.rindex("</section>")
+
+
+def test_page_and_section_headers_are_one_level_smaller(
+    monkeypatch, workspace: Path
+):
+    """Owner brief: page titles drop one heading level (h2 -> h3) and section
+    headings drop one (h3 -> h4) across the site."""
+    ws_id = _register_workspace(workspace)
+    _stub_chat_history(monkeypatch, [], {})
+
+    with _client() as client:
+        home = client.get("/")
+        page = client.get(f"/ws/{ws_id}")
+        search = client.get("/search")
+
+    assert "<h3>Workspaces</h3>" in home.text
+    assert "<h2>Workspaces</h2>" not in home.text
+    assert "<h3>Session Search</h3>" in search.text
+    assert f"<h3>{workspace.name}</h3>" in page.text
+    assert "<h4>Active tasks</h4>" in page.text
+    assert "<h4>Completed tasks</h4>" in page.text
+    assert "<h4>Other chats</h4>" in page.text
+    assert "<h3>Active tasks</h3>" not in page.text
+
+
 def test_workspace_page_back_nav_and_add_task_expander_after_active(
     workspace: Path,
 ):
-    """The workspace page gets a back-link to ``/`` and the add-task form
-    becomes a ``+`` expander placed after the (incomplete/Active) tasks table,
-    still POSTing to ``/ws/{id}/tasks`` (goal G4 / plan 3c)."""
+    """The workspace page gets exactly one back-link to ``/`` and the add-task
+    form becomes a ``+`` expander placed after the (incomplete/Active) tasks
+    table, still POSTing to ``/ws/{id}/tasks`` (goal G4 / plan 3c; the doubled
+    back-link from nesting the ``nav`` block inside ``content`` is fixed by the
+    owner brief)."""
     ws_id = _register_workspace(workspace)
 
     with _client() as client:
@@ -949,13 +1015,16 @@ def test_workspace_page_back_nav_and_add_task_expander_after_active(
     assert resp.status_code == 200
     page = resp.text
     assert '<p class="nav-back"><a href="/">← Workspaces</a></p>' in page
+    # Exactly one: the link is not rendered twice (stacked).
+    assert page.count('<p class="nav-back">') == 1
 
-    # Form moved into the expander, after the incomplete (Active) table.
+    # Form moved into the expander, after the incomplete (Active) table. The
+    # glyph is drawn by the stylesheet, not a literal summary character.
     start = page.index('id="add-task"')
     panel = page[start : page.index("</details>", start)]
     assert 'class="expander add-task"' in page
     assert 'class="expander-plus"' in panel
-    assert ">+</summary>" in panel
+    assert ">+</summary>" not in panel
     assert f'action="/ws/{ws_id}/tasks"' in panel
     assert 'name="name"' in panel
     assert 'name="goal"' in panel
@@ -966,8 +1035,36 @@ def test_workspace_page_back_nav_and_add_task_expander_after_active(
     assert start < page.index("Completed tasks")
 
 
+def test_home_and_workspace_lists_share_clickable_table_style(
+    monkeypatch, workspace: Path
+):
+    """Owner brief: the home Workspaces list and the workspace Tasks lists are
+    one table style -- a ``.data-table`` whose rows carry ``data-href`` for
+    whole-row navigation, with a hover highlight wired in the shared layout."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "lane-a", status="continue", updated_at=1_700_000_000.0)
+    _stub_chat_history(monkeypatch, [], {})
+
+    with _client() as client:
+        home = client.get("/")
+        page = client.get(f"/ws/{ws_id}")
+
+    assert home.status_code == 200
+    assert page.status_code == 200
+    assert '<table class="data-table">' in home.text
+    assert '<table class="data-table">' in page.text
+    assert f'data-href="/ws/{ws_id}"' in home.text
+    assert f'data-href="/ws/{ws_id}/tasks/lane-a"' in page.text
+    # Whole-row navigation and the hover highlight live in the shared layout.
+    assert "tr[data-href]" in home.text
+    assert "tbody tr[data-href]:hover" in home.text
+    assert "closest('tr[data-href]')" in home.text
+
+
 def test_task_page_links_back_to_workspace(workspace: Path):
-    """The task page gets a back-link to its workspace page (goal G4)."""
+    """The task page gets exactly one back-link to its workspace page (goal
+    G4; [6c] fixed the nested-block duplicate by moving it into the shared
+    chat-page header)."""
     ws_id = _register_workspace(workspace)
     _write_lane(workspace, "my-lane", updated_at=1_700_000_000.0)
 
@@ -975,7 +1072,189 @@ def test_task_page_links_back_to_workspace(workspace: Path):
         resp = client.get(f"/ws/{ws_id}/tasks/my-lane")
 
     assert resp.status_code == 200
-    assert f'<a href="/ws/{ws_id}">← {workspace.name}</a>' in resp.text
+    assert f'<a class="chat-header-back" href="/ws/{ws_id}">← {workspace.name}</a>' in resp.text
+    assert resp.text.count(f'href="/ws/{ws_id}"') == 1
+
+
+def test_task_page_matches_the_polish_brief(workspace: Path):
+    """[6c]: the task page is one sticky chat-style header (name over date,
+    Takeover right), Status first with its capsule on the heading, a
+    header-less Iteration/Generation/Reason table, a required-brief Run block
+    with the in progress copy beside a 2/3 Status column, state-colored
+    checklist capsules, no Logs section and no inline transcript -- just a
+    "Raw transcript" link to the 6d page."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "polish-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("ship the polish\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": "polish-lane",
+                "status": "continue",
+                "iteration": 3,
+                "generation": 2,
+                "reason": "waiting on a decision",
+                "updated_at": 1_700_000_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (lane / "transcript.md").write_text(
+        "FULL INLINE TRANSCRIPT BODY\n", encoding="utf-8"
+    )
+    logs = lane / "logs"
+    logs.mkdir()
+    (logs / "run.log").write_text("a log line\n", encoding="utf-8")
+    (lane / "checklist.json").write_text(
+        json.dumps(
+            {
+                "steps": {
+                    "1-plan": {"title": "Plan", "status": "done"},
+                    "2-build": {"title": "Build", "status": "active"},
+                    "3-qa": {"title": "QA", "status": "blocked"},
+                },
+                "remarks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/polish-lane")
+
+    assert page.status_code == 200, page.text
+    html = page.text
+
+    # One back link, in the chat-page header style: name over date, Takeover
+    # button on the right.
+    assert html.count('class="chat-header-back"') == 1
+    assert f'<a class="chat-header-back" href="/ws/{ws_id}">← {workspace.name}</a>' in html
+    header = html[html.index("task-header") : html.index("</header>")]
+    assert "<strong>polish-lane</strong>" in header
+    assert "Updated:" in header
+    assert ">Takeover<" in header
+
+    # Status is the first section; the capsule rides the heading and no raw
+    # "(continue)"/"(complete)" parenthetical is rendered.
+    assert html.index("Status <span") < html.index("<h4>Goal</h4>")
+    status = _section(html, "<h4>Status ")
+    assert '<span class="badge" data-status="continue">in progress</span>' in status
+    assert "(continue)" not in status and "(complete)" not in status
+
+    # Iteration / Generation / Reason: a header-less table.
+    meta_start = html.index('<table class="task-meta">')
+    meta = html[meta_start : html.index("</table>", meta_start)]
+    assert "<thead>" not in meta
+    assert "<td>Iteration</td>" in meta and "<td>3</td>" in meta
+    assert "<td>Generation</td>" in meta and "<td>2</td>" in meta
+    assert "waiting on a decision" in meta
+
+    # Goal box: padded/margined like the transcript box.
+    assert '<pre class="goal">ship the polish</pre>' in html
+
+    # Status (about 2/3) and Run (about 1/3) share one grid row.
+    assert '<div class="task-columns">' in html
+    assert "grid-template-columns: 2fr 1fr" in html
+
+    # Run: required brief, adaptive in progress copy, disabled submit until the
+    # brief has text, and no "Launches ..." prose.
+    run = _section(html, "<h4>Run</h4>")
+    assert "Interrupt this task with an added instruction" in run
+    assert 'id="run-submit" disabled' in run
+    assert 'name="brief"' in run and "required" in run
+    assert "Launches" not in html
+
+    # Checklist capsules are colored by state (done/active/blocked).
+    assert '<span class="badge" data-status="done">done</span>' in html
+    assert '<span class="badge" data-status="active">active</span>' in html
+    assert '<span class="badge" data-status="blocked">blocked</span>' in html
+
+    # No Logs section and no inline transcript; only the "Raw transcript" link
+    # (its 6d target page is not built yet).
+    assert "<h4>Logs</h4>" not in html
+    assert "FULL INLINE TRANSCRIPT BODY" not in html
+    assert (
+        f'<a href="/ws/{ws_id}/tasks/polish-lane/transcript">Raw transcript</a>'
+        in html
+    )
+
+
+def test_task_page_run_copy_restarts_when_not_in_progress(workspace: Path):
+    """[6c]: a finished lane reads "Restart this task ..." and shows no literal
+    "(complete)" beside the capsule."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "done-lane", status="complete", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/done-lane")
+
+    assert page.status_code == 200
+    assert "Restart this task with an added instruction" in page.text
+    assert "Interrupt this task" not in page.text
+    status = _section(page.text, "<h4>Status ")
+    assert "(complete)" not in status and "(continue)" not in status
+
+
+def _write_transcript_lane(workspace: Path, slug: str, body: str) -> None:
+    """A minimal lane with a ``transcript.md`` for the 6d viewer."""
+    lane = workspace / ".backseat" / "tasks" / slug
+    lane.mkdir(parents=True, exist_ok=True)
+    (lane / "goal.md").write_text(f"goal for {slug}\n", encoding="utf-8")
+    (lane / "transcript.md").write_text(body, encoding="utf-8")
+
+
+def test_task_transcript_page_shares_the_chat_layout(workspace: Path):
+    """[6d]: the raw-transcript page reuses the chat layout -- the chat header
+    shell with a back link to the task page, and the full transcript below."""
+    ws_id = _register_workspace(workspace)
+    body = "## USER\nfull transcript body line\n" + "tail chunk " * 20
+    _write_transcript_lane(workspace, "talk-lane", body)
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}/tasks/talk-lane/transcript")
+
+    assert resp.status_code == 200
+    html = resp.text
+    # Same header shell as the chat page (shared _chat_page.html).
+    assert 'class="chat-header"' in html
+    assert html.count('class="chat-header-back"') == 1
+    assert (
+        f'<a class="chat-header-back" href="/ws/{ws_id}/tasks/talk-lane">← talk-lane</a>'
+        in html
+    )
+    # Full transcript below, untruncated, in the shared transcript box.
+    assert '<pre class="transcript">' in html
+    assert "full transcript body line" in html
+    assert html.count("tail chunk") == 20
+
+
+def test_task_page_raw_transcript_link_resolves(workspace: Path):
+    """[6d] bar (1): the task page's "Raw transcript" link resolves to the new
+    page with HTTP 200."""
+    ws_id = _register_workspace(workspace)
+    _write_transcript_lane(workspace, "talk-lane", "the transcript\n")
+
+    with _client() as client:
+        task_page = client.get(f"/ws/{ws_id}/tasks/talk-lane")
+        assert task_page.status_code == 200
+        href = re.search(r'href="([^"]*talk-lane/transcript)"', task_page.text).group(1)
+        assert href == f"/ws/{ws_id}/tasks/talk-lane/transcript"
+        followed = client.get(href)
+
+    assert followed.status_code == 200
+    assert "the transcript" in followed.text
+
+
+def test_task_transcript_page_unknown_task_or_workspace_are_404(workspace: Path):
+    """[6d] bar (1): an unknown workspace or task slug on the transcript route
+    returns 404 rather than crashing."""
+    ws_id = _register_workspace(workspace)
+    bogus_id = ws_id + 9999
+
+    with _client() as client:
+        assert client.get(f"/ws/{bogus_id}/tasks/anything/transcript").status_code == 404
+        assert client.get(f"/ws/{ws_id}/tasks/no-such-lane/transcript").status_code == 404
 
 
 def test_badge_css_covers_all_and_unknown_status(workspace: Path):
@@ -1003,10 +1282,15 @@ def test_badge_css_covers_all_and_unknown_status(workspace: Path):
 
     assert ws_page.status_code == 200
     assert 'data-status="weird"' in ws_page.text
-    assert '<span class="badge" data-status="weird">in-progress</span>' in ws_page.text
+    assert '<span class="badge" data-status="weird">in progress</span>' in ws_page.text
 
     assert task_page.status_code == 200
-    assert '<span class="badge" data-status="weird">in-progress</span>' in task_page.text
+    assert '<span class="badge" data-status="weird">in progress</span>' in task_page.text
+
+    # Owner brief: "continue" renders as "in progress" (space) everywhere --
+    # never the hyphenated form -- on the home, workspace and task pages.
+    for rendered in (page.text, ws_page.text, task_page.text):
+        assert "in-progress" not in rendered
 
 
 def test_add_workspace_registers_existing_workspace(
@@ -1127,9 +1411,8 @@ def _section(html: str, heading: str) -> str:
 
 
 def _other_chats_section(html: str) -> str:
-    """Body of the collapsed ``<details id="other-chats">`` block."""
-    start = html.index('<details id="other-chats">')
-    return html[start : html.index("</details>", start)]
+    """Body of the single non-expandable ``Other chats`` section."""
+    return _section(html, "<h4>Other chats</h4>")
 
 
 def test_workspace_page_sections_tasks_status_and_chat_filtering(
@@ -1137,7 +1420,7 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
 ):
     ws_id = _register_workspace(workspace)
 
-    # Status lanes: blocked -> "needs attention", continue -> "in-progress",
+    # Status lanes: blocked -> "needs attention", continue -> "in progress",
     # complete -> dropped from Active but listed under Completed tasks.
     _write_lane(
         workspace,
@@ -1152,8 +1435,8 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
     _write_lane(
         workspace, "done-lane", status="complete", updated_at=1_700_000_200.0
     )
-    # 22 continue lanes (no state.json) so the 10-cap on Recent tasks is
-    # exercised; their goal mtimes keep them below the three status lanes.
+    # 22 continue lanes (no state.json) so Active is exercised uncapped; their
+    # goal mtimes keep them below the three status lanes.
     for i in range(22):
         _write_lane(
             workspace, f"filler-{i:02d}", status=None, updated_at=1_700_000_000.0 + i
@@ -1179,21 +1462,25 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
         resp = client.get(f"/ws/{ws_id}")
     assert resp.status_code == 200
 
-    active = _section(resp.text, "<h3>Active tasks</h3>")
-    completed = _section(resp.text, "<h3>Completed tasks</h3>")
-    recent = _section(resp.text, "<h3>Recent tasks</h3>")
-    chats = _section(resp.text, "<h3>Recent chats</h3>")
+    active = _section(resp.text, "<h4>Active tasks</h4>")
+    completed = _section(resp.text, "<h4>Completed tasks</h4>")
+    chats = _section(resp.text, "<h4>Other chats</h4>")
 
-    # The goal's order: Active -> (add-task expander) -> Completed -> Recent
-    # tasks -> Recent chats -> Other chats (collapsed details).
+    # The brief's order: Active -> (add-task expander) -> Completed -> one
+    # Other chats table. The duplicated "Recent tasks" (== "Completed tasks")
+    # and the old two-list chat split are gone.
     heading_positions = [
         resp.text.index(h)
-        for h in ("<h3>Active tasks</h3>", "<h3>Completed tasks</h3>",
-                  "<h3>Recent tasks</h3>", "<h3>Recent chats</h3>",
-                  '<details id="other-chats">')
+        for h in ("<h4>Active tasks</h4>", "<h4>Completed tasks</h4>",
+                  "<h4>Other chats</h4>")
     ]
     assert heading_positions == sorted(heading_positions)
-    assert resp.text.index("id=\"add-task\"") > resp.text.index("</table>", heading_positions[0])
+    add_task = resp.text.index("id=\"add-task\"")
+    assert add_task > resp.text.index("</table>", heading_positions[0])
+    assert add_task < heading_positions[1]
+    assert "Recent tasks" not in resp.text
+    assert "Recent chats" not in resp.text
+    assert '<details id="other-chats">' not in resp.text
 
     # Active: badge text per status, complete lane excluded, uncapped
     # (still lists every incomplete lane, now 24).
@@ -1202,7 +1489,7 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
     blocked_row = next(r for r in inc_rows if ">blocked-lane<" in r)
     assert '<span class="badge" data-status="blocked">needs attention</span>' in blocked_row
     continue_row = next(r for r in inc_rows if ">continue-lane<" in r)
-    assert '<span class="badge" data-status="continue">in-progress</span>' in continue_row
+    assert '<span class="badge" data-status="continue">in progress</span>' in continue_row
     assert all("done-lane" not in r for r in inc_rows)
     assert ">filler-00<" in active  # oldest active lane still listed
 
@@ -1212,44 +1499,29 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
     assert ">done-lane<" in comp_rows[0]
     assert '<span class="badge" data-status="complete">complete</span>' in comp_rows[0]
 
-    # Recent tasks: capped at 10, newest first, complete included.
-    rec_rows = _data_rows(recent)
-    assert len(rec_rows) == 10
-    assert ">blocked-lane<" in rec_rows[0]
-    assert ">done-lane<" in recent
-    assert ">filler-21<" in recent
-    assert ">filler-15<" in recent  # the 10th row, right on the cap
-    assert ">filler-14<" not in recent  # the eleventh falls off
-    assert ">filler-00<" not in recent
-
-    # Recent chats: workspace-scoped, <meta> marker sessions excluded,
-    # newest first, Prompt column linking the chat page.
+    # Other chats: one plain section, workspace-scoped, <meta> marker sessions
+    # excluded, newest first, prompt in a fixed-width cell, no session column.
     chat_rows = _data_rows(chats)
     assert len(chat_rows) == 2
     assert "chatting about widgets" in chat_rows[0]
     assert 'href="/chat/opencode/ses_ws_new?ws=1"' in chat_rows[0]
+    assert 'class="prompt"' in chat_rows[0]
     assert "chatting about gadgets" in chat_rows[1]
     assert 'href="/chat/claude_code/ses_ws_old?ws=1"' in chat_rows[1]
     assert "ses_ws_marker" not in resp.text
     assert "managed" not in resp.text
     assert "ses_elsewhere" not in resp.text
     assert "other project chatter" not in resp.text
-    # No session-id column: the native ids render only inside the hrefs.
-    assert "ses_ws_new" in chat_rows[0].split("<td>")[1]  # inside the link only
     assert "<th>Session</th>" not in resp.text
 
-    # Other chats: exists as a closed cohort for this population too.
-    other = _other_chats_section(resp.text)
-    assert "No other chats." in other
-    assert _data_rows(other) == []
 
-
-def test_workspace_page_splits_recent_and_other_chats(
+def test_workspace_page_other_chats_is_one_capped_list(
     monkeypatch, workspace: Path
 ):
-    """12 clean workspace chats + 1 marker chat: the ten newest land under
-    "Recent chats", the rest inside a closed "Other chats" ``<details>``; the
-    marker session appears in neither (goal G6 / plan 3e)."""
+    """12 clean workspace chats + a marker + an empty transcript + an empty
+    prompt: the single "Other chats" table shows the ten newest non-task chats
+    and nothing else -- no "Recent chats" split, no expandable overflow, and
+    empty sessions dropped (owner brief)."""
     ws_id = _register_workspace(workspace)
     refs = []
     transcripts = {}
@@ -1260,34 +1532,37 @@ def test_workspace_page_splits_recent_and_other_chats(
     marker_key = "claude_code:ses_split_marker"
     refs.append(_Ref(marker_key, mtime=999.0, project=str(workspace)))
     transcripts[marker_key] = f"managed {_MARKER}"
+    # A session whose transcript is whitespace-only and one whose only prompt
+    # line is the bare "USER" label / blank: both are ignored.
+    refs.append(_Ref("opencode:ses_split_empty", mtime=998.0, project=str(workspace)))
+    transcripts["opencode:ses_split_empty"] = "   \n  "
+    refs.append(_Ref("opencode:ses_split_noprompt", mtime=997.0, project=str(workspace)))
+    transcripts["opencode:ses_split_noprompt"] = "## USER\n"
     _stub_chat_history(monkeypatch, refs, transcripts)
 
     with _client() as client:
         resp = client.get(f"/ws/{ws_id}")
 
     assert resp.status_code == 200
-    recent = _section(resp.text, "<h3>Recent chats</h3>")
-    other = _other_chats_section(resp.text)
-    recent_rows = _data_rows(recent)
-    other_rows = _data_rows(other)
+    assert "Recent chats" not in resp.text
+    chats = _other_chats_section(resp.text)
+    rows = _data_rows(chats)
 
-    assert len(recent_rows) == 10
-    assert len(other_rows) == 2
-    # Newest ten first (ses_split_11 down to ses_split_02).
-    assert 'href="/chat/opencode/ses_split_11?ws=1"' in recent_rows[0]
-    assert 'href="/chat/opencode/ses_split_02?ws=1"' in recent_rows[-1]
-    # ...and the other two are the oldest.
-    assert 'href="/chat/opencode/ses_split_01?ws=1"' in other_rows[0]
-    assert 'href="/chat/opencode/ses_split_00?ws=1"' in other_rows[1]
-    # Marker sessions are excluded from both sections.
-    assert "ses_split_marker" not in recent
-    assert "ses_split_marker" not in other
-    # The details block has no ``open`` attribute: collapsed by default.
-    tag_start = resp.text.index('<details id="other-chats"')
-    tag = resp.text[tag_start : resp.text.index(">", tag_start) + 1]
-    assert tag == '<details id="other-chats">'
-    # Both sections share the Prompt/Updated columns.
-    assert "<th>Prompt</th>" in recent and "<th>Prompt</th>" in other
+    # Ten rows, newest ten first (ses_split_11 down to ses_split_02).
+    assert len(rows) == 10
+    assert 'href="/chat/opencode/ses_split_11?ws=1"' in rows[0]
+    assert 'href="/chat/opencode/ses_split_02?ws=1"' in rows[-1]
+    # ...and the two oldest fell off the 10-cap.
+    assert "ses_split_01" not in chats
+    assert "ses_split_00" not in chats
+    # Managed and empty sessions appear nowhere.
+    assert "ses_split_marker" not in resp.text
+    assert "ses_split_empty" not in resp.text
+    assert "ses_split_noprompt" not in resp.text
+    # It is one plain table, not an expandable <details>.
+    assert '<details id="other-chats">' not in resp.text
+    assert "<th>Prompt</th>" in chats
+    assert 'class="prompt"' in chats
     assert "<th>Session</th>" not in resp.text
 
 
@@ -1303,15 +1578,17 @@ def test_completed_tasks_section_renders_when_empty(
         resp = client.get("/ws/1")
 
     assert resp.status_code == 200
-    completed = _section(resp.text, "<h3>Completed tasks</h3>")
+    completed = _section(resp.text, "<h4>Completed tasks</h4>")
     assert "No completed tasks." in completed
     assert _data_rows(completed) == []
 
 
 def test_prompt_excerpt_normalizes_and_truncates():
     """The prompt string: leading <meta> markers dropped, first ``## USER``
-    turn body preferred, newlines/tabs collapsed to spaces, hard cut at 120
-    chars, whole-text fallback without headers (plan 3e / Q4)."""
+    turn body preferred, leading blank lines and a bare ``USER`` role label
+    skipped, newlines/tabs collapsed to spaces, cut at 120 chars with "..."
+    appended when truncated, whole-text fallback without headers (owner
+    brief)."""
     excerpt = chat_search_service._prompt_excerpt
 
     assert excerpt("## USER\nHello\nworld\ttabbed") == "Hello world tabbed"
@@ -1323,9 +1600,12 @@ def test_prompt_excerpt_normalizes_and_truncates():
         excerpt("## USER\nthe prompt\n## ASSISTANT\nan assistant reply")
         == "the prompt"
     )
-    assert excerpt("## USER\n" + "x" * 200) == "x" * 120
+    assert excerpt("## USER\n" + "x" * 200) == "x" * 120 + "..."
     assert excerpt("plain text\n\twith lines") == "plain text with lines"
     assert excerpt("") == ""
+    # A bare "USER" leading line and leading empty lines are skipped.
+    assert excerpt("USER\n\nhello there") == "hello there"
+    assert excerpt("\n\n  \nUSER\ncontent") == "content"
 
 
 def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: Path):
@@ -1341,9 +1621,8 @@ def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: P
     one per pass.
     """
     ws_id = _register_workspace(workspace)
-    # 11 chats split across the two sections on next render: the ten newest
-    # feed "Recent chats", the oldest one only "Other chats" -- and the single
-    # batch must still cover all of them at once.
+    # 11 chats so the single "Other chats" table's 10-cap drops the oldest; the
+    # one batch must still cover every candidate at once.
     refs = []
     transcripts = {}
     for key, mtime, text in [
@@ -1395,12 +1674,13 @@ def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: P
     expected_keys = {r.key for r in refs}
     assert set(calls[0]) == expected_keys
     assert seen["load_providers"] is seen["search_providers"]
-    # The one batch covers rows rendered in both chat sections.
-    assert "chat about widgets" in page.text
-    assert "chat about gadgets" in page.text
+    # The one batch covers every rendered row; the single Other chats table
+    # keeps the ten newest and drops the oldest off the cap.
     other = _other_chats_section(page.text)
-    assert "filler chat 08" in other  # the oldest-only key
-    assert "filler chat 08" not in _section(page.text, "<h3>Recent chats</h3>")
+    assert "chat about widgets" in other
+    assert "chat about gadgets" in other
+    assert "filler chat 07" in other  # the tenth row, right on the cap
+    assert "filler chat 08" not in other  # the eleventh falls off
 
 
 # --- step 11c: task viewer Run and Takeover controls ---------------------------
@@ -1692,6 +1972,39 @@ def test_chat_page_falls_back_to_fork_without_resume_command(monkeypatch):
     assert ">Fork<" in resp.text
 
 
+def test_chat_page_fork_button_back_link_and_transcript_styling(monkeypatch):
+    """Owner brief: the chat header's back link is blue like other pages, the
+    Fork button is compact so it does not tower over the back link, and the
+    transcript box has padding and margin."""
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide chat body" for k in keys},
+    )
+    with _client() as client:
+        resp = client.get("/chat/cline/sess_fork")
+
+    assert resp.status_code == 200
+    # Back link is blue: the rule uses the accent color, not muted.
+    back_start = resp.text.index(".chat-header-back {")
+    back_rule = resp.text[back_start : resp.text.index("}", back_start)]
+    assert "color: var(--accent)" in back_rule
+    assert "var(--muted)" not in back_rule
+    # Compact header button (was Pico's tall default).
+    btn_start = resp.text.index(".chat-header .chat-continue-form button {")
+    btn_rule = resp.text[btn_start : resp.text.index("}", btn_start)]
+    assert "padding: 0.3rem 0.85rem" in btn_rule
+    assert "font-size: 0.85rem" in btn_rule
+    # Transcript box has padding and margin.
+    assert '<pre class="transcript">' in resp.text
+    tx_start = resp.text.index(".transcript {")
+    tx_rule = resp.text[tx_start : resp.text.index("}", tx_start)]
+    assert "padding: 0.85rem 1rem" in tx_rule
+    assert "margin: 0.5rem 0 1rem" in tx_rule
+
+
 def test_unknown_chat_provider_and_session_are_404(monkeypatch):
     """Unknown provider names and known providers with no transcript both 404
     (2-plan §B edge case: unknown chat / provider)."""
@@ -1712,47 +2025,108 @@ def test_unknown_chat_provider_and_session_are_404(monkeypatch):
     assert "not found" in missing_session.text.lower()
 
 
-def test_search_fork_sends_fork_prompt_into_the_pty(monkeypatch, tmp_path: Path):
-    # One unsupported-provider chat: pick_fork_provider skips the Kiro-IDE and
-    # most-recent-supported rules and falls to the PATH scan, which we pin to a
-    # fake "opencode" (rule 3 of the goal's fork-provider selection).
-    refs = [_Ref("cursor:sess_cur", mtime=200.0, project=None)]
-    _stub_chat_history(monkeypatch, refs, {"cursor:sess_cur": "cursor chat"})
+def test_build_fork_command_passes_initial_prompt_to_each_provider():
+    """The fork launch command carries the initial prompt as an argument for
+    every fork provider (owner brief: kilo/kiro forked without it)."""
+    from backseat_harness.web.routes import search as search_routes
 
-    fake_bin = tmp_path / "fakebin"
-    fake_bin.mkdir()
-    fake_opencode = fake_bin / "opencode.exe"
-    shutil.copy2(sys.executable, fake_opencode)
-    shutil.copy2(Path(sys.prefix) / "pyvenv.cfg", fake_bin / "pyvenv.cfg")
+    prompt = "Please fork kilo chat session ses_x"
+    assert search_routes._build_fork_command("kiro", prompt) == [
+        "kiro-cli",
+        "chat",
+        prompt,
+    ]
+    assert search_routes._build_fork_command("opencode", prompt) == [
+        "opencode",
+        "--prompt",
+        prompt,
+    ]
+    assert search_routes._build_fork_command("claude", prompt) == ["claude", prompt]
+    with pytest.raises(ValueError, match="Unknown fork provider"):
+        search_routes._build_fork_command("bogus", prompt)
 
-    def _which(command: str, path: str | None = None) -> str | None:
-        # pick_fork_provider scans for the CLI, and pywinpty's spawn resolves
-        # argv[0] through shutil.which too -- both land on the fake binary.
-        return str(fake_opencode) if command == "opencode" else None
 
-    monkeypatch.setattr("shutil.which", _which)
-    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
+def test_fork_prompt_names_the_source_provider_and_session():
+    """The prompt names the source provider, e.g.
+    "Please fork kilo chat session XXXXX" (owner brief)."""
+    from backseat_harness.web.routes import search as search_routes
+
+    assert (
+        search_routes._fork_prompt("kilo", "sess_42")
+        == "Please fork kilo chat session sess_42"
+    )
+    assert (
+        search_routes._fork_prompt("kiro", "sess_43")
+        == "Please fork kiro chat session sess_43"
+    )
+
+
+def _capture_fork_command(monkeypatch) -> dict:
+    """Capture the argv the fork route hands to the PTY manager -- the real
+    launch command -- without spawning a child."""
+    from backseat_harness.web.shell.manager import PTYSessionManager
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_session(self, cmd, cwd, cols=None, rows=None):
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
+        return "abc123def456"
+
+    monkeypatch.setattr(PTYSessionManager, "create_session", _fake_create_session)
+    return captured
+
+
+def test_search_fork_launches_kiro_with_initial_prompt(monkeypatch):
+    """A kiro_ide source chat forks via kiro-cli, and the launch command ends
+    with the initial prompt (no delayed PTY write)."""
+    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
+    captured = _capture_fork_command(monkeypatch)
 
     with _client() as client:
         resp = client.post(
             "/search/fork",
             data={
                 "conversation_id": "sess_cur",
-                "current_session_key": "cursor:sess_cur",
+                "current_session_key": "kiro_ide:sess_cur",
             },
             follow_redirects=False,
         )
-        assert resp.status_code == 303, resp.text
-        location = resp.headers["location"]
-        assert re.fullmatch(r"/shell/[0-9a-f]{12}", location)
-        session_id = location.rsplit("/", 1)[1]
-        try:
-            assert client.get(f"/shell/{session_id}").status_code == 200
-            # The route writes "Please fork chat id <id>\n" into the PTY 0.5s
-            # after spawn; the fake TUI is a real child whose terminal renders
-            # the line back, so the full prompt must land in the ring buffer.
-            _wait_stripped(
-                session_id, b"Please fork chat id sess_cur", timeout=45.0
-            )
-        finally:
-            _kill_session(session_id)
+
+    assert resp.status_code == 303
+    assert captured["cmd"] == [
+        "kiro-cli",
+        "chat",
+        "Please fork kiro_ide chat session sess_cur",
+    ]
+
+
+def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch):
+    """A kilo source chat forks via the opencode-family CLI (rule 2 picks the
+    supported opencode chat), and the prompt names the kilo source."""
+    refs = [
+        _Ref("opencode:ses_recent", mtime=100.0, project=None),
+        _Ref("kilo:sess_k", mtime=200.0, project=None),
+    ]
+    _stub_chat_history(
+        monkeypatch, refs, {"opencode:ses_recent": "x", "kilo:sess_k": "y"}
+    )
+    captured = _capture_fork_command(monkeypatch)
+
+    with _client() as client:
+        resp = client.post(
+            "/search/fork",
+            data={
+                "conversation_id": "sess_k",
+                "current_session_key": "kilo:sess_k",
+            },
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert captured["cmd"] == [
+        "opencode",
+        "--prompt",
+        "Please fork kilo chat session sess_k",
+    ]

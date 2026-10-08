@@ -35,15 +35,17 @@ _META_LINE_RE = re.compile(r"^\s*<meta>.*</meta>\s*$")
 
 
 def _prompt_excerpt(text: str, limit: int = 120) -> str:
-    """The chat's prompt string, per plan §0b: the first 120 characters of the
-    user's prompt, with newlines and tabs replaced by spaces.
+    """The chat's prompt string, per the owner brief: the first 120 characters
+    of the user's prompt, with newlines and tabs replaced by spaces.
 
     1. Drop leading ``<meta>…</meta>`` marker line(s).
     2. Prefer the body of the first ``## USER`` turn (after the header up to
        the next ``## `` header or end of text); without a header, the whole
        remaining text.
-    3. Collapse runs of whitespace into single spaces.
-    4. Hard-cut to ``limit`` characters (no ellipsis).
+    3. Skip leading empty lines and a bare ``USER`` role label, so the excerpt
+       starts at the actual prompt text.
+    4. Collapse runs of whitespace into single spaces.
+    5. Cut to ``limit`` characters and append ``"..."`` when text was dropped.
     """
     if not text:
         return ""
@@ -61,8 +63,20 @@ def _prompt_excerpt(text: str, limit: int = 120) -> str:
         if nxt:
             body = body[: nxt.start()]
 
+    body_lines = body.splitlines()
+    i = 0
+    while i < len(body_lines):
+        stripped = body_lines[i].strip()
+        if stripped == "" or stripped == "USER":
+            i += 1
+            continue
+        break
+    body = "\n".join(body_lines[i:])
+
     collapsed = re.sub(r"\s+", " ", body).strip()
-    return collapsed[:limit]
+    if len(collapsed) > limit:
+        return collapsed[:limit] + "..."
+    return collapsed
 
 
 @dataclass(frozen=True)
@@ -184,10 +198,15 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
             break
 
         text = texts.get(ref.key)
-        if text is None:
+        # Drop sessions with no transcript or an empty prompt (owner brief).
+        if text is None or not text.strip():
             continue
 
         if _is_backseat_session(text):
+            continue
+
+        prompt = _prompt_excerpt(text)
+        if not prompt:
             continue
 
         # Create a preview (first 200 chars of content, stripped of markers)
@@ -201,7 +220,7 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
             project=getattr(ref, "project", None),
             mtime=getattr(ref, "mtime", 0),
             preview=preview,
-            prompt=_prompt_excerpt(text),
+            prompt=prompt,
         ))
 
     return results

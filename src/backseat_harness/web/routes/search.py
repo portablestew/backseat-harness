@@ -61,19 +61,30 @@ def _build_resume_command(provider: str, conversation_id: str) -> list[str] | No
     return [arg.format(conversation_id=conversation_id) for arg in template]
 
 
-def _build_fork_command(fork_provider: str, conversation_id: str) -> list[str]:
-    """Build the fork command for a provider.
-    
-    Fork opens a fresh interactive TUI session (no session ID). The initial
-    prompt "Please fork chat id <conversation_id>" is delivered via PTY write
-    after the session starts (see search_fork).
+def _fork_prompt(source_provider: str, conversation_id: str) -> str:
+    """The initial prompt handed to the forked CLI at launch.
+
+    Names the *source* provider and session so the target CLI's chat tools can
+    find the conversation to fork, e.g. ``Please fork kilo chat session XXXXX``.
+    """
+    return f"Please fork {source_provider} chat session {conversation_id}"
+
+
+def _build_fork_command(fork_provider: str, prompt: str) -> list[str]:
+    """Build the fork launch command, with the initial prompt in argv.
+
+    The prompt must be an argument at launch, not a delayed PTY write: each
+    fork CLI accepts an initial prompt on the command line (kiro-cli's
+    positional ``[INPUT]``, opencode's ``--prompt``, claude's positional
+    prompt). Writing it after a fixed delay raced the TUI startup, so kiro-cli
+    opened without the prompt.
     """
     if fork_provider == "opencode":
-        return ["opencode"]
+        return ["opencode", "--prompt", prompt]
     elif fork_provider == "kiro":
-        return ["kiro-cli", "chat"]
+        return ["kiro-cli", "chat", prompt]
     elif fork_provider == "claude":
-        return ["claude"]
+        return ["claude", prompt]
     else:
         # Fallback - shouldn't happen as pick_fork_provider only returns supported
         raise ValueError(f"Unknown fork provider: {fork_provider}")
@@ -101,7 +112,9 @@ async def search_page(request: Request, q: str = Query(default="")):
             # Non-supported provider: determine fork provider
             try:
                 fork_provider = chat_search_service.pick_fork_provider(r.key, results)
-                fork_command = _build_fork_command(fork_provider, conversation_id)
+                fork_command = _build_fork_command(
+                    fork_provider, _fork_prompt(provider, conversation_id)
+                )
             except RuntimeError:
                 # No supported provider available
                 pass
@@ -138,20 +151,18 @@ async def search_fork(
 
     # Determine fork provider
     fork_provider = chat_search_service.pick_fork_provider(current_session_key, refs)
-    
-    # Build fork command (fresh TUI, no session ID)
-    fork_command = _build_fork_command(fork_provider, conversation_id)
-    
+
+    # The initial prompt is the launch command's last argument (no delayed PTY
+    # write): the source provider names the chat the forked CLI should fork.
+    source_provider = _extract_provider_from_key(current_session_key) or "chat"
+    fork_command = _build_fork_command(
+        fork_provider, _fork_prompt(source_provider, conversation_id)
+    )
+
     # Start shell session
     from backseat_harness.web.routes.shell import get_manager
     manager = get_manager()
     session_id = manager.create_session(fork_command, Path("."))
-    
-    # Send initial fork prompt to the PTY after a brief delay for TUI startup
-    import asyncio
-    await asyncio.sleep(0.5)  # let the TUI initialize
-    fork_prompt = f"Please fork chat id {conversation_id}\n"
-    manager.write(session_id, fork_prompt.encode())
-    
+
     # Redirect to shell page
     return RedirectResponse(url=f"/shell/{session_id}", status_code=303)

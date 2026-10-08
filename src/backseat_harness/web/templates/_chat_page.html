@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block nav %}{% endblock %}
+{% block content %}
+<style>
+  /* Chat-style page: cancel the container's Pico vertical block spacing so the
+     sticky header is flush with the viewport top at scroll 0 too -- the
+     header's rect.top must read 0 before and after a long scroll. */
+  main.container {
+    padding-top: 0;
+    padding-bottom: 1.25rem;
+  }
+</style>
+<header class="chat-header">
+  <div class="chat-header-prompt">
+    {% block back %}{% endblock %}
+    <strong>{% block heading %}{% endblock %}</strong>
+    {% block sub %}{% endblock %}
+  </div>
+  {% block action %}{% endblock %}
+</header>
+{% block body %}{% endblock %}
+{% block scripts %}{% endblock %}
+{% endblock %}

@@ -14,7 +14,7 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 - :func:`resolve_workspace` — sqlite ``workspaces.id`` → path (stable
   across path renames).
 - :func:`load_task` — loads goal.md, state.json, checklist.json, and any
-  transcript.md/logs for the read-only task viewer (step 7.1).
+  transcript.md for the read-only task viewer (step 7.1).
 - :func:`run_task_detached` — launches ``backseat-harness run <slug> [brief]``
   for the task in a detached subprocess (step 7.3).
 """
@@ -69,13 +69,13 @@ def create_task(workspace: Path | str, name: str, goal: str) -> str:
 
 
 def badge_for(status: TaskStatus | str) -> str:
-    """Status badge text: blocked → "needs attention", else "in-progress"."""
+    """Status badge text: blocked → "needs attention", else "in progress"."""
     value = status.value if isinstance(status, TaskStatus) else str(status)
     if value == TaskStatus.BLOCKED.value:
         return "needs attention"
     if value == TaskStatus.COMPLETE.value:
         return "complete"
-    return "in-progress"
+    return "in progress"
 
 
 @dataclass(frozen=True)
@@ -184,7 +184,6 @@ class TaskDetail:
     checklist: dict
     remarks: list[str]
     transcript: str | None
-    log_files: list[str]
 
 
 def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
@@ -200,7 +199,6 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
     goal_path = task_dir / "goal.md"
     checklist_path = task_dir / "checklist.json"
     transcript_path = task_dir / "transcript.md"
-    logs_dir = task_dir / "logs"
 
     # Load goal.md (always exists if task dir exists)
     try:
@@ -243,18 +241,6 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         except OSError:
             pass
 
-    # List log files
-    log_files = []
-    if logs_dir.is_dir():
-        try:
-            log_files = sorted(
-                [f.name for f in logs_dir.iterdir() if f.is_file()],
-                key=lambda f: (logs_dir / f).stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            pass
-
     return TaskDetail(
         slug=slug,
         goal=goal,
@@ -267,7 +253,6 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         checklist=checklist_data.get("steps", {}),
         remarks=checklist_data.get("remarks", []),
         transcript=transcript,
-        log_files=log_files,
     )
 
 

@@ -1,26 +1,15 @@
-{% extends "base.html" %}
+{% extends "_chat_page.html" %}
 {% block title %}{{ provider }}:{{ conversation_id }} - backseat-harness{% endblock %}
-{% block nav %}{% endblock %}
-{% block content %}
-<style>
-  /* Chat page: cancel the container's Pico vertical block spacing so the
-     sticky header is flush with the viewport top at scroll 0 too -- the
-     header's rect.top must read 0 before and after a long scroll. */
-  main.container {
-    padding-top: 0;
-    padding-bottom: 1.25rem;
-  }
-</style>
-<header class="chat-header">
-  <div class="chat-header-prompt">
+{% block back %}
     {% if ws_name %}
     <a class="chat-header-back" href="/ws/{{ ws_id }}">← {{ ws_name }}</a>
     {% else %}
     <a class="chat-header-back" href="/">← Workspaces</a>
     {% endif %}
-    <strong>{{ prompt }}</strong>
-    <small>{{ provider }}:{{ conversation_id }}</small>
-  </div>
+{% endblock %}
+{% block heading %}{{ prompt }}{% endblock %}
+{% block sub %}<small>{{ provider }}:{{ conversation_id }}</small>{% endblock %}
+{% block action %}
   {% if resume_command %}
   <form id="resume-form" class="chat-continue-form">
     <input type="hidden" name="cmd" value='{{ resume_command|tojson }}'>
@@ -34,13 +23,16 @@
     <button type="submit" class="btn">Fork</button>
   </form>
   {% endif %}
-</header>
+{% endblock %}
 
+{% block body %}
 <section>
-  <h3>Transcript</h3>
-  <pre>{{ transcript }}</pre>
+  <h4>Transcript</h4>
+  <pre class="transcript">{{ transcript }}</pre>
 </section>
+{% endblock %}
 
+{% block scripts %}
 {% if resume_command %}
 <script>
   document.getElementById('resume-form').addEventListener('submit', async (e) => {

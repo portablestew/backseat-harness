@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 {% block title %}{{ ws_name }} - backseat-harness{% endblock %}
-{% block content %}
 {% block nav %}<p class="nav-back"><a href="/">← Workspaces</a></p>{% endblock %}
+{% block content %}
 <header>
-  <h2>{{ ws_name }}</h2>
+  <h3>{{ ws_name }}</h3>
   <small>{{ ws_path }}</small>
 </header>
 
 <section>
-  <h3>Active tasks</h3>
-  <table>
+  <h4>Active tasks</h4>
+  <table class="data-table">
     <thead>
       <tr>
         <th>Task</th>
@@ -19,7 +19,7 @@
     </thead>
     <tbody>
       {% for t in incomplete %}
-      <tr>
+      <tr data-href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">
         <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
         <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
@@ -34,7 +34,7 @@
 </section>
 
 <details id="add-task" class="expander add-task">
-  <summary class="expander-plus" title="Add task" aria-label="Add task">+</summary>
+  <summary class="expander-plus" title="Add task" aria-label="Add task"></summary>
   <form method="post" action="/ws/{{ ws_id }}/tasks">
     <label for="task-name">Task name</label>
     <input id="task-name" name="name" type="text" placeholder="My task" required>
@@ -45,8 +45,8 @@
 </details>
 
 <section>
-  <h3>Completed tasks</h3>
-  <table>
+  <h4>Completed tasks</h4>
+  <table class="data-table">
     <thead>
       <tr>
         <th>Task</th>
@@ -56,7 +56,7 @@
     </thead>
     <tbody>
       {% for t in complete %}
-      <tr>
+      <tr data-href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">
         <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
         <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
@@ -71,34 +71,8 @@
 </section>
 
 <section>
-  <h3>Recent tasks</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Task</th>
-        <th>Status</th>
-        <th>Updated</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for t in recent %}
-      <tr>
-        <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
-        <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
-        <td><small>{{ t.updated_at | format_datetime }}</small></td>
-      </tr>
-      {% else %}
-      <tr>
-        <td colspan="3">No tasks yet.</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-
-<section>
-  <h3>Recent chats</h3>
-  <table>
+  <h4>Other chats</h4>
+  <table class="data-table">
     <thead>
       <tr>
         <th>Prompt</th>
@@ -106,33 +80,9 @@
       </tr>
     </thead>
     <tbody>
-      {% for c in recent_chats %}
-      <tr>
-        <td><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
-        <td><small>{{ c.mtime | format_datetime }}</small></td>
-      </tr>
-      {% else %}
-      <tr>
-        <td colspan="2">No recent chats.</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-
-<details id="other-chats">
-  <summary>Other chats</summary>
-  <table>
-    <thead>
-      <tr>
-        <th>Prompt</th>
-        <th>Updated</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for c in other_chats %}
-      <tr>
-        <td><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
+      {% for c in chats %}
+      <tr data-href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">
+        <td class="prompt"><a href="/chat/{{ c.key.split(':')[0] }}/{{ c.native_id }}?ws={{ ws_id }}">{{ c.prompt }}</a></td>
         <td><small>{{ c.mtime | format_datetime }}</small></td>
       </tr>
       {% else %}
@@ -142,5 +92,5 @@
       {% endfor %}
     </tbody>
   </table>
-</details>
+</section>
 {% endblock %}
