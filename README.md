@@ -139,8 +139,8 @@ backseat-harness run hello-endpoint "Add a GET /hello endpoint returning JSON."
 backseat-harness run hello-endpoint
 
 # add your own words to a run: the second argument on a lane that already has a
-# goal is a brief from you, not a new goal. It rides the operator's plan-phase
-# prompt, outranks the goal where they conflict, and ends with the run.
+# goal is a brief from you, not a new goal. It rides every operator prompt of
+# the run, outranks the goal where they conflict, and ends with the run.
 backseat-harness run hello-endpoint "Skip the caching step for now."
 
 # answer an ask_human pause. This is the normal way: the operator asked, the
@@ -218,8 +218,9 @@ deterministic and testable without a live CLI.
 
 ## Human takeover and briefs
 
-`ask_human` blocks the lane. Answer with a brief (the operator's words ride the
-plan-phase prompt, outrank the goal, and end with the run):
+`ask_human` blocks the lane. Answer with a brief (the operator's words ride
+every prompt of the run, outrank the goal, and end with the run; the run's plan
+line records them in `ledger.jsonl`):
 
 ```bash
 backseat-harness run <slug> "Use SQLite."

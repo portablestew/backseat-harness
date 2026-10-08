@@ -70,10 +70,11 @@ class ReviewInputs:
     #: far, overwritten each turn and refreshed before a plan-phase call.
     transcript_file: str | None = None
     #: The task owner's own words for this run, from ``run <slug> "<text>"`` on
-    #: a lane that already has a goal-prompt. Set only for the plan-phase call
-    #: that opens the run, so it is one-shot by construction: the brief reaches
-    #: the operator that re-plans, gets baked into the checklist and the first
-    #: prompt, and the run ends carrying it. None when the run was started
+    #: a lane that already has a goal-prompt. Rides every operator call of the
+    #: run that supplies it and dies with that run: a bare resume brings none
+    #: and a later run replaces it, so one brief is in force at a time. The
+    #: plan call bakes it into the checklist and the first prompt; later calls
+    #: read it as the standing steering it is. None when the run was started
     #: without one.
     owner_brief: str | None = None
     #: The question the operator escalated with, when the lane was left blocked
@@ -209,8 +210,8 @@ def _owner_brief_section(inputs: ReviewInputs) -> str:
     is never rewritten. Silently reconciling the two is the one thing this
     section must not leave to inference.
 
-    Empty when there is no brief. Plan phase only: a brief can only ever arrive
-    on the call that opens a run, so this never renders mid-run.
+    Empty when there is no brief. Renders on every operator call of the run
+    that carries it; the brief is run-scoped, so it never outlives the run.
     """
     if not inputs.owner_brief:
         return ""
@@ -281,12 +282,13 @@ def _plan_task(inputs: ReviewInputs) -> str:
         )
     brief = ""
     if inputs.owner_brief:
-        # The brief is rendered for this call only, so the instruction to act on
-        # it -- and to leave a trace -- belongs here too. A section the operator
-        # reads but no directive tells it to consume is how an answer gets
-        # acknowledged in the prompt and then ignored in the verdict; and since
-        # nothing persists the brief, whatever the next invocation needs has to be
-        # written into the checklist now or it is gone (Tenet 8).
+        # The brief rides every call of this run now, but the run is its whole
+        # lifetime, and this is the call that rewrites the checklist: the
+        # instruction to act on it -- and to leave a trace -- belongs here. A
+        # section the operator reads but no directive tells it to consume is
+        # how an answer gets acknowledged in the prompt and then ignored in the
+        # verdict; and whatever the next *run* needs has to be written into the
+        # checklist now or it is gone (Tenet 8).
         brief = (
             " The task owner's brief above is new input from this run: act on it, "
             "and leave a trace of what it changed -- a remark for a decision, the "

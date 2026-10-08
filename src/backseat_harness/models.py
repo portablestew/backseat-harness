@@ -247,6 +247,14 @@ class LedgerEntry:
     #: is not knowable from here, so none is claimed. Lines written before the
     #: field existed read back as None.
     model: str | None = None
+    #: The task owner's brief in force from this plan call onward (``run <slug>
+    #: "<text>"`` on a lane with a goal). Recorded on the plan line that opens
+    #: the run -- where the owner's words enter the conversation the ledger
+    #: audits -- and never repeated on the run's review lines: one record per
+    #: brief. The brief is run-scoped, so the record is history, not standing
+    #: steering. None on review lines and on runs without a brief. Lines
+    #: written before the field existed read back as None.
+    owner_brief: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +276,7 @@ class LedgerEntry:
             "duration_s": self.duration_s,
             "notes": self.notes,
             "next_prompt": self.next_prompt,
+            "owner_brief": self.owner_brief,
             "reset_context": self.reset_context,
         }
 
@@ -288,6 +297,7 @@ class LedgerEntry:
             # Absent on lines written before the field existed; an empty id is
             # not one either (config parsing drops those), so both read None.
             model=data.get("model") or None,
+            owner_brief=data.get("owner_brief") or None,
         )
 
 

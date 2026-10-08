@@ -295,6 +295,18 @@ def test_prompt_renders_the_owner_brief_with_precedence():
     assert "brief above is new input from this run" in out
 
 
+def test_review_prompt_renders_the_brief_still_in_force():
+    """Whole-run steering: a review call reads the brief too."""
+    inputs = ReviewInputs(
+        goal_prompt="Goal", checklist=Checklist(), managed_fork="fork",
+        outcome=_outcome(), iteration=1, task_dir=".backseat/tasks/t",
+        owner_brief="Keep the shared budget.",
+    )
+    out = build_prompt(inputs)
+    assert "## Brief from the task owner" in out
+    assert "Keep the shared budget." in out
+
+
 def test_prompt_pairs_the_question_with_the_answer():
     """The operator has no memory of asking, so the question rides the prompt."""
     inputs = ReviewInputs(

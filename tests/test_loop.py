@@ -178,8 +178,8 @@ def test_owner_brief_and_its_question_reach_the_plan_prompt(config, task):
     assert state.status is TaskStatus.COMPLETE
 
 
-def test_owner_brief_reaches_only_the_plan_phase(config, task):
-    """One-shot by construction: a review call must not re-read the brief."""
+def test_owner_brief_rides_every_call_of_the_run(config, task):
+    """Whole-run steering: a review call still reads the brief."""
     slug, paths = task
     prompts: list[str] = []
     calls = {"n": 0}
@@ -197,7 +197,57 @@ def test_owner_brief_reaches_only_the_plan_phase(config, task):
     )
     assert len(prompts) == 2
     assert "Sweep the docs too." in prompts[0]
-    assert "Sweep the docs too." not in prompts[1]
+    assert "Sweep the docs too." in prompts[1]
+
+
+def test_the_question_rides_review_calls_beside_its_answer(config, task):
+    """The pair travels together: an answer with no question is not answerable."""
+    slug, paths = task
+    storage.save_state(
+        paths,
+        TaskState(slug=slug, status=TaskStatus.BLOCKED, reason="which db?"),
+    )
+    prompts: list[str] = []
+    calls = {"n": 0}
+
+    def operator_invoker(prompt: str) -> str:
+        prompts.append(prompt)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"verdict":"continue","next_prompt":"go"}'
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        owner_brief="Use sqlite.",
+    )
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert "which db?" in prompt
+        assert "Use sqlite." in prompt
+
+
+def test_plan_ledger_line_records_the_brief(config, task):
+    """The owner's words enter the conversation at the plan line, recorded once."""
+    slug, paths = task
+    calls = {"n": 0}
+
+    def operator_invoker(prompt: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"verdict":"continue","next_prompt":"go"}'
+        return '{"verdict":"done"}'
+
+    run_task(
+        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
+        owner_brief="Sweep the docs too.",
+    )
+    entries = list(storage.read_ledger(paths))
+    assert entries[0].phase == "plan"
+    assert entries[0].owner_brief == "Sweep the docs too."
+    # The run's review lines never repeat it: one record per brief.
+    assert entries[1].phase == "review"
+    assert entries[1].owner_brief is None
 
 
 def test_no_note_carries_no_question(config, task):

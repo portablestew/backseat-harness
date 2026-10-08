@@ -139,6 +139,41 @@ def test_ledger_reads_back_a_line_written_before_the_model_field(config):
     assert entry.to_dict()["model"] is None
 
 
+def test_ledger_round_trips_owner_brief(config):
+    """The run's brief lands on the plan line; the field round-trips."""
+    paths = config.task_paths("t1")
+    storage.append_ledger(
+        paths,
+        LedgerEntry(
+            iteration=0, generation=1, verdict=VerdictKind.CONTINUE,
+            exit_code=0, timed_out=False, duration_s=0.0,
+            phase="plan", owner_brief="Keep the shared budget.",
+        ),
+    )
+    (entry,) = list(storage.read_ledger(paths))
+    assert entry.owner_brief == "Keep the shared budget."
+    assert entry.to_dict()["owner_brief"] == "Keep the shared budget."
+
+
+def test_ledger_reads_back_a_line_written_before_the_owner_brief_field(config):
+    """`owner_brief` is absent from every line written before it existed;
+    those lines must keep loading, as null -- this lane's own ledger is all of
+    them."""
+    paths = config.task_paths("t1")
+    paths.ledger.parent.mkdir(parents=True, exist_ok=True)
+    paths.ledger.write_text(
+        '{"at": 1790664771.0685432, "at_local": "2026-09-29T10:00:00-07:00", '
+        '"phase": "plan", "model": null, "iteration": 0, "generation": 1, '
+        '"verdict": "continue", "exit_code": 0, "timed_out": false, '
+        '"duration_s": 0.0, "notes": "planned", "next_prompt": "step 1", '
+        '"reset_context": false}\n',
+        encoding="utf-8",
+    )
+    (entry,) = list(storage.read_ledger(paths))
+    assert entry.owner_brief is None
+    assert entry.to_dict()["owner_brief"] is None
+
+
 def test_atomic_write_retries_a_contended_replace(config, monkeypatch, capsys):
     """WinError 5 on the swap is a losing race, not a verdict: wait it out."""
     real_replace = os.replace

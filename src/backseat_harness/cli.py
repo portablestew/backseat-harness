@@ -8,8 +8,8 @@ itself stays injectable.
 
 ``run <slug> [GOAL|BRIEF]`` reads its second argument two ways. On a lane with no
 goal-prompt yet it is the goal, and it is required. On a lane that already has
-one it is a brief from the task owner for this run only: it rides the
-plan-phase operator prompt, outranks the goal-prompt where they conflict, and
+one it is a brief from the task owner for this run only: it rides every
+operator prompt of the run, outranks the goal-prompt where they conflict, and
 ends with the run. That is how an ``ask_human`` pause gets answered without a
 separate verb -- and it is why a lane that is blocked or complete refuses a bare
 resume.
@@ -86,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         metavar="GOAL|BRIEF",
         help="the goal-prompt when the lane has none yet; on a lane that already "
-        "has one, a brief from you added to this run's operator prompt. Required "
+        "has one, a brief from you added to this run's operator prompts. Required "
         "for a new task, and for one that is blocked or complete",
     )
     run.add_argument(

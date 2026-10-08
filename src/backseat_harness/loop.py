@@ -148,10 +148,12 @@ def run_task(
 
     ``owner_brief`` is the task owner's own words for this run, supplied when a
     lane that already has a goal-prompt is resumed with a second argument (see
-    ``cli._cmd_run``). It reaches the plan-phase operator prompt and nothing
-    else, so it is one-shot without any persisted state to expire: the operator
-    bakes it into the checklist and the first prompt, and the run ends carrying
-    it. The ``ask_human`` question it usually answers rides alongside it,
+    ``cli._cmd_run``). It rides every operator prompt of the run -- plan and
+    review -- and dies with it: the parameter is per-run, a bare resume brings
+    none, and a later run replaces it, so one brief is in force at a time. The
+    operator bakes it into the checklist and the first prompt, and the run's
+    plan line records it in the ledger for posterity. The ``ask_human``
+    question it usually answers rides alongside it on the same prompts,
     captured from ``state.reason`` below -- the operator is invoked fresh and
     has no memory of having asked.
     """
@@ -203,11 +205,11 @@ def run_task(
             slot_warning=slot_warning,
             docs=_list_docs(paths, config.workspace_root),
             transcript_file=transcript_file,
-            # Both are one-shot by construction: only the plan-phase call that
-            # opens the run can carry them, and a review call is built from the
-            # same closure with `outcome` set, so neither can leak forward.
-            owner_brief=owner_brief if outcome is None else None,
-            pending_question=pending_question if outcome is None else None,
+            # Both ride every call of the run that supplies them: run-scoped by
+            # construction (this closure is rebuilt per run_task), so nothing
+            # leaks past the run's end into a later resume.
+            owner_brief=owner_brief or None,
+            pending_question=pending_question or None,
         )
         # One budget for every unusable reply, whatever made it unusable. An
         # unparsable envelope and a bad model slot are the same failure to the
@@ -358,7 +360,10 @@ def run_task(
         )
         verdict = call_operator(None, prior, slot_warning=plan_warning)
         with progress.step("persist plan verdict"):
-            _persist(paths, state, binding, verdict, None, phase="plan")
+            _persist(
+                paths, state, binding, verdict, None,
+                phase="plan", owner_brief=owner_brief,
+            )
         _report(verdict)
         last_verdict = verdict.kind
         terminal = _terminal(paths, state, verdict)
@@ -814,6 +819,7 @@ def _persist(
     result: TurnResult | None,
     phase: str,
     model: str | None = None,
+    owner_brief: str | None = None,
 ) -> None:
     """Apply a verdict to disk. The harness is the only writer.
 
@@ -825,6 +831,11 @@ def _persist(
     would read the checklist *after* the merge above and record the next
     turn's slot on this turn's line. It defaults to None because a
     plan-phase verdict spawns no turn, so no ``--model`` was composed for it.
+
+    ``owner_brief`` records the run's brief on the plan line that opens the
+    run: the owner's words enter the conversation here, the ledger logs each
+    utterance once, and the run's review lines never repeat it. None on review
+    lines and on runs without a brief.
     """
     current = checklist_mod.load_checklist(paths.checklist)
     merged = checklist_mod.merge_update(current, verdict.checklist_update)
@@ -845,6 +856,7 @@ def _persist(
             reset_context=verdict.reset_context,
             phase=phase,
             model=model,
+            owner_brief=owner_brief,
         ),
     )
 
