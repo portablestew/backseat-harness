@@ -2835,3 +2835,90 @@ def test_header_action_button_sits_below_back_link():
     rule = css[start : css.index("}", start)]
     assert "align-self: flex-end" in rule
     assert "margin: 0.6rem 0 0" in rule
+
+
+# --- step 4-test: edge coverage named in the QA plan ---------------------------
+
+
+def test_auto_refresh_keeps_homepage_poll_and_pauses_on_edit(workspace: Path):
+    """Goal 1 / plan edge cases: the homepage keeps its own HTMX ``every 60s``
+    poll (it must not also carry the reload hook), and the shared reload helper
+    defers while the user is typing or an expander is open (rendered source)."""
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        home = client.get("/")
+        page = client.get(f"/ws/{ws_id}")
+
+    assert home.status_code == 200 and page.status_code == 200
+
+    # The homepage poll is intact -- the other half of the page split.
+    assert 'hx-trigger="every 60s, workspaceAdded from:body"' in home.text
+    assert 'data-auto-refresh="60"' not in home.text
+
+    # The reload helper defers while editing or with an open + expander.
+    body = page.text
+    assert "details.expander[open]" in body
+    assert "/^(input|textarea|select)$/i" in body
+    assert "window.location.reload()" in body
+
+
+def test_prompt_excerpt_strips_indented_quotes_and_chat_header(monkeypatch):
+    """Goal 6 / plan edge cases: the blockquote marker is dropped even when the
+    line is space- or tab-indented before the ``>``, and the same stripped
+    string reaches the chat page's sticky header (the body keeps its escaping)."""
+    excerpt = chat_search_service._prompt_excerpt
+
+    assert excerpt("## USER\n   > indented prompt") == "indented prompt"
+    assert excerpt("## USER\n\t> tabbed prompt") == "tabbed prompt"
+
+    from backseat_harness import history
+
+    transcript = "## USER\n> quoted header line\n## ASSISTANT\n> reply"
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: transcript for k in keys},
+    )
+
+    with _client() as client:
+        resp = client.get("/chat/opencode/ses_quoted_header")
+
+    assert resp.status_code == 200
+    header = resp.text[resp.text.index('<header class="chat-header') : resp.text.index("</header>")]
+    assert "<strong>quoted header line</strong>" in header
+    assert "&gt;" not in header
+
+
+def test_action_forms_carry_shared_offset_class(monkeypatch, workspace: Path):
+    """Goal 13 / plan 3a: the shared ``.chat-continue-form`` offset rule applies
+    to the real controls -- the task page's Takeover form and the chat page's
+    Continue form render with that class inside ``<header class="chat-header">``."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "offset-lane", updated_at=1_700_000_000.0)
+
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "a chat body" for k in keys},
+    )
+
+    with _client() as client:
+        task = client.get(f"/ws/{ws_id}/tasks/offset-lane")
+        chat = client.get("/chat/opencode/ses_offset")
+
+    assert task.status_code == 200 and chat.status_code == 200
+
+    # The shared offset rule is served with the pages...
+    assert "align-self: flex-end" in task.text
+    assert "margin: 0.6rem 0 0" in task.text
+
+    # ...and both real controls carry the class inside the sticky header.
+    for html, form in (
+        (task.text, 'id="takeover-form" class="chat-continue-form"'),
+        (chat.text, 'id="resume-form" class="chat-continue-form"'),
+    ):
+        header = html[html.index('<header class="chat-header') : html.index("</header>")]
+        assert form in header
