@@ -148,6 +148,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="forward --debug to daemon-spawned runs ([dbg] step lines in "
         "each lane's daemon.log); also accepted before the daemon subcommand",
     )
+    # Same SUPPRESS pattern as --debug: absent means simply "no web server",
+    # so the root-level value is never clobbered by a subparser default.
+    daemon_run.add_argument(
+        "--web",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="also serve the web interface in this process (host/port from "
+        "the [web] table; a busy port is refused before the daemon starts)",
+    )
     daemon_run.set_defaults(func=_cmd_daemon)
 
     daemon_install = daemon_sub.add_parser(
@@ -495,8 +504,26 @@ def _cmd_daemon(args) -> int:
     left untouched. Ctrl-C is the normal way to stop — by the time it surfaces
     here the ``finally`` in ``run`` has already joined the watchers and
     released the guard, so both exits report the same stopped payload.
+
+    ``--web`` (2-plan A/3a) also serves the web interface in this process, on
+    a background thread started before the guard is claimed: a bad bind
+    (non-localhost host, busy port) is refused with exit 2 and no daemon.
+    uvicorn only installs signal handlers on the main thread, so Ctrl-C keeps
+    reaching this handler chain and the web thread is joined and stopped here.
     """
     instance = Daemon(debug=getattr(args, "debug", False))
+    web_handle = None
+    if getattr(args, "web", False):
+        # Lazily: the daemon process without --web never loads the web stack.
+        from backseat_harness import config as config_mod
+        from backseat_harness.web.cli import start_web_in_thread
+
+        config = config_mod.load_config(args.workspace)
+        try:
+            web_handle = start_web_in_thread(host=config.web.host, port=config.web.port)
+        except (OSError, ValueError) as exc:
+            _emit(args, {"error": str(exc)}, f"web: refused to start: {exc}")
+            return 2
     try:
         instance.run()
     except db.DaemonAlreadyRunning as exc:
@@ -504,6 +531,9 @@ def _cmd_daemon(args) -> int:
         return 2
     except KeyboardInterrupt:
         pass
+    finally:
+        if web_handle is not None:
+            web_handle.stop()
     _emit(args, {"daemon": "stopped"}, "daemon stopped")
     return 0
 

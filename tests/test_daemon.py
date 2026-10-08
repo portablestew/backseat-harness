@@ -622,3 +622,108 @@ def test_the_workspace_watch_is_filtered_to_goal_and_job_files(
     # ...and a goal.md move resets it to now+30s (goal:55-58).
     on_change([str(goal)])
     assert daemon._sched._jobs[checkin_job(ws)].deadline == clock() + 30
+
+
+# --- daemon run --web: the embedded web server (2-plan A/3a) -------------------
+
+
+def _free_port() -> int:
+    """A port the OS hands out free; returned already closed."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_daemon_run_web_starts_stoppable_background_thread(monkeypatch):
+    """--web serves the app on a background thread, and ``stop()`` ends it.
+
+    The fake uvicorn.Server records the thread it runs on and spins until
+    ``should_exit``, so both halves of the WebHandle contract are observed:
+    run happens off the main thread (the daemon keeps it for its pump and for
+    Ctrl-C — uvicorn installs no handlers off the main thread), and ``stop()``
+    is the one channel that ends it.
+    """
+    recorded: dict[str, object] = {}
+    started = threading.Event()
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            thread = threading.current_thread()
+            recorded["thread"] = thread
+            recorded["on_main"] = thread is threading.main_thread()
+            recorded["host"] = self.config.host
+            recorded["port"] = self.config.port
+            started.set()
+            deadline = time.monotonic() + 10.0
+            while not self.should_exit and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+
+    from backseat_harness.web import cli as web_cli
+    from backseat_harness.web.cli import start_web_in_thread
+
+    port = _free_port()
+    handle = start_web_in_thread(host="127.0.0.1", port=port)
+    try:
+        assert started.wait(timeout=5.0), "fake server never started"
+        assert recorded["on_main"] is False
+        assert recorded["thread"].name == web_cli.WEB_THREAD_NAME
+        assert recorded["thread"].is_alive()
+        assert (recorded["host"], recorded["port"]) == ("127.0.0.1", port)
+    finally:
+        handle.stop()
+    assert handle._server is None, "stop() releases the server handle exactly once"
+    assert not recorded["thread"].is_alive(), "thread joined before stop returned"
+
+
+def test_daemon_run_web_refuses_when_port_busy(tmp_path: Path):
+    """--web on a busy port exits 2 BEFORE the daemon claims its guard."""
+    import socket
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        ws = tmp_path / "ws"
+        (ws / ".backseat").mkdir(parents=True)
+        (ws / ".backseat" / "config.toml").write_text(f"[web]\nport = {port}\n", encoding="utf-8")
+
+        from backseat_harness import cli
+
+        args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+        rc = args.func(args)
+    finally:
+        blocker.close()
+
+    assert rc == 2, "a busy port is a pre-run refusal, not a half-started daemon"
+    with db.open_db() as conn:
+        assert db._daemon_record(conn) is None, "no guard may be claimed on refusal"
+
+
+def test_daemon_module_does_not_import_web():
+    """The daemon never imports the web stack; the bridge lives in cli.py."""
+    import ast
+
+    from backseat_harness import daemon as daemon_mod
+
+    source = Path(daemon_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(daemon_mod.__file__))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+    for name in imported:
+        assert not name.startswith("backseat_harness.web"), (
+            f"daemon.py imports {name!r}; the embedded web bridge belongs to "
+            "cli -> web.cli (2-plan A/3a)"
+        )
