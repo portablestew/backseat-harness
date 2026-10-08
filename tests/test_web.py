@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -31,6 +32,7 @@ from starlette.websockets import WebSocketDisconnect
 from backseat_harness import db
 from backseat_harness.web.main import create_app
 from backseat_harness.web.services import chat_search as chat_search_service
+from backseat_harness.web.services import workspace as workspace_service
 
 _PORT = 8080
 
@@ -93,12 +95,63 @@ def test_homepage_lists_registered_workspace_name_and_full_path(workspace: Path)
     assert f"<small>{resolved}</small>" in resp.text
 
 
+def test_homepage_and_fragment_link_workspace_cards(workspace: Path):
+    """Each workspace card links to ``/ws/<id>`` in both the full page and the
+    60s HTMX fragment (docs/2-plan.md Step A).
+
+    Regression: cards were bare ``<article>`` elements with no ``href`` and
+    ``_entries()`` carried no id, so workspaces could not be clicked.
+    """
+    with db.open_db() as conn:
+        assert db.add_workspace(conn, workspace) is True
+        ws_id = db._workspace_id(conn, workspace)
+    assert ws_id is not None
+
+    with _client() as client:
+        page = client.get("/")
+        fragment = client.get("/workspaces/fragment")
+
+    assert page.status_code == 200
+    assert fragment.status_code == 200
+    link = f'href="/ws/{ws_id}"'
+    assert link in page.text
+    assert link in fragment.text
+    # The old non-clickable markup is gone from both renders.
+    assert '<article class="workspace-card">' not in page.text
+    assert '<article class="workspace-card">' not in fragment.text
+
+
 def test_homepage_without_workspaces_says_so():
     with _client() as client:
         resp = client.get("/")
 
     assert resp.status_code == 200
     assert "No workspaces registered yet." in resp.text
+
+
+def test_base_uses_dark_theme():
+    """The shared layout is unconditionally dark: Pico's ``data-theme="dark"``
+    pins the palette regardless of the OS and ``color-scheme: dark`` locks
+    native widgets dark (plan Step D, Q8/F7)."""
+    with _client() as client:
+        resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert 'data-theme="dark"' in resp.text
+    assert "color-scheme: dark" in resp.text
+    # No light variant and no OS-driven theme switching.
+    assert "prefers-color-scheme" not in resp.text
+
+
+def test_base_swaps_400_error_toast():
+    """A 400 from add-workspace must reach ``#toast``: the base layout opts 400
+    responses into htmx's swap (htmx does not swap 4xx by default)."""
+    with _client() as client:
+        resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "htmx:beforeSwap" in resp.text
+    assert "=== 400" in resp.text
 
 
 # --- add-task form (step 5.3, 9.2) ---------------------------------------------
@@ -192,12 +245,24 @@ _MARKER = "<meta>START SESSION 5bee533f-ab27-4fe2-a548-a675f597479c #1</meta>"
 
 
 class _Ref:
-    """Stand-in for a chat-mother-forker ChatRef (only the attrs the seam reads)."""
+    """Stand-in for a chat-mother-forker ChatRef (attrs the seams read)."""
 
-    def __init__(self, key: str, mtime: float, project: str | None = None):
+    def __init__(
+        self,
+        key: str,
+        mtime: float,
+        project: str | None = None,
+        *,
+        locator: str | None = None,
+        database: str | None = None,
+        session: str | None = None,
+    ):
         self.key = key
         self.mtime = mtime
         self.project = project
+        self.locator = locator
+        self.database = database
+        self.session = session
 
 
 def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
@@ -205,6 +270,17 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
 
     Everything downstream -- search_all_sessions' sort, classify_session, the
     route's resume/fork enrichment, and the template -- stays real.
+
+    Three seams are stubbed, one per shape of read:
+    - ``find_chats`` (the parse-per-row search) for the two listing pages,
+    - ``list_session_refs`` (the cheap, unparsed listing) for the suggestion
+      list and the fork route,
+    - ``load_sessions`` (batched transcripts) for the rows' text.
+
+    ``load_chat`` is deliberately *not* stubbed: a request for it means some
+    path went back to the per-row tiered search that re-scans every stored
+    conversation for each row, which is what made ``/ws/<id>`` take minutes
+    (history.load_sessions).
     """
     from backseat_harness import history
 
@@ -213,11 +289,15 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
             return lambda query="", providers=None, limit=None: list(refs)
         if attr == "default_providers":
             return lambda: []
-        if attr == "load_chat":
-            return lambda key, providers=None: transcripts[key]
         raise AssertionError(f"unexpected history seam requested: {attr}")
 
     monkeypatch.setattr(history, "_load", _fake_load)
+    monkeypatch.setattr(history, "list_session_refs", lambda limit=None: list(refs))
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: transcripts[k] for k in keys if k in transcripts},
+    )
 
 
 def _data_rows(html: str) -> list[str]:
@@ -501,17 +581,268 @@ def test_homepage_suggest_offers_only_unregistered_chat_dirs(
         page = client.get("/")
         resp = client.get("/workspaces/suggest")
 
-    # The homepage Suggestions section is wired to this endpoint.
+    # The homepage add control is wired to this endpoint.
     assert 'hx-get="/workspaces/suggest"' in page.text
 
     assert resp.status_code == 200
     body = resp.text
-    # Offered: the unregistered dir with chats, as a button that POSTs its path.
-    assert f">{candidate}</button>" in body
-    assert 'hx-post="/workspaces"' in body
+    # Offered: the unregistered dir with chats, as a datalist option.
+    candidate_s = workspace_service._normalize(candidate)
+    assert f'<option value="{candidate_s}">' in body
+    # The old POST-button payload is gone (Step C changed the shape, F2).
+    assert 'hx-post="/workspaces"' not in body
     # Filtered out: already-registered workspaces and dirs that don't exist.
     assert str(registered) not in body
     assert str(vanished) not in body
+
+
+def test_workspace_dir_for_dispatches_kiro_ide_and_v2(tmp_path: Path):
+    """Exact provider dispatch: ``kiro_ide`` and ``kiro_ide_v2`` recover from
+    their own (different) store shapes (plan D2, F3)."""
+    v2_ws = tmp_path / "v2-workspace"
+    v2_ws.mkdir()
+    v2_session = tmp_path / "v2-session"
+    v2_session.mkdir()
+    (v2_session / "session.json").write_text(
+        json.dumps({"workspacePaths": [str(v2_ws)]}), encoding="utf-8"
+    )
+
+    legacy_ws = tmp_path / "legacy-workspace"
+    legacy_ws.mkdir()
+    legacy_log = tmp_path / "exec.json"
+    legacy_log.write_text(
+        json.dumps(
+            {
+                "context": {
+                    "messages": [
+                        {
+                            "entries": [
+                                {
+                                    "type": "document",
+                                    "document": {
+                                        "staticDirectoryView": (
+                                            f"<folder name='{legacy_ws}\\.git' closed />"
+                                        )
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    v2_ref = _Ref(
+        "kiro_ide_v2:sess_1", 2.0, v2_ws.name, locator=str(v2_session)
+    )
+    legacy_ref = _Ref(
+        "kiro_ide:sess_2", 1.0, legacy_ws.name, locator=str(legacy_log)
+    )
+
+    assert workspace_service._workspace_dir_for(v2_ref) == str(v2_ws)
+    assert workspace_service._workspace_dir_for(legacy_ref) == str(legacy_ws)
+
+
+def test_workspace_dir_for_reads_stores_and_skips_unrecoverable(tmp_path: Path):
+    """DB/jsonl recovery succeeds; unknown/missing store data returns None
+    (never a guessed path) (plan Q3/Q4, F4)."""
+    sqlite_ws = tmp_path / "sqlite-workspace"
+    sqlite_ws.mkdir()
+    db_file = tmp_path / "opencode.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("CREATE TABLE session (id TEXT, directory TEXT)")
+    conn.execute("INSERT INTO session VALUES (?, ?)", ("ses_1", str(sqlite_ws)))
+    conn.commit()
+    conn.close()
+    db_ref = _Ref(
+        "opencode:ses_1", 1.0, sqlite_ws.name, database=str(db_file), session="ses_1"
+    )
+    assert workspace_service._workspace_dir_for(db_ref) == str(sqlite_ws)
+
+    # claude_code: the first line has no cwd; a later line does (F4).
+    claude_ws = tmp_path / "claude-workspace"
+    claude_ws.mkdir()
+    jsonl = tmp_path / "sess.jsonl"
+    jsonl.write_text(
+        json.dumps({"type": "file-history-snapshot"})
+        + "\n"
+        + json.dumps({"type": "user", "cwd": str(claude_ws)})
+        + "\n",
+        encoding="utf-8",
+    )
+    claude_ref = _Ref("claude_code:sess", 1.0, claude_ws.name, locator=str(jsonl))
+    assert workspace_service._workspace_dir_for(claude_ref) == str(claude_ws)
+
+    # Unrecoverable: unknown provider, DB ref with no session, missing stores.
+    assert workspace_service._workspace_dir_for(_Ref("mystery:x", 1.0, "somewhere")) is None
+    assert (
+        workspace_service._workspace_dir_for(
+            _Ref("opencode:x", 1.0, "somewhere", database=str(db_file))
+        )
+        is None
+    )
+    assert (
+        workspace_service._workspace_dir_for(
+            _Ref("kiro_ide_v2:x", 1.0, "somewhere", locator=str(tmp_path / "nope"))
+        )
+        is None
+    )
+
+
+def test_suggest_lists_dir_recovered_from_provider_store(monkeypatch, tmp_path: Path):
+    """A ref the old code dropped now appears: its ``project`` is only the bare
+    basename the real providers store, and the absolute dir is recovered from
+    the provider store (plan D1/D2, Q4)."""
+    ws_dir = tmp_path / "brick-lobster"
+    ws_dir.mkdir()
+    session_dir = tmp_path / "v2-session"
+    session_dir.mkdir()
+    (session_dir / "session.json").write_text(
+        json.dumps({"workspacePaths": [str(ws_dir)]}), encoding="utf-8"
+    )
+    # project is the basename only — Path("brick-lobster").is_dir() is False,
+    # so the old _candidate_dirs dropped this ref.
+    refs = [_Ref("kiro_ide_v2:sess_x", 300.0, ws_dir.name, locator=str(session_dir))]
+    _stub_chat_history(monkeypatch, refs, {})
+
+    with _client() as client:
+        resp = client.get("/workspaces/suggest")
+
+    assert resp.status_code == 200
+    assert str(ws_dir) in resp.text
+
+
+# --- step 11e: add-workspace + control -----------------------------------------
+
+
+def test_suggest_renders_datalist_options_with_ready_state(
+    monkeypatch, tmp_path: Path
+):
+    """``/workspaces/suggest`` emits datalist-consumable ``<option>`` rows,
+    tagging each dir ready (has ``.backseat/``) or needs-init (plan Step C/F2,
+    Q6)."""
+    ready = tmp_path / "ready-ws"
+    (ready / ".backseat").mkdir(parents=True)
+    plain = tmp_path / "plain-ws"
+    plain.mkdir()
+    refs = [
+        _Ref("opencode:ses_ready", mtime=300.0, project=str(ready)),
+        _Ref("opencode:ses_plain", mtime=200.0, project=str(plain)),
+    ]
+    _stub_chat_history(monkeypatch, refs, {})
+
+    with _client() as client:
+        resp = client.get("/workspaces/suggest")
+
+    assert resp.status_code == 200
+    body = resp.text
+    ready_s = workspace_service._normalize(ready)
+    plain_s = workspace_service._normalize(plain)
+    assert f'<option value="{ready_s}">{ready_s} \u00b7 ready</option>' in body
+    assert f'<option value="{plain_s}">{plain_s} \u00b7 needs init</option>' in body
+    assert "hx-post" not in body
+
+
+def test_homepage_has_add_workspace_plus_control():
+    """The ``+`` disclosure, its path input, and its ``<datalist>`` live on the
+    homepage but outside the 60s-polled ``#workspace-list`` fragment, so a poll
+    can never wipe an open panel (plan Step C, F5/F8)."""
+    with _client() as client:
+        page = client.get("/")
+        fragment = client.get("/workspaces/fragment")
+
+    assert page.status_code == 200
+    assert fragment.status_code == 200
+
+    # The ``+`` control and its datalist-fed path input.
+    assert 'class="add-workspace-plus"' in page.text
+    assert ">+</summary>" in page.text
+    assert 'name="path"' in page.text
+    assert 'list="ws-suggestions"' in page.text
+    assert '<datalist id="ws-suggestions"' in page.text
+    assert 'hx-get="/workspaces/suggest"' in page.text
+    # The list refreshes immediately after a successful add (F8).
+    assert "workspaceAdded from:body" in page.text
+
+    # The polled fragment is cards only: no panel to lose on the outerHTML swap.
+    assert "add-workspace" not in fragment.text
+    assert 'name="path"' not in fragment.text
+    assert "<datalist" not in fragment.text
+    assert "workspaceAdded from:body" in fragment.text
+
+
+def test_add_workspace_panel_is_bounded_and_holds_plus_and_form():
+    """Owner brief: expanded, the ``+`` becomes a bounded panel (not the page
+    width) with the ``+`` at its top-left and the path input + Add button
+    inside it. Hermetic proxy for the geometry: the served CSS caps the panel
+    width, and the markup nests both the ``+`` and the form in the panel."""
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    # The open state is the panel, capped well under the page width.
+    assert ".add-workspace[open]" in page.text
+    assert "max-width: 100%" in page.text
+    assert "width: 26rem" in page.text
+    # The "+" and the path form are both descendants of the panel element.
+    start = page.text.index('id="add-workspace"')
+    panel = page.text[start : page.text.index("</details>", start)]
+    assert 'class="add-workspace-plus"' in panel
+    assert 'name="path"' in panel
+    assert 'type="submit"' in panel
+
+
+def test_add_workspace_initializes_plain_dir_and_triggers_refresh(
+    monkeypatch, tmp_path: Path, fake_home: Path
+):
+    """Adding an existing dir with no ``.backseat/`` creates the marker, then
+    registers it and asks the list to refresh (plan Step C, F1/F8)."""
+    plain = tmp_path / "plain-ws"
+    plain.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    with _client() as client:
+        resp = client.post("/workspaces", data={"path": str(plain)})
+
+    assert resp.status_code == 200, resp.text
+    assert (plain / ".backseat").is_dir()
+    assert "Initialized and registered workspace" in resp.text
+    assert resp.headers["HX-Trigger"] == "workspaceAdded"
+    with db.open_db() as conn:
+        assert str(plain.resolve()) in db.list_workspaces(conn)
+
+
+def test_add_workspace_registers_existing_workspace(
+    monkeypatch, tmp_path: Path, fake_home: Path
+):
+    """Adding a dir that already has ``.backseat/`` registers it as before, with
+    the immediate-refresh header and no initialization message (plan Q7)."""
+    ws = tmp_path / "already-ws"
+    (ws / ".backseat").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    with _client() as client:
+        resp = client.post("/workspaces", data={"path": str(ws)})
+
+    assert resp.status_code == 200, resp.text
+    assert "Registered workspace" in resp.text
+    assert "Initialized" not in resp.text
+    assert resp.headers["HX-Trigger"] == "workspaceAdded"
+
+
+def test_add_workspace_nonexistent_path_is_400(tmp_path: Path):
+    """A path that is not a directory is refused (HTTP 400), and no refresh is
+    triggered (plan Q7)."""
+    missing = tmp_path / "not-here"
+    with _client() as client:
+        resp = client.post("/workspaces", data={"path": str(missing)})
+
+    assert resp.status_code == 400
+    assert "HX-Trigger" not in resp.headers
 
 
 # --- step 11b: workspace page listings -----------------------------------------
@@ -636,6 +967,73 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
     assert "managed" not in chats
     assert "ses_elsewhere" not in chats
     assert "other project chatter" not in chats
+
+
+def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: Path):
+    """Regression guard for the slow ``/ws/<id>``: one batched transcript read.
+
+    The pre-fix path asked chat-mother-forker for each row's transcript one at
+    a time, and every one of those tiered searches re-parses *every* stored
+    conversation of *every* provider -- measured at 2.4s per row against this
+    machine's 344 stored conversations, 147s end-to-end for one workspace
+    page. The page must ask once, with all candidate keys at once, and it
+    must hand the fetch the *same* memoized providers the search used: that
+    sharing is what keeps the whole render at one parse per row instead of
+    one per pass.
+    """
+    ws_id = _register_workspace(workspace)
+    refs = [
+        _Ref("opencode:ses_batch_a", mtime=300.0, project=str(workspace)),
+        _Ref("claude_code:ses_batch_b", mtime=200.0, project=str(workspace)),
+    ]
+    _stub_chat_history(
+        monkeypatch,
+        refs,
+        {
+            "opencode:ses_batch_a": "chat about widgets",
+            "claude_code:ses_batch_b": "chat about gadgets",
+        },
+    )
+
+    from backseat_harness import history
+
+    calls: list[list[str]] = []
+    seen: dict[str, object] = {}
+    batched = history.load_sessions
+
+    # Record the provider list the search was handed, so the transcript fetch
+    # can be checked for passing the very same one.
+    real_load = history._load
+
+    def _spy_load(attr: str):
+        impl = real_load(attr)
+        if attr != "find_chats":
+            return impl
+
+        def _find_chats(query="", providers=None, limit=None):
+            seen["search_providers"] = providers
+            return impl(query, providers=providers, limit=limit)
+
+        return _find_chats
+
+    def _spy(keys, providers=None) -> dict[str, str]:
+        requested = list(keys)
+        calls.append(requested)
+        seen["load_providers"] = providers
+        return batched(requested, providers=providers)
+
+    monkeypatch.setattr(history, "_load", _spy_load)
+    monkeypatch.setattr(history, "load_sessions", _spy)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    assert len(calls) == 1, f"transcripts were fetched {len(calls)} times, not once"
+    assert set(calls[0]) == {"opencode:ses_batch_a", "claude_code:ses_batch_b"}
+    assert seen["load_providers"] is seen["search_providers"]
+    assert "chat about widgets" in page.text
+    assert "chat about gadgets" in page.text
 
 
 # --- step 11c: task viewer Run and Takeover controls ---------------------------
@@ -831,8 +1229,9 @@ def test_chat_viewer_renders_resume_argv_for_native_cli(monkeypatch):
     from backseat_harness import history
 
     transcript = "User: fix the flaky test\nAssistant: done, the test is stable"
+    # The viewer asks for the exact key in the URL (one parse), not a search.
     monkeypatch.setattr(
-        history, "load_full_transcript", lambda key, provider: transcript
+        history, "load_sessions", lambda keys, providers=None: {k: transcript for k in keys}
     )
 
     with _client() as client:
@@ -851,7 +1250,9 @@ def test_chat_viewer_renders_resume_argv_for_native_cli(monkeypatch):
 
     # A provider with no interactive resume gets the transcript, no button.
     monkeypatch.setattr(
-        history, "load_full_transcript", lambda key, provider: "ide-side chat"
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide-side chat" for k in keys},
     )
     with _client() as client:
         resp2 = client.get("/chat/kiro_ide/sess_x")

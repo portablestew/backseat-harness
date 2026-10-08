@@ -1,11 +1,16 @@
 """Chat viewer route (step 7.2, 7.5): GET /chat/<provider>/<conversation_id>.
 
-Thin over ``history.load_full_transcript``: rendering lives here.
-Unknown provider or session returns 404.
+Thin over ``history.load_sessions``: rendering lives here. Unknown provider
+or session returns 404.
+
+The URL already names the exact session, so the viewer asks for that key
+rather than content-searching for it: one listing plus one parse of the one
+conversation, where the search path parses every candidate of that provider
+(32 parses against this machine's stores) to find the same row.
 
 The provider parameter is the chat-mother-forker history provider name
 (e.g., opencode, kiro_cli, kiro_ide, kiro_ide_v2, claude_code, kilo, cline),
-which is what load_full_transcript expects.
+which is what load_sessions expects in a key.
 """
 
 from __future__ import annotations
@@ -63,15 +68,16 @@ def _build_resume_command(provider: str, conversation_id: str) -> list[str] | No
 
 @router.get("/chat/{provider}/{conversation_id}", response_class=HTMLResponse)
 def chat_page(request: Request, provider: str, conversation_id: str):
-    """Read-only chat viewer: full transcript via history.load_full_transcript."""
+    """Read-only chat viewer: full transcript for the exact session in the URL."""
     if provider not in _VALID_HISTORY_PROVIDERS:
         return HTMLResponse(f"Unknown provider: {provider}", status_code=404)
 
-    # Build search key for chat-mother-forker (format: "provider:conversation_id")
+    # Exact key (provider:conversation_id) -- see the module docstring for why
+    # this is not a content search.
     search_key = f"{provider}:{conversation_id}"
 
     try:
-        transcript = history.load_full_transcript(search_key, provider)
+        transcript = history.load_sessions([search_key]).get(search_key)
     except history.HistoryError as e:
         return HTMLResponse(str(e), status_code=404)
 

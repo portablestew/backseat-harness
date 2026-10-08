@@ -359,7 +359,19 @@ def unregister_workspace(conn: sqlite3.Connection, path: Path | str) -> bool:
 
 def list_workspaces(conn: sqlite3.Connection) -> list[str]:
     """Every registered workspace path, in registration order."""
-    return [row["path"] for row in conn.execute("SELECT path FROM workspaces ORDER BY id")]
+    return [path for _id, path in list_workspaces_with_ids(conn)]
+
+
+def list_workspaces_with_ids(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """Every registered workspace as ``(id, path)``, in registration order.
+
+    The id is the URL key the ``/ws/{id}`` route resolves via
+    ``task.resolve_workspace``; the homepage needs it to link each card.
+    """
+    return [
+        (row["id"], row["path"])
+        for row in conn.execute("SELECT id, path FROM workspaces ORDER BY id")
+    ]
 
 
 def _workspace_id(conn: sqlite3.Connection, path: Path | str) -> int | None:

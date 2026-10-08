@@ -10,8 +10,10 @@ Also provides fork-provider selection helper (step 6.3).
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from backseat_harness import marker
 
@@ -107,9 +109,12 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
         return []
 
     try:
+        # One parse per row for the whole request: find_chats parses the rows
+        # it returns (project lives on the conversation), and the transcript
+        # fetch below reads them back from this same memoized list instead of
+        # the stores (history.memoized_providers).
         find_chats = history._load("find_chats")
-        default_providers = history._load("default_providers")
-        providers = default_providers()
+        providers = history.memoized_providers()
     except Exception:
         return []
 
@@ -129,18 +134,21 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
     # Sort by mtime desc (newest first)
     ws_candidates.sort(key=lambda r: getattr(r, "mtime", 0), reverse=True)
 
-    # Load transcripts and filter out backseat sessions
+    # Load transcripts and filter out backseat sessions. One batched read for
+    # every candidate (a per-row transcript load re-scans all stored
+    # conversations each time, rationale at history.load_sessions), served
+    # from the parse map the search above just filled.
     results = []
-    load_chat = None
+    try:
+        texts = history.load_sessions([r.key for r in ws_candidates], providers=providers)
+    except Exception:
+        texts = {}
     for ref in ws_candidates:
         if len(results) >= limit:
             break
 
-        try:
-            if load_chat is None:
-                load_chat = history._load("load_chat")
-            text = load_chat(ref.key, providers=providers)
-        except Exception:
+        text = texts.get(ref.key)
+        if text is None:
             continue
 
         if _is_backseat_session(text):
@@ -154,7 +162,7 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
         results.append(ChatInfo(
             key=ref.key,
             native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
-            project=project,
+            project=getattr(ref, "project", None),
             mtime=getattr(ref, "mtime", 0),
             preview=preview,
         ))
@@ -193,9 +201,10 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
         return []
 
     try:
+        # Same one-parse-per-row sharing as list_recent_chats: the search
+        # parses what it returns, the transcript fetch reads it from memory.
         find_chats = history._load("find_chats")
-        default_providers = history._load("default_providers")
-        providers = default_providers()
+        providers = history.memoized_providers()
     except Exception:
         return []
 
@@ -209,16 +218,16 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
 
     # Load transcripts and classify
     results = []
-    load_chat = None
+    try:
+        texts = history.load_sessions([r.key for r in refs], providers=providers)
+    except Exception:
+        texts = {}
     for ref in refs:
         if len(results) >= limit:
             break
 
-        try:
-            if load_chat is None:
-                load_chat = history._load("load_chat")
-            text = load_chat(ref.key, providers=providers)
-        except Exception:
+        text = texts.get(ref.key)
+        if text is None:
             classification = "other"
             preview = ""
         else:
@@ -262,7 +271,18 @@ def _extract_provider_from_key(key: str) -> str | None:
     return key.split(":", 1)[0]
 
 
-def pick_fork_provider(current_session_key: str, results: list[SessionSearchResult]) -> str:
+class _SessionKeyed(Protocol):
+    """Structural type for what :func:`pick_fork_provider` reads: a session key.
+
+    Lets the fork button pass the cheap ``history.SessionRef`` listing (which
+    parses nothing) as well as full ``SessionSearchResult`` rows from the
+    search page -- both carry ``key``, which is all the rules below look at.
+    """
+
+    key: str
+
+
+def pick_fork_provider(current_session_key: str, results: Sequence[_SessionKeyed]) -> str:
     """Select the provider to use for forking a session.
 
     Rules (per 2-plan.md §6 lines 106-111):
@@ -271,6 +291,9 @@ def pick_fork_provider(current_session_key: str, results: list[SessionSearchResu
        most recent such chat (by mtime).
     3. Else -> first of opencode / kiro / claude found on PATH.
     4. None on PATH -> raise RuntimeError.
+
+    ``results`` is read newest-first; only ``key`` is consulted, so callers
+    need no transcript text (the fork route lists keys only).
     """
     current_provider = _extract_provider_from_key(current_session_key)
 

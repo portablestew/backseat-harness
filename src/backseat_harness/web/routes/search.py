@@ -1,6 +1,9 @@
 """Raw session search routes (step 6.2, 6.4): GET /search?q=..., POST /search/fork.
 
-Thin over ``services.chat_search.search_all_sessions``: rendering lives here.
+GET /search is thin over ``services.chat_search.search_all_sessions``. The
+fork POST only needs session *keys* to pick a provider, so it lists them
+through ``history.list_session_refs`` -- the cheap, unparsed store scan --
+instead of loading 200 transcripts it would never read.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from backseat_harness import history
 from backseat_harness.web.services import chat_search as chat_search_service
 
 router = APIRouter()
@@ -128,11 +132,12 @@ async def search_fork(
     current_session_key: str = Form(...),
 ):
     """Fork a session using the selected provider, start a shell session, and redirect."""
-    # Search to get results for pick_fork_provider
-    results = await anyio.to_thread.run_sync(chat_search_service.search_all_sessions, "", 200)
-    
+    # Provider selection reads keys only (pick_fork_provider rule 2), so list
+    # them from the cheap store scan: no transcript is parsed here.
+    refs = await anyio.to_thread.run_sync(history.list_session_refs, 200)
+
     # Determine fork provider
-    fork_provider = chat_search_service.pick_fork_provider(current_session_key, results)
+    fork_provider = chat_search_service.pick_fork_provider(current_session_key, refs)
     
     # Build fork command (fresh TUI, no session ID)
     fork_command = _build_fork_command(fork_provider, conversation_id)

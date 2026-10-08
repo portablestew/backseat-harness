@@ -3,13 +3,12 @@
 Thin over ``services.workspace``: rendering lives here, registry/chat
 seams stay in the service layer. Snippet endpoints return small HTML
 fragments for HTMX targets (``#toast``, ``#workspace-list``,
-``#suggestions``).
+``#ws-suggestions``).
 """
 
 from __future__ import annotations
 
 import html
-import json
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Request
@@ -23,16 +22,20 @@ router = APIRouter()
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
+#: The polled workspace list also refreshes immediately when a successful add
+#: fires the ``workspaceAdded`` event (``HX-Trigger`` on the POST response).
 _POLL_ATTRS = (
-    'hx-get="/workspaces/fragment" hx-trigger="every 60s" hx-swap="outerHTML"'
+    'hx-get="/workspaces/fragment" '
+    'hx-trigger="every 60s, workspaceAdded from:body" '
+    'hx-swap="outerHTML"'
 )
 
 
-def _entries() -> list[dict[str, str]]:
-    """Workspace rows for templates: trailing name + full path (V4)."""
+def _entries() -> list[dict[str, object]]:
+    """Workspace rows for templates: id + trailing name + full path (V4)."""
     return [
-        {"name": workspace_service.display_name(p), "path": p}
-        for p in workspace_service.list_workspaces()
+        {"id": ws_id, "name": workspace_service.display_name(p), "path": p}
+        for ws_id, p in workspace_service.list_workspaces_with_ids()
     ]
 
 
@@ -41,13 +44,13 @@ def _toast_html(ok: bool, message: str) -> str:
     return f"<p><strong>{kind}:</strong> {html.escape(message)}</p>"
 
 
-def _fragment_html(entries: list[dict[str, str]]) -> str:
+def _fragment_html(entries: list[dict[str, object]]) -> str:
     if entries:
         cards = "\n".join(
-            "    <article class=\"workspace-card\">\n"
-            f"      <strong>{html.escape(e['name'])}</strong>"
-            f"<br><small>{html.escape(e['path'])}</small>\n"
-            "    </article>"
+            f"    <a class=\"workspace-card\" href=\"/ws/{e['id']}\">\n"
+            f"      <strong>{html.escape(str(e['name']))}</strong>"
+            f"<br><small>{html.escape(str(e['path']))}</small>\n"
+            "    </a>"
             for e in entries
         )
     else:
@@ -56,16 +59,18 @@ def _fragment_html(entries: list[dict[str, str]]) -> str:
 
 
 def _suggest_html(suggestions: list[str]) -> str:
-    if not suggestions:
-        return "<p>No unregistered workspace suggestions found.</p>"
+    """``<option>`` rows for the add-workspace ``<datalist>`` (plan Step C/F2).
+
+    The browser filters these natively as the user types. Each option tags
+    whether the dir already has ``.backseat/`` (``ready``) or will be
+    initialized when added (``needs init``).
+    """
     parts = []
     for s in suggestions:
-        vals = json.dumps({"path": s}).replace("'", "&#x27;")
-        parts.append(
-            f"<button hx-post=\"/workspaces\" hx-vals='{vals}' "
-            f"hx-target=\"#toast\" hx-swap=\"innerHTML\">"
-            f"{html.escape(s)}</button>"
-        )
+        status = "ready" if (Path(s) / ".backseat").is_dir() else "needs init"
+        value = html.escape(s, quote=True)
+        label = html.escape(f"{s} \u00b7 {status}")
+        parts.append(f'<option value="{value}">{label}</option>')
     return "\n".join(parts)
 
 
@@ -79,12 +84,30 @@ def homepage(request: Request):
 
 @router.post("/workspaces", response_class=HTMLResponse)
 def add_workspace(path: str = Form(...)):
-    """Register a workspace via the CLI; toast HTML for ``#toast`` (V5)."""
+    """Register a workspace via the CLI; toast HTML for ``#toast`` (V5).
+
+    Plan Step C/F1: an existing plain dir (no ``.backseat/``) is initialized
+    with a bare ``.backseat/`` marker before registering, so the dropdown's
+    un-initialized suggestions are actually addable. A nonexistent path is
+    left to the CLI, which refuses it unchanged (HTTP 400). On success the
+    ``HX-Trigger: workspaceAdded`` header refreshes ``#workspace-list`` at once
+    instead of waiting for the 60s poll (F8).
+    """
     target = (path or "").strip()
     if not target:
         return HTMLResponse(_toast_html(False, "path is required"), status_code=400)
+    try:
+        initialized = workspace_service.initialize_workspace_marker(target)
+    except OSError:
+        initialized = False
     ok, message = workspace_service.register_workspace(target)
-    return HTMLResponse(_toast_html(ok, message), status_code=200 if ok else 400)
+    if ok and initialized:
+        resolved = Path(target).expanduser().resolve()
+        message = f"Initialized and registered workspace {resolved}"
+    headers = {"HX-Trigger": "workspaceAdded"} if ok else None
+    return HTMLResponse(
+        _toast_html(ok, message), status_code=200 if ok else 400, headers=headers
+    )
 
 
 @router.get("/workspaces/fragment", response_class=HTMLResponse)

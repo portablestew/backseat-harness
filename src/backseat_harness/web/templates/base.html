@@ -1,11 +1,239 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}backseat-harness{% endblock %}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.0.6/css/pico.min.css">
+  <style>
+    /* Always-dark, modern chrome. Unconditional: Pico's data-theme="dark" on
+       <html> pins the dark palette regardless of the OS, and color-scheme:dark
+       locks native widgets (scrollbars, the datalist dropdown) dark too. No
+       light variant and no OS-driven color-scheme media query anywhere. */
+    :root {
+      color-scheme: dark;
+      --bg: #0f1216;
+      --surface: #171b21;
+      --surface-2: #1e242c;
+      --surface-hover: #262d37;
+      --border: #2a323c;
+      --border-hover: #3a4553;
+      --text: #e6edf3;
+      --muted: #9aa7b4;
+      --accent: #4c8dff;
+      --accent-hover: #6ba1ff;
+      --accent-ink: #06121f;
+      --radius: 10px;
+      --ring: 0 0 0 3px rgba(76, 141, 255, 0.35);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.25);
+      /* Align Pico's own component variables with the palette above; this
+         stylesheet follows the CDN link, so these win over its defaults. */
+      --pico-border-radius: var(--radius);
+      --pico-primary: var(--accent);
+      --pico-primary-hover: var(--accent-hover);
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+    }
+    a {
+      color: var(--accent);
+    }
+    a:hover {
+      color: var(--accent-hover);
+    }
+
+    /* Buttons */
+    button,
+    [role="button"],
+    input[type="submit"],
+    input[type="button"] {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      color: var(--text);
+      font-weight: 600;
+      transition: background 0.15s ease, border-color 0.15s ease,
+        transform 0.05s ease, box-shadow 0.15s ease;
+    }
+    button:hover,
+    [role="button"]:hover,
+    input[type="submit"]:hover,
+    input[type="button"]:hover {
+      background: var(--surface-hover);
+      border-color: var(--border-hover);
+    }
+    button:active,
+    [role="button"]:active {
+      transform: translateY(1px);
+    }
+    button[type="submit"] {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+    }
+    button[type="submit"]:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+    button:focus-visible,
+    [role="button"]:focus-visible,
+    a:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible {
+      outline: none;
+      box-shadow: var(--ring);
+    }
+
+    /* Inputs (incl. the datalist-backed path input) */
+    input,
+    textarea,
+    select {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+    }
+    input:hover,
+    textarea:hover,
+    select:hover {
+      border-color: var(--border-hover);
+    }
+    input::placeholder,
+    textarea::placeholder {
+      color: var(--muted);
+    }
+
+    /* Workspace cards */
+    .workspace-card {
+      display: block;
+      padding: 0.9rem 1.1rem;
+      margin-bottom: 0.6rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      text-decoration: none;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease,
+        transform 0.05s ease, box-shadow 0.15s ease;
+    }
+    .workspace-card:hover {
+      background: var(--surface-2);
+      border-color: var(--accent);
+      box-shadow: var(--shadow);
+      transform: translateY(-1px);
+    }
+    .workspace-card small {
+      color: var(--muted);
+    }
+
+    /* Add-workspace "+" control and its expanded panel. Collapsed the control
+       is just the round "+"; expanded the same element becomes a bounded
+       panel with the "+" pinned at its top-left and the path field + Add
+       button inside it (owner brief). The panel is sized well under the page
+       width via the form's fixed width. */
+    .add-workspace {
+      margin-top: 0.75rem;
+    }
+    .add-workspace-plus {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2.1rem;
+      height: 2.1rem;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: var(--surface-2);
+      color: var(--text);
+      font-size: 1.3rem;
+      line-height: 1;
+      list-style: none;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s ease, border-color 0.15s ease,
+        color 0.15s ease, box-shadow 0.15s ease;
+    }
+    /* Pico draws its own disclosure triangle on summary::after; inside this
+       inline-flex control it lands as a second flex item, which both shows a
+       caret and knocks the "+" off-center. Suppress it, plus the native
+       marker the UA would draw, so the round control holds just the "+". */
+    .add-workspace-plus::after {
+      content: none;
+      display: none;
+    }
+    .add-workspace-plus::-webkit-details-marker {
+      display: none;
+    }
+    .add-workspace-plus:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      box-shadow: var(--shadow);
+    }
+    .add-workspace[open] {
+      display: inline-block;
+      max-width: 100%;
+      padding: 0.7rem 0.9rem 0.95rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .add-workspace[open] .add-workspace-plus {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      margin-bottom: 0.6rem;
+    }
+    .add-workspace form {
+      margin: 0;
+      padding: 0;
+      width: 26rem;
+      max-width: 100%;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      padding: 0.1rem 0.55rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    /* Toasts */
+    #toast:not(:empty) {
+      margin: 0 0 1rem;
+      padding: 0.7rem 1rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    #toast:not(:empty) strong {
+      color: var(--muted);
+    }
+  </style>
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.12/dist/htmx.min.js"></script>
+  <script>
+    // htmx does not swap 4xx responses by default, so the add-workspace
+    // validation toast (HTTP 400) never reached #toast. Let 400 responses
+    // swap too, so the error message is shown to the user.
+    document.addEventListener('htmx:beforeSwap', (evt) => {
+      if (evt.detail.xhr && evt.detail.xhr.status === 400) {
+        evt.detail.shouldSwap = true;
+        evt.detail.isError = false;
+      }
+    });
+  </script>
 </head>
 <body>
   <main class="container">

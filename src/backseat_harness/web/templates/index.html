@@ -3,31 +3,25 @@
 {% block content %}
 <section>
   <h2>Workspaces</h2>
-  <div id="workspace-list" hx-get="/workspaces/fragment" hx-trigger="every 60s" hx-swap="outerHTML">
+  <div id="workspace-list" hx-get="/workspaces/fragment" hx-trigger="every 60s, workspaceAdded from:body" hx-swap="outerHTML">
     {% for ws in workspaces %}
-    <article class="workspace-card">
+    <a class="workspace-card" href="/ws/{{ ws.id }}">
       <strong>{{ ws.name }}</strong><br><small>{{ ws.path }}</small>
-    </article>
+    </a>
     {% else %}
     <p>No workspaces registered yet.</p>
     {% endfor %}
   </div>
-</section>
-<section>
-  <h2>Add workspace</h2>
-  <form hx-post="/workspaces" hx-target="#toast" hx-swap="innerHTML">
-    <label for="ws-path">Path</label>
-    <input id="ws-path" name="path" type="text" placeholder="/home/user/code/my-project" required>
-    <button type="submit">Add workspace</button>
-  </form>
-</section>
-<section>
-  <h2>Suggestions</h2>
-  <button hx-get="/workspaces/suggest" hx-target="#suggestions" hx-swap="innerHTML">Suggest workspaces</button>
-  <div id="suggestions">
-    {% for s in suggestions | default([]) %}
-    <button hx-post="/workspaces" hx-vals='{"path": "{{ s }}"}' hx-target="#toast" hx-swap="innerHTML">{{ s }}</button>
-    {% endfor %}
-  </div>
+  <details id="add-workspace" class="add-workspace"
+           hx-get="/workspaces/suggest" hx-trigger="toggle" hx-target="#ws-suggestions" hx-swap="innerHTML">
+    <summary class="add-workspace-plus" title="Add workspace" aria-label="Add workspace">+</summary>
+    <form hx-post="/workspaces" hx-target="#toast" hx-swap="innerHTML">
+      <label for="ws-path">Path</label>
+      <input id="ws-path" name="path" type="text" list="ws-suggestions"
+             placeholder="/home/user/code/my-project" required>
+      <datalist id="ws-suggestions"></datalist>
+      <button type="submit">Add</button>
+    </form>
+  </details>
 </section>
 {% endblock %}

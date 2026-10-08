@@ -24,6 +24,14 @@ anything wrong with the run. That belongs here, once, rather than at each of the
 four call sites: this module is already the single door every caller comes
 through, so one decorator covers the size lookup, both fork renderings, and
 turn capture at the same cost of zero changes anywhere else.
+
+``load_sessions`` is the exception: a batched, exact-key read for callers that
+already hold keys from ``find_chats``. It is never retried -- a page listing
+degrades to fewer rows, not to a failed run -- so store failures are swallowed
+per key rather than costing ``RETRY_ATTEMPTS`` sleeps each. The other listing
+reads share that posture: ``memoized_providers`` gives a search and its
+transcript fetch one parse per row between them, and ``list_session_refs``
+answers from the cheap scan alone.
 """
 
 from __future__ import annotations
@@ -31,7 +39,9 @@ from __future__ import annotations
 import functools
 import sys
 import time
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
 from backseat_harness import progress
@@ -179,6 +189,188 @@ def load_full_transcript(search: str, history_provider: str) -> str:
         return load_chat(search, providers=_scoped(history_provider))
     except LookupError:
         return ""
+
+
+def load_sessions(
+    keys: Iterable[str], *, providers: Sequence[Any] | None = None
+) -> dict[str, str]:
+    """Render the stored sessions named by exact ``provider:id`` keys.
+
+    ``find_chats`` already hands the web pages a key per listed row, and those
+    pages want each row's transcript to classify it and preview it. Searching
+    for them one at a time -- the only thing ``load_full_transcript`` can do,
+    because it starts from a marker rather than a key -- re-parses *every*
+    conversation of *every* provider once per row: 2.4s per row against this
+    machine's 344 stored conversations, 147s for the workspace page's 60 rows.
+
+    This inverts the lookup instead: group the keys by provider, list each
+    provider once (the cheap, unparsed scan), then parse only the named
+    conversations -- one listing per provider and one parse per key.
+
+    ``providers`` defaults to :func:`memoized_providers`. Pass the same list
+    :func:`memoized_providers` call to ``find_chats`` and the parses the
+    search already did come back from that block's map: one parse per row for
+    the whole request instead of one per pass.
+
+    A key naming an unknown provider, a session that has since gone, or a
+    conversation that will not parse is simply absent from the result;
+    callers treat that as "no transcript", the same degradation a failed read
+    already had.
+    """
+    try:
+        from chat_mother_forker.turns import render_conversation
+    except ImportError as exc:  # pragma: no cover - dependency-optional path
+        raise HistoryError(
+            "reading managed chat history requires chat-mother-forker>=0.2.1; "
+            "install it to enable compaction, session capture, and operator review"
+        ) from exc
+
+    wanted: dict[str, list[str]] = {}
+    for key in keys:
+        provider_name, sep, conversation_id = key.partition(":")
+        if not sep or not provider_name or not conversation_id:
+            continue
+        wanted.setdefault(provider_name, []).append(conversation_id)
+    if not wanted:
+        return {}
+
+    provs = _load("default_providers")() if providers is None else providers
+    by_name = {p.name: p for p in provs}
+    rendered: dict[str, str] = {}
+    for provider_name, conversation_ids in wanted.items():
+        provider = by_name.get(provider_name)
+        if provider is None:
+            continue
+        try:
+            index = {c.conversation_id: c for c in provider.list_candidates()}
+        except Exception:  # noqa: BLE001 - an unreadable store means no transcripts
+            continue
+        for conversation_id in dict.fromkeys(conversation_ids):
+            try:
+                ref = index[conversation_id]
+                conversation = provider.load(ref)
+            except Exception:  # noqa: BLE001 - one dead session must not drop the rest
+                continue
+            rendered[f"{provider_name}:{conversation_id}"] = render_conversation(
+                conversation, truncate=False
+            )
+    return rendered
+
+
+class _MemoProvider:
+    """Provider proxy whose ``load`` results are shared for one request.
+
+    ``memoized_providers`` wraps the default providers in these so that
+    ``find_chats`` and :func:`load_sessions` see the *same* objects: a row the
+    search already parsed comes back from the block's shared map instead of
+    the store. Everything else -- ``name``, ``list_candidates``,
+    ``conversation_size``, ``conversation_metadata`` -- forwards untouched,
+    so the real providers keep owning their storage formats.
+    """
+
+    def __init__(self, provider: Any, parsed: dict[str, Any]) -> None:
+        self._provider = provider
+        self._parsed = parsed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+    def load(self, ref: Any) -> Any:
+        key = f"{ref.provider}:{ref.conversation_id}"
+        if key not in self._parsed:
+            self._parsed[key] = self._provider.load(ref)
+        return self._parsed[key]
+
+
+def memoized_providers() -> list[_MemoProvider]:
+    """The default providers with ``load`` memoized for this call chain.
+
+    A listing page makes two passes over the chat stores: ``find_chats`` for
+    the refs (it must parse every row it returns, because ``project`` lives on
+    the conversation) and :func:`load_sessions` for those rows' transcripts.
+    Handing both the same memoized list turns the second pass into memory
+    reads -- the workspace page from 113 parses to 56, the search page from
+    44 to 24.
+
+    The map lives only as long as the returned list, which the request holds
+    and drops: nothing outlives one request, so a later request reads the
+    stores afresh and can never show a stale transcript.
+    """
+    parsed: dict[str, Any] = {}
+    return [_MemoProvider(p, parsed) for p in _load("default_providers")()]
+
+
+@dataclass
+class SessionRef:
+    """A stored session as the *cheap* listing sees it: no message bodies.
+
+    Every field but ``project`` comes from one ``list_candidates`` per
+    provider plus that provider's metadata probe -- neither parses message
+    bodies, which is the expensive half of reading chat history. Callers that
+    only need the key, the recency, or the store locator (fork-provider
+    selection, the suggestion list's directory recovery) therefore parse
+    nothing at all.
+
+    ``project`` lives on the parsed conversation, so it resolves on first
+    access -- one parse of this one session -- and caches. The suggestion
+    list reads ``locator``/``database``/``session`` first and only touches
+    ``project`` when that recovery came up empty, so the parse happens on the
+    rare ref that needs it and never on the rest.
+    """
+
+    key: str
+    native_id: str
+    mtime: float
+    locator: str | None = None
+    database: str | None = None
+    session: str | None = None
+    _provider: Any = field(default=None, repr=False, compare=False)
+    _candidate: Any = field(default=None, repr=False, compare=False)
+
+    @cached_property
+    def project(self) -> str | None:
+        if self._provider is None or self._candidate is None:
+            return None
+        try:
+            return self._provider.load(self._candidate).project
+        except Exception:  # noqa: BLE001 - an unreadable session has no project
+            return None
+
+
+#: The per-provider window chat-mother-forker's own search caps at
+#: (``search.CANDIDATES_PER_PROVIDER``, not exported from the package root):
+#: a listing sees the same most-recent rows a search would.
+_CANDIDATES_PER_PROVIDER = 100
+
+
+def list_session_refs(limit: int | None = None) -> list[SessionRef]:
+    """Every stored session, newest first, without parsing any of them.
+
+    One ``list_candidates`` per provider -- the cheap, unparsed scan each
+    provider documents -- capped per provider the way chat-mother-forker's
+    search caps it, then merged by recency and cut to ``limit``. ``locator``
+    and ``database``/``session`` come from the provider's metadata probe (a
+    stored path or the ref's own fields, never a message body).
+    """
+    merged: list[SessionRef] = []
+    for provider in _load("default_providers")():
+        candidates = sorted(provider.list_candidates(), key=lambda r: r.mtime, reverse=True)
+        for candidate in candidates[:_CANDIDATES_PER_PROVIDER]:
+            database, session = provider.conversation_metadata(candidate)
+            merged.append(
+                SessionRef(
+                    key=f"{candidate.provider}:{candidate.conversation_id}",
+                    native_id=session or candidate.conversation_id,
+                    mtime=candidate.mtime,
+                    locator=None if database else candidate.locator,
+                    database=database,
+                    session=session,
+                    _provider=provider,
+                    _candidate=candidate,
+                )
+            )
+    merged.sort(key=lambda r: r.mtime, reverse=True)
+    return merged if limit is None else merged[:limit]
 
 
 def _id_from_key(key: str) -> str:
