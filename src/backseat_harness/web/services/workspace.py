@@ -136,23 +136,58 @@ def _provider_of(key: str) -> str:
     return key.split(":", 1)[0]
 
 
+#: ``{database: ((mtime, size), {session_id: directory})}`` -- one read of a
+#: shared SQLite store per file version, not one query per session id.
+_SESSION_DIR_CACHE: dict[str, tuple[tuple[float, int], dict[str, str]]] = {}
+
+
+def _session_dirs(database: str) -> dict[str, str]:
+    """``{session_id: directory}`` from a shared store, read once per version.
+
+    A listing probes one directory per candidate row -- up to a hundred rows
+    per store -- and querying them one id at a time re-opens and re-scans the
+    table each time: 0.8s across opencode's store alone. One
+    ``SELECT id, directory`` covers every row the page will ask about, and
+    keying the result on the file's ``(mtime, size)`` rebuilds it after a
+    write instead of serving a stale path.
+    """
+    path = Path(database)
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    stamp = (st.st_mtime, st.st_size)
+    cached = _SESSION_DIR_CACHE.get(database)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
+    mapping: dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(
+            f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=5.0
+        )
+        try:
+            rows = conn.execute("SELECT id, directory FROM session").fetchall()
+        finally:
+            conn.close()
+        mapping = {
+            session_id: directory
+            for session_id, directory in ((row[0], row[1]) for row in rows)
+            if isinstance(session_id, str)
+            and isinstance(directory, str)
+            and directory
+        }
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        mapping = {}
+    _SESSION_DIR_CACHE[database] = (stamp, mapping)
+    return mapping
+
+
 def _dir_from_session_db(database: str, session: str | None) -> str | None:
     """``session.directory`` for an opencode/kilo session id, read-only."""
-    if not session or not Path(database).is_file():
+    if not session:
         return None
-    uri = f"file:{Path(database).resolve().as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    try:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT directory FROM session WHERE id=?", (session,)
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        return None
-    directory = row["directory"]
-    return directory if isinstance(directory, str) and directory else None
+    return _session_dirs(database).get(session)
 
 
 def _dir_from_claude_jsonl(locator: str) -> str | None:

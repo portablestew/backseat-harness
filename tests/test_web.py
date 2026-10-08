@@ -271,9 +271,9 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
     route's resume/fork enrichment, and the template -- stays real.
 
     Three seams are stubbed, one per shape of read:
-    - ``find_chats`` (the parse-per-row search) for the two listing pages,
-    - ``list_session_refs`` (the cheap, unparsed listing) for the suggestion
-      list and the fork route,
+    - ``find_chats`` (the parse-per-row search) for the search page,
+    - ``list_session_refs`` (the cheap, unparsed listing) for the workspace
+      page's chat window, the suggestion list and the fork route,
     - ``load_sessions`` (batched transcripts) for the rows' text.
 
     ``load_chat`` is deliberately *not* stubbed: a request for it means some
@@ -772,6 +772,44 @@ def test_workspace_dir_for_reads_stores_and_skips_unrecoverable(tmp_path: Path):
         )
         is None
     )
+
+
+def test_shared_store_is_read_once_per_page(tmp_path: Path, monkeypatch):
+    """Many ids from one SQLite store cost one read, not one query per id.
+
+    A workspace page probes up to a hundred opencode/kilo ids, and the per-id
+    ``SELECT`` re-scans (and re-opens) the table every time -- 0.8s across
+    opencode's store alone, the cost this guard exists to prevent.
+    """
+    db_file = tmp_path / "opencode.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("CREATE TABLE session (id TEXT, directory TEXT)")
+    conn.executemany(
+        "INSERT INTO session VALUES (?, ?)",
+        [(f"ses_{i}", str(tmp_path / f"ws-{i}")) for i in range(50)],
+    )
+    conn.commit()
+    conn.close()
+
+    real_connect = sqlite3.connect
+    connects: list[object] = []
+
+    def _spy(*args, **kwargs):
+        connects.append(args)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_service.sqlite3, "connect", _spy)
+
+    assert (
+        workspace_service._dir_from_session_db(str(db_file), "ses_3")
+        == str(tmp_path / "ws-3")
+    )
+    assert (
+        workspace_service._dir_from_session_db(str(db_file), "ses_47")
+        == str(tmp_path / "ws-47")
+    )
+    assert workspace_service._dir_from_session_db(str(db_file), "ses_missing") is None
+    assert len(connects) == 1, f"shared store opened {len(connects)} times, not once"
 
 
 def test_suggest_lists_dir_recovered_from_provider_store(monkeypatch, tmp_path: Path):
@@ -1566,6 +1604,82 @@ def test_workspace_page_other_chats_is_one_capped_list(
     assert "<th>Session</th>" not in resp.text
 
 
+def test_other_chats_recovers_workspace_from_provider_store(
+    monkeypatch, workspace: Path
+):
+    """A chat whose ``project`` is unusable still lands in "Other chats" when
+    its provider store names this workspace -- the recovery the suggestion
+    list already uses -- so membership is not decided by the basename alone,
+    and a newer chat from another project cannot take the row."""
+    ws_id = _register_workspace(workspace)
+    session_dir = workspace / "_store"
+    session_dir.mkdir()
+    (session_dir / "session.json").write_text(
+        json.dumps({"workspacePaths": [str(workspace)]}), encoding="utf-8"
+    )
+    refs = [
+        _Ref(
+            "kiro_ide_v2:sess_recovered",
+            mtime=300.0,
+            project=None,
+            locator=str(session_dir),
+        ),
+        _Ref("opencode:ses_elsewhere_newer", mtime=900.0, project="elsewhere"),
+    ]
+    transcripts = {
+        "kiro_ide_v2:sess_recovered": "recovered from the store",
+        "opencode:ses_elsewhere_newer": "other project chatter",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+
+    assert resp.status_code == 200
+    assert "recovered from the store" in _other_chats_section(resp.text)
+    assert "other project chatter" not in resp.text
+
+
+def test_other_chats_bounds_the_transcripts_it_reads(
+    monkeypatch, workspace: Path
+):
+    """Transcript reads are capped at ``limit * 20`` rows of this workspace
+    (floor 50 -- 200 for the ten-row table), never every candidate.
+
+    What is *not* bounded is the candidate window: the workspace filter has
+    already run over each provider's own window by the time this cap applies,
+    so a chatty provider still cannot starve the others. Only the parse-per-row
+    half -- the part that made ``/ws/<id>`` slow -- is bounded here."""
+    ws_id = _register_workspace(workspace)
+    refs = []
+    transcripts = {}
+    for i in range(210):
+        key = f"opencode:ses_bound_{i:03d}"
+        refs.append(_Ref(key, mtime=900.0 - i, project=str(workspace)))
+        transcripts[key] = f"managed {_MARKER}"
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    from backseat_harness import history
+
+    reads: list[int] = []
+    batched = history.load_sessions
+
+    def _spy(keys, providers=None) -> dict[str, str]:
+        requested = list(keys)
+        reads.append(len(requested))
+        return batched(requested, providers=providers)
+
+    monkeypatch.setattr(history, "load_sessions", _spy)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}")
+
+    assert page.status_code == 200
+    assert sum(reads) == 200, f"read {sum(reads)} transcripts, the cap is 200"
+    # Every candidate is a managed session, so nothing survives the filter.
+    assert _data_rows(_other_chats_section(page.text)) == []
+
+
 def test_completed_tasks_section_renders_when_empty(
     monkeypatch, workspace: Path
 ):
@@ -1609,16 +1723,17 @@ def test_prompt_excerpt_normalizes_and_truncates():
 
 
 def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: Path):
-    """Regression guard for the slow ``/ws/<id>``: one batched transcript read.
+    """Regression guard for the slow ``/ws/<id>``: the cheap listing, one batch.
 
     The pre-fix path asked chat-mother-forker for each row's transcript one at
     a time, and every one of those tiered searches re-parses *every* stored
     conversation of *every* provider -- measured at 2.4s per row against this
     machine's 344 stored conversations, 147s end-to-end for one workspace
-    page. The page must ask once, with all candidate keys at once, and it
-    must hand the fetch the *same* memoized providers the search used: that
-    sharing is what keeps the whole render at one parse per row instead of
-    one per pass.
+    page. The page must therefore list its candidates from the unparsed
+    ``list_session_refs`` scan -- per-provider windows, never ``find_chats``,
+    whose single global recency cut a chatty provider can fill with rows the
+    workspace filter then throws away -- and it must ask for the transcripts
+    once, with all candidate keys at once.
     """
     ws_id = _register_workspace(workspace)
     # 11 chats so the single "Other chats" table's 10-cap drops the oldest; the
@@ -1639,11 +1754,12 @@ def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: P
     from backseat_harness import history
 
     calls: list[list[str]] = []
-    seen: dict[str, object] = {}
+    window: list[list[object]] = []
+    searches: list[str] = []
     batched = history.load_sessions
+    listed = history.list_session_refs
 
-    # Record the provider list the search was handed, so the transcript fetch
-    # can be checked for passing the very same one.
+    # Record any ``find_chats`` call so the page can be held to the cheap scan.
     real_load = history._load
 
     def _spy_load(attr: str):
@@ -1652,28 +1768,35 @@ def test_workspace_page_reads_transcripts_in_one_batch(monkeypatch, workspace: P
             return impl
 
         def _find_chats(query="", providers=None, limit=None):
-            seen["search_providers"] = providers
+            searches.append(query)
             return impl(query, providers=providers, limit=limit)
 
         return _find_chats
 
+    def _spy_list(limit=None):
+        window.append(limit)
+        return listed(limit=limit)
+
     def _spy(keys, providers=None) -> dict[str, str]:
         requested = list(keys)
         calls.append(requested)
-        seen["load_providers"] = providers
         return batched(requested, providers=providers)
 
     monkeypatch.setattr(history, "_load", _spy_load)
+    monkeypatch.setattr(history, "list_session_refs", _spy_list)
     monkeypatch.setattr(history, "load_sessions", _spy)
 
     with _client() as client:
         page = client.get(f"/ws/{ws_id}")
 
     assert page.status_code == 200
+    # The window is the whole unparsed scan -- no global recency cut (None) --
+    # and the parse-per-row search is never reached.
+    assert window == [None], f"candidate window was cut to {window!r}"
+    assert searches == [], "the workspace page must not call find_chats"
     assert len(calls) == 1, f"transcripts were fetched {len(calls)} times, not once"
     expected_keys = {r.key for r in refs}
     assert set(calls[0]) == expected_keys
-    assert seen["load_providers"] is seen["search_providers"]
     # The one batch covers every rendered row; the single Other chats table
     # keeps the ten newest and drops the oldest off the cap.
     other = _other_chats_section(page.text)

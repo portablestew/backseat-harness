@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Protocol
 
 from backseat_harness import marker
+from backseat_harness.web.services.workspace import _workspace_dir_for
 
 
 @dataclass(frozen=True)
@@ -144,14 +145,39 @@ def _is_backseat_session(text: str) -> bool:
     return False
 
 
+def _ref_workspace_dir(ref: object, workspace: Path, ws_norm: str) -> str | None:
+    """The workspace dir of ``ref`` when the chat belongs here, else ``None``.
+
+    Store recovery first (``_workspace_dir_for``): it reads the provider's own
+    store, never a message body, so the whole per-provider candidate window
+    costs one directory probe per row. ``project`` -- which for a
+    ``history.SessionRef`` parses that one conversation -- is consulted only
+    when recovery came up empty, the posture ``_candidate_dirs`` already uses
+    for the suggestion list.
+    """
+    raw = _workspace_dir_for(ref)
+    if raw is not None:
+        return raw if _normalize(raw) == ws_norm else None
+    project = getattr(ref, "project", None)
+    if project and _project_matches_workspace(project, workspace):
+        return project
+    return None
+
+
 def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
     """Recent chat sessions in this workspace, excluding backseat sessions.
 
-    Scopes to the workspace by matching ChatRef.project against the workspace
-    path (same logic as services.workspace._candidate_dirs). Loads each
-    session's transcript to filter out backseat-marked sessions. Returns up to
-    ``limit`` sessions, newest first (by mtime).
+    The candidate window is the cheap, unparsed listing
+    (``history.list_session_refs``), which takes each provider's newest
+    ``_CANDIDATES_PER_PROVIDER`` rows *before* merging them -- so a chatty
+    provider cannot push another provider's chats out of the window the way a
+    single global recency cut did. Rows are then narrowed to this workspace by
+    store recovery (no message bodies), their transcripts are read in
+    newest-first batches until ``limit`` survivors remain (never one row at a
+    time), backseat-marked and empty sessions are dropped, and the newest
+    ``limit`` rows come back newest first (by mtime).
     """
+    ws_path = Path(workspace)
 
     try:
         from backseat_harness import history
@@ -159,69 +185,73 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
         return []
 
     try:
-        # One parse per row for the whole request: find_chats parses the rows
-        # it returns (project lives on the conversation), and the transcript
-        # fetch below reads them back from this same memoized list instead of
-        # the stores (history.memoized_providers).
-        find_chats = history._load("find_chats")
-        providers = history.memoized_providers()
+        refs = history.list_session_refs()
     except Exception:
         return []
 
-    try:
-        # Search with empty query to get all sessions, then filter by project
-        refs = find_chats("", providers=providers, limit=limit * 3)  # fetch extra for filtering
-    except Exception:
-        return []
-
-    # Filter by project matching workspace path
+    ws_norm = _normalize(ws_path)
     ws_candidates = []
     for ref in refs:
-        project = getattr(ref, "project", None)
-        if project and _project_matches_workspace(project, Path(workspace)):
-            ws_candidates.append(ref)
+        project_dir = _ref_workspace_dir(ref, ws_path, ws_norm)
+        if project_dir is not None:
+            ws_candidates.append((ref, project_dir))
 
     # Sort by mtime desc (newest first)
-    ws_candidates.sort(key=lambda r: getattr(r, "mtime", 0), reverse=True)
+    ws_candidates.sort(key=lambda pair: getattr(pair[0], "mtime", 0), reverse=True)
 
-    # Load transcripts and filter out backseat sessions. One batched read for
-    # every candidate (a per-row transcript load re-scans all stored
-    # conversations each time, rationale at history.load_sessions), served
-    # from the parse map the search above just filled.
+    # Cap how many transcripts to read. Nothing is starved at this point -- the
+    # workspace filter above ran over every provider's own window -- but parsing
+    # transcripts is the expensive half, so read at most twenty times what the
+    # table shows (floor of 50). Backseat sessions dominate a harness
+    # workspace's history, so the cap has to sit well above ``limit``.
+    ws_candidates = ws_candidates[: max(limit * 20, 50)]
+
+    # Then read those transcripts newest-first in batches and stop as soon as
+    # ``limit`` rows survive the backseat/empty filters -- a batched read,
+    # never one row at a time (rationale at history.load_sessions). Stopping
+    # early only skips rows this workspace's own newer sessions have already
+    # filled the table with.
     results = []
-    try:
-        texts = history.load_sessions([r.key for r in ws_candidates], providers=providers)
-    except Exception:
-        texts = {}
-    for ref in ws_candidates:
+    batch_size = max(limit * 3, 10)
+    for start in range(0, len(ws_candidates), batch_size):
+        chunk = ws_candidates[start : start + batch_size]
+        try:
+            texts = history.load_sessions([ref.key for ref, _ in chunk])
+        except Exception:
+            texts = {}
+
+        for ref, project_dir in chunk:
+            if len(results) >= limit:
+                break
+
+            text = texts.get(ref.key)
+            # Drop sessions with no transcript or an empty prompt (owner brief).
+            if text is None or not text.strip():
+                continue
+
+            if _is_backseat_session(text):
+                continue
+
+            prompt = _prompt_excerpt(text)
+            if not prompt:
+                continue
+
+            # Create a preview (first 200 chars of content, stripped of markers)
+            preview = text.strip()
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+
+            results.append(ChatInfo(
+                key=ref.key,
+                native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
+                project=project_dir,
+                mtime=getattr(ref, "mtime", 0),
+                preview=preview,
+                prompt=prompt,
+            ))
+
         if len(results) >= limit:
             break
-
-        text = texts.get(ref.key)
-        # Drop sessions with no transcript or an empty prompt (owner brief).
-        if text is None or not text.strip():
-            continue
-
-        if _is_backseat_session(text):
-            continue
-
-        prompt = _prompt_excerpt(text)
-        if not prompt:
-            continue
-
-        # Create a preview (first 200 chars of content, stripped of markers)
-        preview = text.strip()
-        if len(preview) > 200:
-            preview = preview[:200] + "…"
-
-        results.append(ChatInfo(
-            key=ref.key,
-            native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
-            project=getattr(ref, "project", None),
-            mtime=getattr(ref, "mtime", 0),
-            preview=preview,
-            prompt=prompt,
-        ))
 
     return results
 
@@ -257,8 +287,9 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
         return []
 
     try:
-        # Same one-parse-per-row sharing as list_recent_chats: the search
-        # parses what it returns, the transcript fetch reads it from memory.
+        # One parse per row for the whole request: the search parses the rows
+        # it returns (project lives on the conversation) and the transcript
+        # fetch below reads them back from this same memoized list.
         find_chats = history._load("find_chats")
         providers = history.memoized_providers()
     except Exception:

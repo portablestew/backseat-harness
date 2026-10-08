@@ -26,10 +26,11 @@ through, so one decorator covers the size lookup, both fork renderings, and
 turn capture at the same cost of zero changes anywhere else.
 
 ``load_sessions`` is the exception: a batched, exact-key read for callers that
-already hold keys from ``find_chats``. It is never retried -- a page listing
-degrades to fewer rows, not to a failed run -- so store failures are swallowed
-per key rather than costing ``RETRY_ATTEMPTS`` sleeps each. The other listing
-reads share that posture: ``memoized_providers`` gives a search and its
+already hold keys from a listing (``find_chats`` on the search page,
+``list_session_refs`` on the workspace page). It is never retried -- a page
+listing degrades to fewer rows, not to a failed run -- so store failures are
+swallowed per key rather than costing ``RETRY_ATTEMPTS`` sleeps each. The other
+listing reads share that posture: ``memoized_providers`` gives a search and its
 transcript fetch one parse per row between them, and ``list_session_refs``
 answers from the cheap scan alone.
 """
@@ -196,21 +197,23 @@ def load_sessions(
 ) -> dict[str, str]:
     """Render the stored sessions named by exact ``provider:id`` keys.
 
-    ``find_chats`` already hands the web pages a key per listed row, and those
-    pages want each row's transcript to classify it and preview it. Searching
-    for them one at a time -- the only thing ``load_full_transcript`` can do,
-    because it starts from a marker rather than a key -- re-parses *every*
-    conversation of *every* provider once per row: 2.4s per row against this
-    machine's 344 stored conversations, 147s for the workspace page's 60 rows.
+    A listing already hands the web pages a key per listed row --
+    ``find_chats`` on the search page, ``list_session_refs`` on the workspace
+    page -- and those pages want each row's transcript to classify it and
+    preview it. Searching for them one at a time -- the only thing
+    ``load_full_transcript`` can do, because it starts from a marker rather
+    than a key -- re-parses *every* conversation of *every* provider once per
+    row: 2.4s per row against this machine's 344 stored conversations, 147s
+    for a 60-row page.
 
     This inverts the lookup instead: group the keys by provider, list each
     provider once (the cheap, unparsed scan), then parse only the named
     conversations -- one listing per provider and one parse per key.
 
-    ``providers`` defaults to :func:`memoized_providers`. Pass the same list
-    :func:`memoized_providers` call to ``find_chats`` and the parses the
-    search already did come back from that block's map: one parse per row for
-    the whole request instead of one per pass.
+    ``providers`` defaults to :func:`memoized_providers`. A caller whose refs
+    came from ``find_chats`` passes the same :func:`memoized_providers` list
+    that search used, so the parses it already did come back from that block's
+    map: one parse per row for the whole request instead of one per pass.
 
     A key naming an unknown provider, a session that has since gone, or a
     conversation that will not parse is simply absent from the result;
@@ -285,12 +288,13 @@ class _MemoProvider:
 def memoized_providers() -> list[_MemoProvider]:
     """The default providers with ``load`` memoized for this call chain.
 
-    A listing page makes two passes over the chat stores: ``find_chats`` for
+    The search page makes two passes over the chat stores: ``find_chats`` for
     the refs (it must parse every row it returns, because ``project`` lives on
     the conversation) and :func:`load_sessions` for those rows' transcripts.
     Handing both the same memoized list turns the second pass into memory
-    reads -- the workspace page from 113 parses to 56, the search page from
-    44 to 24.
+    reads -- that page from 44 parses to 24. The workspace page makes one
+    pass: its refs come from the unparsed ``list_session_refs`` scan, so
+    there is no first pass to share and it passes nothing.
 
     The map lives only as long as the returned list, which the request holds
     and drops: nothing outlives one request, so a later request reads the
