@@ -205,11 +205,17 @@
       vertical-align: middle;
     }
     /* In-table links are quiet at rest and light up, underlined, only while
-       their row is hovered. */
+       their row is hovered. Task links (the homepage Tasks cell) are the
+       exception: they light up only under the pointer itself, and while one
+       is hovered the row's other links stay quiet. */
     .data-table a {
       text-decoration: none;
     }
-    .data-table tbody tr:not(.empty-row):hover a {
+    .data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover a:not(.task-link) {
+      text-decoration: underline;
+      color: var(--accent-hover);
+    }
+    .data-table a.task-link:hover {
       text-decoration: underline;
       color: var(--accent-hover);
     }

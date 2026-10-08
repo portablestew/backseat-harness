@@ -20,18 +20,14 @@
       grid-template-columns: 1fr;
     }
   }
-  /* Iteration / Generation / Reason: a header-less table (no <thead>) styled
-     like the checklist .data-table -- an outer margin and a divider under each
-     row -- while the key/value rows stay non-hoverable. */
+  /* Iteration / Generation / Reason: a header-less table (no <thead>). Its
+     cells take the same padding and row dividers as the checklist .data-table
+     cells -- neither table overrides them, so both inherit the shared table-cell
+     rules -- and only the outer margin and the label column are set here. */
   .task-meta {
     width: 100%;
     margin: 0.5rem 0 1rem;
     border-collapse: collapse;
-  }
-  .task-meta td {
-    border: 0;
-    border-bottom: 1px solid var(--border);
-    padding: 0.35rem 0;
   }
   .task-meta td:first-child {
     color: var(--muted);

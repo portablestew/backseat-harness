@@ -31,6 +31,7 @@ from starlette.websockets import WebSocketDisconnect
 from backseat_harness import db
 from backseat_harness.web.main import create_app
 from backseat_harness.web.services import chat_search as chat_search_service
+from backseat_harness.web.services import task as task_service
 from backseat_harness.web.services import workspace as workspace_service
 
 _PORT = 8080
@@ -135,6 +136,16 @@ def _home_row(html: str, ws_id: int) -> str:
     return html[start : html.index("</tr>", marker) + len("</tr>")]
 
 
+def _css_rule_bodies(html: str) -> dict[str, list[str]]:
+    """Declaration bodies of the page's ``<style>`` rules, keyed by selector."""
+    rules: dict[str, list[str]] = {}
+    for style in re.findall(r"<style\b[^>]*>(.*?)</style>", html, re.S):
+        style = re.sub(r"/\*.*?\*/", "", style, flags=re.S)
+        for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", style):
+            rules.setdefault(" ".join(selector.split()), []).append(body)
+    return rules
+
+
 def _home_tasks_cell(html: str, ws_id: int) -> str:
     """Inner HTML of the "Tasks" ``<td>`` on that row (last cell)."""
     row = _home_row(html, ws_id)
@@ -190,7 +201,9 @@ def test_homepage_tasks_column_latest_three_plus_more(workspace, count, more_tex
     assert fragment.status_code == 200
     for html in (page.text, fragment.text):
         cell = _home_tasks_cell(html, ws_id)
-        links = re.findall(r'<a href="(/ws/\d+/tasks/[^"]+)">([^<]+)</a>', cell)
+        links = re.findall(
+            r'<a class="task-link" href="(/ws/\d+/tasks/[^"]+)">([^<]+)</a>', cell
+        )
         assert len(links) == min(count, 3)
         if count == 0:
             assert cell.strip() == ""
@@ -198,6 +211,32 @@ def test_homepage_tasks_column_latest_three_plus_more(workspace, count, more_tex
             assert more_text in cell
         else:
             assert "more" not in cell
+
+
+def test_homepage_tasks_cell_is_comma_separated(workspace):
+    """The Tasks cell reads as plain text ``a, b, c, ... and N more``: task
+    links are joined by commas and the "... and N more" tail follows a comma.
+    The page and polled fragment render the identical cell (goal.md:25)."""
+    tasks_root = workspace / ".backseat" / "tasks"
+    lanes = {
+        "newest": 1_700_000_300.0,
+        "newer": 1_700_000_200.0,
+        "older": 1_700_000_100.0,
+        "oldest": 1_700_000_000.0,
+    }
+    for slug, when in lanes.items():
+        _write_lane(workspace, slug, status="continue", updated_at=when)
+        os.utime(tasks_root / slug, (when, when))
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        page = client.get("/")
+        fragment = client.get("/workspaces/fragment")
+
+    cells = [_home_tasks_cell(h.text, ws_id) for h in (page, fragment)]
+    assert cells[0] == cells[1]
+    text = re.sub(r"<[^>]+>", "", cells[0])
+    assert text == "newest, newer, older, ... and 1 more"
 
 
 def test_homepage_tasks_column_orders_by_task_dir_mtime(workspace):
@@ -222,7 +261,7 @@ def test_homepage_tasks_column_orders_by_task_dir_mtime(workspace):
 
     assert page.status_code == 200
     cell = _home_tasks_cell(page.text, ws_id)
-    shown = re.findall(r'<a href="/ws/\d+/tasks/([^"]+)">', cell)
+    shown = re.findall(r'<a class="task-link" href="/ws/\d+/tasks/([^"]+)">', cell)
     assert shown == ["newest", "newer", "older"]
     assert "... and 1 more" in cell
     assert "oldest" not in cell
@@ -241,11 +280,15 @@ def test_homepage_task_links_inherit_row_hover_and_open_the_task(workspace):
 
     body = page.text
     row = _home_row(body, ws_id)
-    assert f'href="/ws/{ws_id}/tasks/lane-a"' in row
+    assert f'<a class="task-link" href="/ws/{ws_id}/tasks/lane-a"' in row
     assert f'data-href="/ws/{ws_id}"' in row
-    # 3a: only populated rows highlight; in-cell links underline on row hover.
+    # 3a: only populated rows highlight.
     assert "tbody tr:not(.empty-row):hover" in body
-    assert "tr:not(.empty-row):hover a" in body
+    # Task links underline under their own pointer; the row's workspace link
+    # underlines on row hover except while a task link is hovered.
+    assert ".data-table a.task-link:hover" in body
+    assert "a:not(.task-link)" in body
+    assert ":not(:has(a.task-link:hover))" in body
     # The click handler bails on anchors, so the task link's href wins.
     assert "closest('a, button, form, input, textarea, select')" in body
 
@@ -1464,9 +1507,14 @@ def test_task_status_table_has_margin_and_dividers(workspace: Path):
     rule = html[html.index(".task-meta {") :]
     rule = rule[: rule.index("}")]
     assert "margin: 0.5rem 0 1rem" in rule
-    cell = html[html.index(".task-meta td {") :]
-    cell = cell[: cell.index("}")]
-    assert "border-bottom: 1px solid var(--border)" in cell
+
+    # Cell padding and row dividers: the status table and the checklist
+    # .data-table set neither, so both inherit the same shared table-cell rules.
+    bodies = _css_rule_bodies(html)
+    assert ".data-table td" in bodies
+    for selector in (".task-meta td", ".data-table td"):
+        for body in bodies.get(selector, []):
+            assert "padding" not in body and "border" not in body, selector
 
 
 def test_workspace_expander_control_uses_shared_crossed_glyph(workspace: Path):
@@ -1654,10 +1702,10 @@ def test_badge_css_covers_all_and_unknown_status(workspace: Path):
 
     assert ws_page.status_code == 200
     assert 'data-status="weird"' in ws_page.text
-    assert '<span class="badge" data-status="weird">in progress</span>' in ws_page.text
+    assert '<span class="badge" data-status="weird">weird</span>' in ws_page.text
 
     assert task_page.status_code == 200
-    assert '<span class="badge" data-status="weird">in progress</span>' in task_page.text
+    assert '<span class="badge" data-status="weird">weird</span>' in task_page.text
 
     # Owner brief: "continue" renders as "in progress" (space) everywhere --
     # never the hyphenated form -- on the home, workspace and task pages.
@@ -1747,7 +1795,7 @@ def _write_lane(
     reason: str = "",
 ) -> None:
     """Create a task lane. ``status=None`` means no state.json, so the lane
-    reads as ``continue`` ordered by goal.md's mtime."""
+    reads as ``pending`` ordered by goal.md's mtime."""
     lane = workspace / ".backseat" / "tasks" / slug
     lane.mkdir(parents=True, exist_ok=True)
     goal = lane / "goal.md"
@@ -2720,10 +2768,33 @@ def test_data_table_rows_hover_and_links_underline_only_on_hover():
     a_rule = css[a_start : css.index("}", a_start)]
     assert "text-decoration: none" in a_rule
 
-    h_start = css.index(".data-table tbody tr:not(.empty-row):hover a {")
+    h_sel = ".data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover"
+    h_start = css.index(f"{h_sel} a:not(.task-link) {{")
     h_rule = css[h_start : css.index("}", h_start)]
     assert "text-decoration: underline" in h_rule
     assert "color: var(--accent-hover)" in h_rule
+
+
+def test_task_links_underline_only_under_their_own_pointer():
+    """Homepage task links (``.task-link``) are excluded from the row-hover
+    rule, so they underline only while hovered themselves; and the row's other
+    links stay quiet while a task link is the thing hovered (goal 4 / owner
+    feedback on the Tasks cell)."""
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    css = page.text
+    # Excluded from the row-hover underline.
+    row_rule = css[css.index(".data-table tbody tr:not(.empty-row):not(:has(") :]
+    row_rule = row_rule[: row_rule.index("{")]
+    assert ":not(.task-link)" in row_rule
+    assert ":has(a.task-link:hover)" in row_rule
+    # Own-hover rule underlines the task link itself.
+    t_start = css.index(".data-table a.task-link:hover {")
+    t_rule = css[t_start : css.index("}", t_start)]
+    assert "text-decoration: underline" in t_rule
+    assert "color: var(--accent-hover)" in t_rule
 
 
 def test_workspace_empty_and_chat_rows_use_shared_hover(monkeypatch, workspace: Path):
@@ -2922,3 +2993,69 @@ def test_action_forms_carry_shared_offset_class(monkeypatch, workspace: Path):
     ):
         header = html[html.index('<header class="chat-header') : html.index("</header>")]
         assert form in header
+
+
+# --- step 6c: task status derivation ----------------------------------------
+
+
+def _lane_badge(workspace: Path, slug: str) -> tuple[str, str]:
+    """(status, badge) the single derivation reports for one lane."""
+    info = next(i for i in task_service.list_tasks(workspace) if i.slug == slug)
+    return info.status, info.badge
+
+
+def test_status_no_state_json_is_pending_on_every_surface(workspace: Path):
+    """A lane with no state.json has never run: it reads ``pending`` in the
+    listing, on the task page, and in the Run verb -- not the ``continue``
+    default ``storage.load_state`` falls back to (6c)."""
+    _write_lane(workspace, "fresh-lane", status=None, updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+
+    assert _lane_badge(workspace, "fresh-lane") == ("pending", "pending")
+    detail = task_service.load_task(workspace, "fresh-lane")
+    assert detail is not None
+    assert (detail.status, detail.badge, detail.run_action) == ("pending", "pending", "Run")
+
+    with _client() as client:
+        task_page = client.get(f"/ws/{ws_id}/tasks/fresh-lane")
+    assert '<span class="badge" data-status="pending">pending</span>' in task_page.text
+    assert '">in progress</span>' not in task_page.text
+
+
+def test_status_continue_is_in_progress(workspace: Path):
+    """Only a state.json saying ``continue`` reads as "in progress"."""
+    _write_lane(
+        workspace, "running-lane", status="continue", updated_at=1_700_000_000.0
+    )
+    ws_id = _register_workspace(workspace)
+
+    assert _lane_badge(workspace, "running-lane") == ("continue", "in progress")
+    detail = task_service.load_task(workspace, "running-lane")
+    assert detail is not None
+    assert (detail.status, detail.badge) == ("continue", "in progress")
+
+    with _client() as client:
+        task_page = client.get(f"/ws/{ws_id}/tasks/running-lane")
+    assert '<span class="badge" data-status="continue">in progress</span>' in task_page.text
+
+
+@pytest.mark.parametrize(
+    ("status", "badge"),
+    [("blocked", "needs attention"), ("complete", "complete")],
+)
+def test_status_other_states_keep_their_own_label(workspace: Path, status, badge):
+    """Any state.json status other than ``continue`` keeps its own label and
+    never reads as "in progress"."""
+    _write_lane(workspace, "other-lane", status=status, updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+
+    assert _lane_badge(workspace, "other-lane") == (status, badge)
+    detail = task_service.load_task(workspace, "other-lane")
+    assert detail is not None
+    assert detail.badge == badge
+
+    with _client() as client:
+        task_page = client.get(f"/ws/{ws_id}/tasks/other-lane")
+    assert f'<span class="badge" data-status="{status}">{badge}</span>' in task_page.text
+    assert '">in progress</span>' not in task_page.text
+

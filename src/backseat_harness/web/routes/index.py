@@ -58,14 +58,14 @@ def _tasks_cell(ws_id: object, slugs: list[str], more: int) -> str:
     Built here so the full page (``index.html``) and the polled fragment
     (``_fragment_html``) render byte-identical cells.
     """
-    links = " ".join(
-        f'<a href="/ws/{ws_id}/tasks/{html.escape(slug, quote=True)}">'
+    links = ", ".join(
+        f'<a class="task-link" href="/ws/{ws_id}/tasks/{html.escape(slug, quote=True)}">'
         f"{html.escape(slug)}</a>"
         for slug in slugs
     )
     if more > 0:
         more_text = f"... and {more} more"
-        links = f"{links} {more_text}" if links else more_text
+        links = f"{links}, {more_text}" if links else more_text
     return links
 
 

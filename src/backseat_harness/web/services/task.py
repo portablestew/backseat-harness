@@ -10,7 +10,7 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 - :func:`list_incomplete` / :func:`list_recent` — filesystem scan of the
   workspace's ``tasks/`` dir joined with ``storage.load_state`` for status,
   sorted by ``state.updated_at`` desc; a lane with no ``state.json`` yet
-  reads as ``continue`` with the ``goal.md`` mtime.
+  reads as ``pending`` with the ``goal.md`` mtime.
 - :func:`resolve_workspace` — sqlite ``workspaces.id`` → path (stable
   across path renames).
 - :func:`load_task` — loads goal.md, state.json, checklist.json, and any
@@ -68,14 +68,33 @@ def create_task(workspace: Path | str, name: str, goal: str) -> str:
     return slug
 
 
+#: Status of a lane that has no ``state.json`` yet: it has never run.
+PENDING_STATUS = "pending"
+
+
+def status_value(task_dir: Path, status: TaskStatus | str) -> str:
+    """The lane's status string, the one derivation every listing and page uses.
+
+    ``storage.load_state`` answers a missing ``state.json`` with the
+    ``TaskState`` default (``continue``); that default must not leak through,
+    so a lane with no ``state.json`` reads :data:`PENDING_STATUS` instead.
+    """
+    if not (task_dir / "state.json").exists():
+        return PENDING_STATUS
+    return status.value if isinstance(status, TaskStatus) else str(status)
+
+
 def badge_for(status: TaskStatus | str) -> str:
-    """Status badge text: blocked → "needs attention", else "in progress"."""
+    """Status badge text: blocked → "needs attention", complete → "complete",
+    continue → "in progress"; any other status keeps its own label."""
     value = status.value if isinstance(status, TaskStatus) else str(status)
     if value == TaskStatus.BLOCKED.value:
         return "needs attention"
     if value == TaskStatus.COMPLETE.value:
         return "complete"
-    return "in progress"
+    if value == TaskStatus.CONTINUE.value:
+        return "in progress"
+    return value
 
 
 def run_action_for(task_dir: Path, status: str) -> str:
@@ -138,7 +157,7 @@ def _lane_info(task_dir: Path) -> TaskInfo:
             updated_at = goal_path.stat().st_mtime
         except OSError:
             updated_at = task_dir.stat().st_mtime
-    value = status.value if isinstance(status, TaskStatus) else str(status)
+    value = status_value(task_dir, status)
     return TaskInfo(slug=slug, status=value, badge=badge_for(value), updated_at=updated_at)
 
 
@@ -254,7 +273,7 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
     try:
         from backseat_harness import storage
         state = storage.load_state(TaskPaths(task_dir), slug)
-        status = state.status.value if hasattr(state.status, "value") else str(state.status)
+        status = status_value(task_dir, state.status)
         iteration = state.iteration
         generation = state.generation
         reason = state.reason
