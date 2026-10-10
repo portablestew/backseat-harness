@@ -6,8 +6,12 @@ Detection is monkeypatched on ``shutil.which`` so nothing needs to be installed.
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
+import pytest
+from fastapi.testclient import TestClient
+
+from backseat_harness import db
 from backseat_harness.providers import (
     available_providers,
     binary_for,
@@ -15,12 +19,41 @@ from backseat_harness.providers import (
     on_path_providers,
 )
 from backseat_harness.providers.base import ProviderError
+from backseat_harness.web.main import create_app
 from backseat_harness.web.services import chat_search as chat_search_service
+from backseat_harness.web.shell.manager import PTYSessionManager
+
+_PORT = 8080
 
 
 def _which_only(*present: str):
     """``shutil.which`` stand-in that resolves only the named executables."""
     return lambda exe: f"/usr/bin/{exe}" if exe in present else None
+
+
+def _client() -> TestClient:
+    return TestClient(create_app(port=_PORT), base_url=f"http://localhost:{_PORT}")
+
+
+def _register_workspace(workspace: Path) -> int:
+    with db.open_db() as conn:
+        assert db.add_workspace(conn, workspace) is True
+        ws_id = db._workspace_id(conn, workspace)
+    assert ws_id is not None
+    return ws_id
+
+
+@pytest.fixture
+def spawned(monkeypatch) -> list[dict]:
+    """Record every PTY spawn the route asks for; spawn nothing."""
+    calls: list[dict] = []
+
+    def _fake_create_session(self, cmd, cwd, cols=None, rows=None):
+        calls.append({"cmd": list(cmd), "cwd": cwd})
+        return "abc123def456"
+
+    monkeypatch.setattr(PTYSessionManager, "create_session", _fake_create_session)
+    return calls
 
 
 def test_binary_for_maps_every_registered_provider():
@@ -59,3 +92,81 @@ def test_pick_fork_provider_scan_order_is_opencode_first(monkeypatch):
     # present, the fork picker still prefers opencode, then kiro, then claude.
     monkeypatch.setattr("shutil.which", _which_only("claude", "opencode"))
     assert chat_search_service.pick_fork_provider("unknown:sess_cur", []) == "opencode"
+
+
+# --- Step 3: POST /ws/{id}/chats -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("provider", "argv"),
+    [
+        ("opencode", ["/usr/bin/opencode"]),
+        ("kiro", ["/usr/bin/kiro-cli", "chat"]),
+        ("claude", ["/usr/bin/claude"]),
+    ],
+)
+def test_new_chat_spawns_fresh_provider_argv_and_redirects(
+    monkeypatch, workspace: Path, spawned, provider, argv
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("opencode", "kiro-cli", "claude"))
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": provider}, follow_redirects=False
+        )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == (
+        f"/shell/abc123def456?from=%2Fws%2F{ws_id}&label={workspace.name}"
+    )
+    assert len(spawned) == 1
+    assert spawned[0]["cmd"] == argv
+    assert Path(spawned[0]["cwd"]).resolve() == workspace.resolve()
+
+
+def test_new_chat_absent_provider_is_400_and_spawns_nothing(
+    monkeypatch, workspace: Path, spawned
+):
+    ws_id = _register_workspace(workspace)
+    # kiro is registered but not installed on this host.
+    monkeypatch.setattr("shutil.which", _which_only("opencode", "claude"))
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "kiro"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 400
+    assert "kiro is not on PATH" in resp.text
+    assert spawned == []
+
+
+def test_new_chat_unknown_provider_is_400_and_spawns_nothing(
+    monkeypatch, workspace: Path, spawned
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("opencode", "kiro-cli", "claude"))
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "cursor"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 400
+    assert "unknown provider" in resp.text
+    assert spawned == []
+
+
+def test_new_chat_unknown_workspace_is_404_and_spawns_nothing(
+    monkeypatch, spawned
+):
+    monkeypatch.setattr("shutil.which", _which_only("claude"))
+
+    with _client() as client:
+        resp = client.post(
+            "/ws/999999/chats", data={"provider": "claude"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 404
+    assert spawned == []
