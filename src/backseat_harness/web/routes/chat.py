@@ -113,12 +113,20 @@ def chat_page(request: Request, provider: str, conversation_id: str):
     # cwd, not the chat's).
     chat_cwd = str(ws_path_resolved) if ws_path_resolved is not None else "."
 
+    # The shell page's back link is this page, reached through ``?from=``, so
+    # the payload must re-carry ``?ws=``; without it the round trip lands on
+    # the bare transcript and the header degrades to the "Workspaces" homepage.
+    back_url = f"/chat/{provider}/{conversation_id}"
+    if ws_id is not None:
+        back_url = f"{back_url}?ws={ws_id}"
+
     return templates.TemplateResponse(
         request,
         "chat.html",
         {
             "provider": provider,
             "conversation_id": conversation_id,
+            "back_url": back_url,
             "current_session_key": search_key,
             "transcript": transcript,
             "resume_command": resume_command,

@@ -112,7 +112,12 @@ def _resolve_back(request: Request) -> tuple[str, str]:
         and parts.netloc == request.url.netloc
         and parts.path.startswith("/")
     ):
-        return parts.path or "/", _label_for_path(parts.path)
+        # Keep the query string: it can carry the context (``?ws=``) the
+        # opener page needs to render its own back link.
+        target = parts.path or "/"
+        if parts.query:
+            target = f"{target}?{parts.query}"
+        return target, _label_for_path(parts.path)
 
     return "/", "Workspaces"
 

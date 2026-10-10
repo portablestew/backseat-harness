@@ -3051,6 +3051,91 @@ def test_chat_continue_form_carries_back_nav_hidden_inputs(monkeypatch):
     assert _hidden_input(resp.text, "back_label") == "Workspaces"
 
 
+def test_chat_continue_form_recarries_workspace_in_back_url(
+    monkeypatch, workspace: Path
+):
+    """Regression: the ``?ws=`` binding must survive the shell round trip.
+
+    The chat page carries its workspace only in the query string, so a
+    ``back_url`` built from the path alone sends the user back to a chat page
+    with no workspace -- and its header degrades to the "Workspaces" homepage.
+    """
+    from backseat_harness import history
+
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {k: "chat body" for k in keys}
+    )
+
+    with _client() as client:
+        resp = client.get(f"/chat/opencode/ses_backnav?ws={ws_id}")
+
+    assert _hidden_input(resp.text, "back_url") == f"/chat/opencode/ses_backnav?ws={ws_id}"
+    assert _hidden_input(resp.text, "back_label") == workspace.name
+
+
+def test_chat_shell_round_trip_returns_to_workspace(workspace: Path, tmp_path: Path, monkeypatch):
+    """Full reported flow: workspace -> chat -> Continue -> shell -> back.
+
+    The transcript's back link must again resolve to the exact workspace, not
+    the homepage.
+    """
+    from backseat_harness import history
+
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {k: "chat body" for k in keys}
+    )
+    chat_url = f"/chat/opencode/ses_roundtrip?ws={ws_id}"
+
+    with _client() as client:
+        chat = client.get(chat_url)
+        assert f'<a class="chat-header-back" href="/ws/{ws_id}">' in chat.text
+
+        session_id = _start_session(
+            client, [sys.executable, "-c", "import time; time.sleep(60)"], tmp_path
+        )
+        try:
+            shell = client.get(
+                f"/shell/{session_id}",
+                params={
+                    "from": _hidden_input(chat.text, "back_url"),
+                    "label": _hidden_input(chat.text, "back_label"),
+                },
+            )
+            # Shell back link carries the workspace binding through.
+            assert (
+                f'<a class="chat-header-back" href="{chat_url}">← {workspace.name}</a>'
+                in shell.text
+            )
+
+            # Following it lands on a transcript whose back link is the workspace.
+            returned = client.get(chat_url)
+            assert f'<a class="chat-header-back" href="/ws/{ws_id}">' in returned.text
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_page_back_link_keeps_referer_query(tmp_path: Path):
+    """The same-origin Referer fallback must not drop ``?ws=``."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                headers={
+                    "referer": f"http://localhost:{_PORT}/chat/opencode/ses_x?ws=7",
+                },
+            )
+            assert (
+                '<a class="chat-header-back" href="/chat/opencode/ses_x?ws=7">← Chat</a>'
+                in page.text
+            )
+        finally:
+            _kill_session(session_id)
+
+
 def test_search_fork_redirect_carries_back_nav_params(monkeypatch):
     refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
     _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
@@ -3388,6 +3473,25 @@ def test_chat_fork_form_carries_back_nav_hidden_inputs(monkeypatch):
 
     assert _hidden_input(resp.text, "back_url") == "/chat/cline/sess_fork"
     assert _hidden_input(resp.text, "back_label") == "Workspaces"
+
+
+def test_chat_fork_form_recarries_workspace_in_back_url(monkeypatch, workspace: Path):
+    """The fork form shares the chat page's back-nav payload, so it must
+    re-carry ``?ws=`` too (the redirect reaches the shell the same way)."""
+    from backseat_harness import history
+
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide chat body" for k in keys},
+    )
+
+    with _client() as client:
+        resp = client.get(f"/chat/cline/sess_fork?ws={ws_id}")
+
+    assert _hidden_input(resp.text, "back_url") == f"/chat/cline/sess_fork?ws={ws_id}"
+    assert _hidden_input(resp.text, "back_label") == workspace.name
 
 
 def test_prompt_excerpt_strips_indented_quotes_and_chat_header(monkeypatch):
