@@ -61,6 +61,35 @@ def _run_schtasks(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
+def _xml_text(value: str) -> str:
+    """Escape ``value`` for use as a Task Scheduler XML element text."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# VBScript rejects an arbitrarily long statement line, so a PATH-sized string
+# literal is emitted as adjacent chunks joined by ``& _`` continuations.
+_VBS_LITERAL_CHUNK = 96
+
+
+def _vbs_string(value: str, chunk: int = _VBS_LITERAL_CHUNK) -> str:
+    """``value`` as a VBScript string literal, wrapped over short lines.
+
+    Each chunk carries its own quotes, so the separator holds only the
+    concatenation and the line continuation::
+
+        "first chunk" & _
+        "second chunk"
+
+    Escaping happens per chunk and chunking splits between characters, so a
+    doubled quote is never cut in half by a line continuation.
+    """
+    pieces = [value[i : i + chunk] for i in range(0, len(value), chunk)] or [""]
+    literals = ['"' + piece.replace('"', '""') + '"' for piece in pieces]
+    if len(literals) == 1:
+        return literals[0]
+    return ' & _\n    '.join(literals)
+
+
 def _run_systemctl(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
@@ -74,13 +103,53 @@ class _WindowsPlatform(_PlatformImpl):
         return Path.home() / ".backseat" / "daemon" / "backseat-daemon.xml"
 
     def _wrapper_path(self) -> Path:
-        return self.artifact_path().with_suffix(".bat")
+        return self.artifact_path().with_suffix(".vbs")
+
+    def _legacy_wrapper_path(self) -> Path:
+        """The pre-VBS ``.bat`` launcher, still around on an upgraded install."""
+        return self._wrapper_path().with_suffix(".bat")
 
     def _command_line(self) -> str:
         return f'"{sys.executable}" -m backseat_harness.cli daemon run --web'
 
+    def _wscript_path(self) -> str:
+        """Absolute ``wscript.exe``: the windowless host that runs the wrapper.
+
+        It is named in ``<Command>`` rather than the ``.vbs`` itself so the
+        launch does not depend on the user's ``.vbs`` file association -- a
+        CScript default would put the console window straight back.
+        """
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        return str(system_root / "System32" / "wscript.exe")
+
+    def _wrapper_content(self) -> str:
+        """The launcher: freeze PATH, then run the daemon without a window.
+
+        ``Environment("PROCESS")`` hands the frozen PATH down exactly the way
+        the old ``set PATH=`` line did: this process and its descendants, and
+        nothing persisted. ``WshShell.Run`` window style 0 is ``SW_HIDE``, so
+        python still gets a console -- stdout/stderr stay real handles and the
+        CLI's prints keep working -- but it is never shown. ``bWaitOnReturn``
+        is true so wscript outlives the daemon and the task instance stays
+        Running, which is what lets ``schtasks /end`` (daemon stop/restart)
+        terminate the whole tree; the return code is then re-raised so a daemon
+        that died nonzero still trips the task's RestartOnFailure, exactly as
+        the old ``.bat`` did by exiting with python's code. wscript.exe is
+        itself a windowless host, so no visible window is created at any point
+        in the chain.
+        """
+        frozen = os.environ.get("PATH", "")
+        return (
+            'Set sh = CreateObject("WScript.Shell")\n'
+            'sh.Environment("PROCESS")("PATH") = ' + _vbs_string(frozen) + '\n'
+            'rc = sh.Run(' + _vbs_string(self._command_line()) + ', 0, True)\n'
+            'WScript.Quit rc\n'
+        )
+
     def _build_xml(self) -> str:
         wrapper = self._wrapper_path()
+        wscript = self._wscript_path()
+        arguments = _xml_text(f'"{wrapper}"')
         xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -109,8 +178,8 @@ class _WindowsPlatform(_PlatformImpl):
   </Triggers>
   <Actions Context="Author">
     <Exec>
-      <Command>{wrapper}</Command>
-      <Arguments></Arguments>
+      <Command>{_xml_text(wscript)}</Command>
+      <Arguments>{arguments}</Arguments>
     </Exec>
   </Actions>
 </Task>"""
@@ -119,10 +188,15 @@ class _WindowsPlatform(_PlatformImpl):
     def register(self) -> None:
         artifact = self.artifact_path()
         artifact.parent.mkdir(parents=True, exist_ok=True)
-        frozen_path = os.environ.get("PATH", "")
-        wrapper_content = f"@echo off\nset PATH={frozen_path}\n{self._command_line()}\n"
+        # A pre-VBS install's .bat is left alone here: until schtasks /create has
+        # re-pointed the task at the .vbs it is still the registered task's
+        # launcher. It stops mattering the moment that call succeeds, and
+        # uninstall removes it either way, so deleting it by hand after a
+        # successful install is enough.
         wrapper_path = self._wrapper_path()
-        wrapper_path.write_text(wrapper_content, encoding="utf-8")
+        # UTF-16 LE with BOM, like the XML beside it: the Windows Script Host
+        # reads that as Unicode, so a non-ASCII profile path survives the write.
+        wrapper_path.write_bytes(b"\xff\xfe" + self._wrapper_content().encode("utf-16-le"))
         xml_content = self._build_xml()
         artifact.write_bytes(b"\xff\xfe" + xml_content.encode("utf-16-le"))
         cmd = [
@@ -166,9 +240,9 @@ class _WindowsPlatform(_PlatformImpl):
         artifact = self.artifact_path()
         if artifact.exists():
             artifact.unlink()
-        wrapper = self._wrapper_path()
-        if wrapper.exists():
-            wrapper.unlink()
+        for wrapper in (self._wrapper_path(), self._legacy_wrapper_path()):
+            if wrapper.exists():
+                wrapper.unlink()
 
     def is_registered(self) -> bool:
         cmd = ["schtasks", "/query", "/tn", "backseat-daemon", "/fo", "LIST"]
