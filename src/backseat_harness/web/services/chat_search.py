@@ -10,13 +10,13 @@ Also provides fork-provider selection helper (step 6.3).
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from backseat_harness import marker
+from backseat_harness.providers import on_path_providers
 from backseat_harness.web.services.workspace import _workspace_dir_for
 
 
@@ -404,9 +404,9 @@ def pick_fork_provider(current_session_key: str, results: Sequence[_SessionKeyed
             return fork_provider
 
     # Rule 3: PATH fallback in scan order
-    _EXE_FOR = {"opencode": "opencode", "kiro": "kiro-cli", "claude": "claude"}
+    on_path = set(on_path_providers())
     for provider in _SUPPORTED_FORK_PROVIDERS:
-        if shutil.which(_EXE_FOR[provider]):
+        if provider in on_path:
             return provider
 
     # Rule 4: Nothing on PATH

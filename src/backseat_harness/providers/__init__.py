@@ -16,6 +16,8 @@ no operator profile.
 
 from __future__ import annotations
 
+import shutil
+
 from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, TurnResult
 from backseat_harness.providers.claude import ClaudeProvider
 from backseat_harness.providers.kiro import KiroProvider
@@ -26,6 +28,15 @@ _REGISTRY: dict[str, type[Provider]] = {
     "claude": ClaudeProvider,
     "kiro": KiroProvider,
     "opencode": OpencodeProvider,
+}
+
+# Executable each registered provider launches (its interactive argv[0]). The
+# one place PATH checks read from: the fork picker and the workspace "New chat"
+# buttons both go through on_path_providers().
+_BINARY: dict[str, str] = {
+    "claude": "claude",
+    "kiro": "kiro-cli",
+    "opencode": "opencode",
 }
 
 
@@ -44,6 +55,18 @@ def available_providers() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def binary_for(name: str) -> str:
+    try:
+        return _BINARY[name]
+    except KeyError as exc:
+        raise ProviderError(f"no CLI binary known for provider {name!r}") from exc
+
+
+def on_path_providers() -> list[str]:
+    """Registered providers whose CLI resolves on PATH, in ``available_providers`` order."""
+    return [name for name in available_providers() if shutil.which(binary_for(name))]
+
+
 __all__ = [
     "Provider",
     "ProviderError",
@@ -54,4 +77,6 @@ __all__ = [
     "OpencodeProvider",
     "get_provider",
     "available_providers",
+    "binary_for",
+    "on_path_providers",
 ]
