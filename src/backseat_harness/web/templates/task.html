@@ -61,6 +61,7 @@
     <input type="hidden" name="cwd" value=".">
     <input type="hidden" name="back_url" value="/ws/{{ ws_id }}/tasks/{{ task.slug }}">
     <input type="hidden" name="back_label" value="{{ ws_name }}">
+    <input type="hidden" name="title" value="{{ task.slug }}">
     <button type="submit" class="btn">Takeover</button>
   </form>
   {% endif %}
@@ -76,6 +77,7 @@
     const cwd = formData.get('cwd');
     const backUrl = formData.get('back_url');
     const backLabel = formData.get('back_label');
+    const title = formData.get('title');
 
     try {
       const response = await fetch('/shell/start', {
@@ -85,7 +87,7 @@
       });
       if (response.ok) {
         const data = await response.json();
-        const params = new URLSearchParams({ from: backUrl, label: backLabel });
+        const params = new URLSearchParams({ from: backUrl, label: backLabel, title });
         window.location.href = `/shell/${data.session_id}?${params}`;
       } else {
         alert('Failed to start shell session');

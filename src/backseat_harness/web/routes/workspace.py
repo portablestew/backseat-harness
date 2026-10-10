@@ -128,5 +128,6 @@ def new_chat(ws_id: int, provider: str = Form(...)):
         return HTMLResponse(f"<p><strong>error:</strong> {e}</p>", status_code=400)
 
     session_id = get_manager().create_session(argv, ws_path)
-    params = urlencode({"from": f"/ws/{ws_id}", "label": ws_path.name})
+    title = f"New {ws_path.name} {binary_for(provider)}"
+    params = urlencode({"from": f"/ws/{ws_id}", "label": ws_path.name, "title": title})
     return RedirectResponse(url=f"/shell/{session_id}?{params}", status_code=303)

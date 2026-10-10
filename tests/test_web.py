@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -3514,3 +3515,127 @@ def test_status_other_states_keep_their_own_label(workspace: Path, status, badge
     assert f'<span class="badge" data-status="{status}">{badge}</span>' in task_page.text
     assert '">in progress</span>' not in task_page.text
 
+
+
+# --- shell heading: title line over the session id ----------------------------
+
+
+def _shell_heading(html: str) -> str:
+    """The header's top line: the ``<strong>`` text inside the shell header."""
+    header = html[html.index('<header class="chat-header">') : html.index("</header>")]
+    return re.search(r"<strong>(.*?)</strong>", header, re.S).group(1)
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        # Task page / task chat: the task name.
+        ({"title": "fix-login-flow"}, "fix-login-flow"),
+        # Plain chat: the prompt excerpt the chat page already shows.
+        ({"title": "fix the flaky test now"}, "fix the flaky test now"),
+        # Workspace "+ New chat": the workspace and provider.
+        ({"title": "New my-ws kiro-cli"}, "New my-ws kiro-cli"),
+        # No title known: the command is the fallback.
+        ({}, None),
+    ],
+)
+def test_shell_heading_is_title_then_session_id(tmp_path: Path, params, expected):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(f"/shell/{session_id}", params=params)
+            assert page.status_code == 200
+            heading = _shell_heading(page.text)
+            assert heading == (expected if expected is not None else " ".join(cmd))
+            # The session id stays on its own line under the heading.
+            assert f"<small>{session_id}</small>" in page.text
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_heading_escapes_and_bounds_user_title(tmp_path: Path):
+    """Titles are user text: markup is escaped, and a hand-written overlong
+    ``?title=`` is cut to the 160-character bound with an ellipsis."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    hostile = "<img src=x onerror=alert(1)>  " + "a" * 400
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(f"/shell/{session_id}", params={"title": hostile})
+            assert page.status_code == 200
+            heading = _shell_heading(page.text)
+            assert "<img" not in heading
+            assert heading.startswith("&lt;img src=x onerror=alert(1)&gt; a")
+            assert heading.endswith("...")
+            assert len(unescape(heading)) == 160
+        finally:
+            _kill_session(session_id)
+
+
+def test_task_takeover_title_is_the_task_slug(workspace: Path):
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "title-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": "title-lane",
+                "status": "blocked",
+                "iteration": 0,
+                "generation": 1,
+                "reason": "Pick a palette color",
+                "updated_at": 1_700_000_300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/title-lane")
+
+    assert _hidden_input(page.text, "title") == "title-lane"
+
+
+def test_chat_fork_title_is_the_prompt_excerpt(monkeypatch):
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {
+            k: "## USER\nfix the\tflaky test now\n## ASSISTANT\ndone" for k in keys
+        },
+    )
+
+    with _client() as client:
+        resp = client.get("/chat/cline/sess_title")
+
+    assert _hidden_input(resp.text, "title") == "fix the flaky test now"
+
+
+def test_search_fork_redirect_carries_title(monkeypatch):
+    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
+    _capture_fork_command(monkeypatch)
+
+    with _client() as client:
+        resp = client.post(
+            "/search/fork",
+            data={
+                "conversation_id": "sess_cur",
+                "current_session_key": "kiro_ide:sess_cur",
+                "back_url": "/chat/kiro_ide/sess_cur",
+                "back_label": "Workspaces",
+                "title": "fix the flaky test now",
+            },
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert (
+        resp.headers["location"]
+        == "/shell/abc123def456?from=%2Fchat%2Fkiro_ide%2Fsess_cur"
+        "&label=Workspaces&title=fix+the+flaky+test+now"
+    )

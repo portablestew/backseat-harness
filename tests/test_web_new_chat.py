@@ -6,7 +6,9 @@ Detection is monkeypatched on ``shutil.which`` so nothing needs to be installed.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
@@ -117,8 +119,10 @@ def test_new_chat_spawns_fresh_provider_argv_and_redirects(
         )
 
     assert resp.status_code == 303
+    title = f"New {workspace.name} {binary_for(provider)}"
     assert resp.headers["location"] == (
-        f"/shell/abc123def456?from=%2Fws%2F{ws_id}&label={workspace.name}"
+        "/shell/abc123def456?"
+        + urlencode({"from": f"/ws/{ws_id}", "label": workspace.name, "title": title})
     )
     assert len(spawned) == 1
     assert spawned[0]["cmd"] == argv
@@ -232,3 +236,35 @@ def test_new_chat_expander_none_on_path_shows_note_and_no_form(
     assert "No supported CLI found on PATH." in panel
     assert f'action="/ws/{ws_id}/chats"' not in panel
     assert 'name="provider"' not in panel
+
+
+# --- shell heading: "New <ws> <provider>" from the + New chat opener ----------
+
+
+def _shell_heading(html: str) -> str:
+    """The header's top line: the ``<strong>`` text inside the shell header."""
+    header = html[html.index('<header class="chat-header">') : html.index("</header>")]
+    return re.search(r"<strong>(.*?)</strong>", header, re.S).group(1)
+
+
+def test_new_chat_shell_heading_reads_new_workspace_provider(
+    monkeypatch, workspace: Path, spawned
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("kiro-cli"))
+    # The fake spawn id resolves on the shell page, with the argv as fallback.
+    monkeypatch.setattr(
+        PTYSessionManager,
+        "get_session",
+        lambda self, sid: type("S", (), {"cmd": ["kiro-cli", "chat"]})(),
+    )
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "kiro"}, follow_redirects=False
+        )
+        page = client.get(resp.headers["location"])
+
+    assert page.status_code == 200
+    assert _shell_heading(page.text) == f"New {workspace.name} kiro-cli"
+    assert "<small>abc123def456</small>" in page.text

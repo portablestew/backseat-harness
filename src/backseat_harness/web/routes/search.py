@@ -90,6 +90,7 @@ async def search_fork(
     current_session_key: str = Form(...),
     back_url: str = Form("/"),
     back_label: str = Form(""),
+    title: str = Form(""),
 ):
     """Fork a session using the selected provider, start a shell session, and redirect."""
     # Provider selection reads keys only (pick_fork_provider rule 2), so list
@@ -114,6 +115,8 @@ async def search_fork(
     # Redirect to shell page, carrying the origin so the shell header's back
     # link returns to the chat page.
     params = {"from": back_url or "/", "label": back_label or "Chat"}
+    if title:
+        params["title"] = title
     return RedirectResponse(
         url=f"/shell/{session_id}?{urlencode(params)}",
         status_code=303,

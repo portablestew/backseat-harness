@@ -75,6 +75,25 @@ def _label_for_path(path: str) -> str:
     return "Back"
 
 
+#: Longest header title the shell page renders; openers already bound their
+#: own titles (a prompt excerpt is at most 123 characters), so this only trims
+#: a hand-written ``?title=`` URL.
+_TITLE_MAX = 160
+
+
+def _shell_title(request: Request, fallback: str) -> str:
+    """The shell header's top line: the opener's ``?title=`` (task name, prompt
+    excerpt, or "New <ws> <provider>"), whitespace-collapsed and length-bounded.
+    The command is shown only when no title is known.
+    """
+    raw = " ".join(request.query_params.get("title", "").split())
+    if not raw:
+        return fallback
+    if len(raw) > _TITLE_MAX:
+        return raw[: _TITLE_MAX - 3] + "..."
+    return raw
+
+
 def _resolve_back(request: Request) -> tuple[str, str]:
     """Resolve (url, label) for the shell page's back link.
 
@@ -116,7 +135,7 @@ def shell_page(request: Request, session_id: str):
         {
             "session_id": session_id,
             "ws_path": f"/ws/shell/{session_id}",
-            "cmd_display": " ".join(session.cmd),
+            "title": _shell_title(request, " ".join(session.cmd)),
             "back_url": back_url,
             "back_label": back_label,
         },
