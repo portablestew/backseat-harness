@@ -170,3 +170,65 @@ def test_new_chat_unknown_workspace_is_404_and_spawns_nothing(
 
     assert resp.status_code == 404
     assert spawned == []
+
+
+# --- Step 4: workspace "+ New chat" expander -----------------------------------
+
+
+def _new_chat_panel(page: str) -> str:
+    start = page.index('id="new-chat"')
+    return page[start : page.index("</details>", start)]
+
+
+def test_new_chat_expander_sits_after_other_chats(monkeypatch, workspace: Path):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("claude"))
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}").text
+
+    assert 'class="expander new-chat"' in page
+    panel = _new_chat_panel(page)
+    assert 'class="expander-plus"' in panel
+    assert ">+</summary>" not in panel
+    assert "<strong>New chat</strong>" in panel
+    # Placed after the Other chats table, i.e. after its closing </table>.
+    other = page.index("<h4>Other chats</h4>")
+    assert page.index('id="new-chat"') > page.index("</table>", other)
+
+
+def test_new_chat_expander_renders_form_per_on_path_provider(
+    monkeypatch, workspace: Path
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("opencode", "kiro-cli"))
+
+    with _client() as client:
+        panel = _new_chat_panel(client.get(f"/ws/{ws_id}").text)
+
+    assert panel.count(f'action="/ws/{ws_id}/chats"') == 2
+    assert 'name="provider" value="kiro"' in panel
+    assert 'name="provider" value="opencode"' in panel
+    # The kiro button shows the CLI's display name, not the registry key.
+    assert ">kiro-cli</button>" in panel
+    assert 'value="claude"' not in panel
+    # Stacked in registry order: kiro-cli above opencode.
+    assert panel.index("kiro-cli") < panel.index(">opencode</button>")
+    assert "No supported CLI found on PATH." not in panel
+
+
+def test_new_chat_expander_none_on_path_shows_note_and_no_form(
+    monkeypatch, workspace: Path
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only())
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+
+    assert resp.status_code == 200
+    panel = _new_chat_panel(resp.text)
+    assert 'class="expander-plus"' in panel
+    assert "No supported CLI found on PATH." in panel
+    assert f'action="/ws/{ws_id}/chats"' not in panel
+    assert 'name="provider"' not in panel

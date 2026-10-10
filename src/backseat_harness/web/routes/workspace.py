@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from backseat_harness.providers import (
     ProviderError,
     available_providers,
+    binary_for,
     get_provider,
     on_path_providers,
 )
@@ -62,6 +63,9 @@ def workspace_page(request: Request, ws_id: int):
     incomplete = task_service.list_incomplete(ws_path)
     complete = task_service.list_complete(ws_path)
     chats = chat_search_service.list_recent_chats(ws_path, limit=10)
+    new_chat_providers = [
+        {"name": p, "label": binary_for(p)} for p in on_path_providers()
+    ]
 
     return templates.TemplateResponse(
         request,
@@ -73,6 +77,7 @@ def workspace_page(request: Request, ws_id: int):
             "incomplete": incomplete,
             "complete": complete,
             "chats": chats,
+            "new_chat_providers": new_chat_providers,
         },
     )
 

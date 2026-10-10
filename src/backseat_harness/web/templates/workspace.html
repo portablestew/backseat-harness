@@ -122,4 +122,16 @@
     </tbody>
   </table>
 </section>
+
+<details id="new-chat" class="expander new-chat">
+  <summary class="expander-plus" title="New chat" aria-label="New chat"></summary>
+  <p><strong>New chat</strong></p>
+  {% for p in new_chat_providers %}
+  <form method="post" action="/ws/{{ ws_id }}/chats">
+    <button type="submit" name="provider" value="{{ p.name }}">{{ p.label }}</button>
+  </form>
+  {% else %}
+  <p><small>No supported CLI found on PATH.</small></p>
+  {% endfor %}
+</details>
 {% endblock %}
