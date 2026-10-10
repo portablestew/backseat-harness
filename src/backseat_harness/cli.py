@@ -561,16 +561,79 @@ def _cmd_daemon(args) -> int:
     return 0
 
 
+# The guard row is the only record of the daemon that is actually running, so
+# both directions are confirmed against it rather than against a scheduler's
+# return code: `schtasks /run` returns as soon as the request is accepted, and
+# `schtasks /end` reports success even when the task has no running instance
+# to end. A start only counts once something claimed the guard; a stop only
+# counts once that pid stops being live.
+_START_GRACE_S = 10.0
+_STOP_GRACE_S = 5.0
+#: Budget for the direct kill that follows an /end that reached no daemon.
+_KILL_GRACE_S = 5.0
+
+
+def _wait_for(check, grace_s: float):
+    """Poll ``check`` until it returns a truthy answer, or None when time is up.
+
+    Re-read rather than sampled once because both transitions land
+    asynchronously: ``/end`` tears a tree down and the daemon's ``finally``
+    clears the row a moment later, while a fresh daemon has to boot before it
+    can claim. A check that raises reads as "no answer yet" rather than
+    propagating, so an unreadable guard cannot wedge the command that exists
+    to report on it.
+    """
+    deadline = time.monotonic() + grace_s
+    while True:
+        try:
+            answer = check()
+        except Exception:
+            return None
+        if answer:
+            return answer
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _wait_new_guard_owner(pid, start, grace_s: float) -> dict | None:
+    """The first live guard owner that is not ``(pid, start)``.
+
+    Evidence of a real start, since a restart that leaves the same live daemon
+    in place has restarted nothing: the fresh instance died refusing a guard
+    it could not take (``DaemonAlreadyRunning``, exit 2) while ``/run`` still
+    returned 0.
+    """
+
+    def check() -> dict | None:
+        with db.open_db() as conn:
+            guard = db._daemon_record(conn)
+        if guard is None or not db.pid_live(guard["pid"], guard.get("start")):
+            return None
+        if (guard["pid"], guard.get("start")) == (pid, start):
+            return None
+        return guard
+
+    return _wait_for(check, grace_s)
+
+
+def _wait_guard_gone(pid, start, grace_s: float) -> bool:
+    """True once ``(pid, start)`` no longer owns a live daemon."""
+    return _wait_for(lambda: not db.pid_live(pid, start), grace_s) is not None
+
+
 def _cmd_daemon_install(args) -> int:
     original_path = os.environ.get("PATH")
     if args.path_override:
         os.environ["PATH"] = args.path_override
 
     foreign_warning = None
+    guard_before = None
     try:
         with db.open_db() as conn:
             guard = db._daemon_record(conn)
-            if guard is not None and db.pid_live(guard.get("pid"), guard.get("start")):
+        guard_before = guard
+        if guard is not None and db.pid_live(guard.get("pid"), guard.get("start")):
                 registered = platform_mod.is_registered()
                 foreign_warning = (
                     f"daemon is already live (pid={guard.get('pid')}); "
@@ -598,6 +661,23 @@ def _cmd_daemon_install(args) -> int:
             except Exception as exc:
                 start_ok = False
                 start_err = str(exc)
+            else:
+                # The scheduler accepting the request says nothing about the
+                # task's action running: the wrapper can be missing or blocked,
+                # and the fresh instance can die refusing a guard someone else
+                # holds, all long after /run returned 0. Only a new owner of
+                # the guard row proves the daemon came up.
+                owner = _wait_new_guard_owner(
+                    guard_before.get("pid") if guard_before else None,
+                    guard_before.get("start") if guard_before else None,
+                    _START_GRACE_S,
+                )
+                if owner is None:
+                    start_ok = False
+                    start_err = (
+                        "scheduler accepted the start but no daemon claimed the "
+                        "guard; the task instance did not stay up"
+                    )
             linger_text = None
             try:
                 user = os.environ.get("USER") or os.environ.get("USERNAME", "user")
@@ -651,14 +731,48 @@ def _cmd_daemon_restart(args) -> int:
         payload = {"restarted": False, "installed": False, "error": "nothing installed"}
         _emit(args, payload, payload["error"])
         return 2
+    with db.open_db() as conn:
+        before = db._daemon_record(conn)
+    old_pid = before["pid"] if before else None
+    old_start = before.get("start") if before else None
     try:
         platform_mod.restart()
-        payload = {"restarted": True, "installed": True}
-        text = "daemon restarted"
     except Exception as exc:
         payload = {"restarted": False, "installed": True, "error": str(exc)}
-        text = f"restart failed: {exc}"
-    _emit(args, payload, text)
+        _emit(args, payload, f"restart failed: {exc}")
+        return 0
+
+    # A restart that left the same live daemon in place has restarted nothing,
+    # so the claim is made once a different pid owns the guard -- never on the
+    # strength of /end and /run both returning 0.
+    owner = _wait_new_guard_owner(old_pid, old_start, _START_GRACE_S)
+    if owner is None and old_pid is not None:
+        # /run could not start a second daemon while the old one still holds
+        # the guard, and the old one survives /end whenever the task's python
+        # launcher sits between the scheduler and the daemon. End it directly
+        # and ask the task to start again.
+        if _end_recorded_daemon(old_pid, old_start, _STOP_GRACE_S):
+            try:
+                platform_mod.start()
+                owner = _wait_new_guard_owner(old_pid, old_start, _START_GRACE_S)
+            except Exception as exc:
+                payload = {"restarted": False, "installed": True, "error": str(exc)}
+                _emit(args, payload, f"restart failed: {exc}")
+                return 0
+    if owner is None:
+        payload = {"restarted": False, "installed": True, "pid": old_pid}
+        text = (
+            f"restart failed: the previous daemon (pid={old_pid}) could not be "
+            f"ended, so the task could not start a new one -- if it was "
+            f"installed as Administrator its daemon runs elevated, so re-run "
+            f"this command from an Administrator shell"
+            if old_pid is not None
+            else "restart failed: no new daemon claimed the guard"
+        )
+        _emit(args, payload, text)
+        return 0
+    payload = {"restarted": True, "installed": True, "pid": owner["pid"]}
+    _emit(args, payload, f"daemon restarted: pid={owner['pid']}")
     return 0
 
 
@@ -704,37 +818,74 @@ def _cmd_daemon_status(args) -> int:
     return 0
 
 
+def _end_recorded_daemon(pid, start, grace_s: float) -> bool:
+    """Make the daemon named by the guard row stop, and report whether it did.
+
+    ``schtasks /end`` only ends the task's action tree, and on a uv-managed
+    venv the action's python.exe is a launcher that re-execs the real
+    interpreter as a *child*: the daemon itself is that grandchild, so ending
+    the task leaves it running. The guard row holds the daemon's real pid, so
+    that process is what has to go when /end did not reach it. It dies hard
+    (no graceful release; the next claim overwrites the stale row), and a
+    daemon this shell cannot terminate -- one the task started elevated --
+    simply survives, which the caller reports rather than hides.
+    """
+    if _wait_guard_gone(pid, start, grace_s):
+        return True
+    spawn.kill_pid_tree(pid, budget_s=_KILL_GRACE_S)
+    return _wait_guard_gone(pid, start, grace_s)
+
+
 def _cmd_daemon_stop(args) -> int:
     registered = platform_mod.is_registered()
     with db.open_db() as conn:
         guard = db._daemon_record(conn)
-        foreign_live = (
-            guard is not None
-            and db.pid_live(guard["pid"], guard.get("start"))
-        )
+    live_before = guard is not None and db.pid_live(guard["pid"], guard.get("start"))
     if registered:
         try:
             platform_mod.stop()
-            payload = {"stopped": True}
-            text = "daemon stopped"
         except Exception as exc:
             payload = {"stopped": False, "error": str(exc)}
-            text = f"stop failed: {exc}"
+            _emit(args, payload, f"stop failed: {exc}")
+            return 0
+
+        # /end succeeding is not evidence the daemon died: it reports success
+        # with no running instance at all, and it cannot end an instance that
+        # never was the daemon's parent. The guard row is what has to move.
+        if not live_before:
+            payload = {"stopped": True, "was_running": False}
+            _emit(args, payload, "no daemon running; nothing to stop")
+            return 0
+        if _end_recorded_daemon(guard["pid"], guard.get("start"), _STOP_GRACE_S):
+            payload = {"stopped": True, "pid": guard["pid"]}
+            _emit(args, payload, "daemon stopped")
+            return 0
+
+        payload = {"stopped": False, "pid": guard["pid"], "start": guard.get("start")}
+        text = (
+            f"stop failed: the daemon is still live (pid={guard['pid']}); "
+            f"`schtasks /end` ended no instance owning it and this shell could "
+            f"not terminate it either -- if the task was installed as "
+            f"Administrator its daemon runs elevated, so re-run this command "
+            f"from an Administrator shell"
+        )
+        _emit(args, payload, text)
+        return 0
+
+    if live_before and guard is not None:
+        payload = {
+            "stopped": False,
+            "unmanaged": True,
+            "pid": guard["pid"],
+            "start": guard.get("start"),
+        }
+        text = (
+            f"daemon is unmanaged (live pid={guard['pid']} with no "
+            f"registration); stop with foreground Ctrl-C instead"
+        )
     else:
-        if foreign_live and guard is not None:
-            payload = {
-                "stopped": False,
-                "unmanaged": True,
-                "pid": guard["pid"],
-                "start": guard.get("start"),
-            }
-            text = (
-                f"daemon is unmanaged (live pid={guard['pid']} with no "
-                f"registration); stop with foreground Ctrl-C instead"
-            )
-        else:
-            payload = {"stopped": False}
-            text = "daemon not installed; nothing to stop"
+        payload = {"stopped": False}
+        text = "daemon not installed; nothing to stop"
     _emit(args, payload, text)
     return 0
 

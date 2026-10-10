@@ -1,8 +1,27 @@
 """CLI lane creation: `run`'s second argument is the goal, or a brief."""
 
+import json
+
+import pytest
+
 from backseat_harness import spawn
 from backseat_harness.cli import _ensure_goal, main
 from backseat_harness.config import load_config
+
+
+@pytest.fixture(autouse=True)
+def _no_real_guard_waits(monkeypatch):
+    """Guard-row polling waits on real time; tests take the single-check path.
+
+    Production polls for up to _START_GRACE_S / _STOP_GRACE_S because a
+    daemon booting or a tree being torn down lands asynchronously. With the
+    grace at zero the same helpers check exactly once, which keeps the
+    suite instant while still exercising the predicates.
+    """
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(cli, "_START_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_STOP_GRACE_S", 0.0)
 
 
 def test_run_requires_goal_for_new_task(tmp_path, capsys):
@@ -897,8 +916,100 @@ def test_daemon_stop_registered(monkeypatch, capsys):
 
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     monkeypatch.setattr(platform_mod, "stop", lambda: None)
-    rc = main(["daemon", "stop"])
+    import backseat_harness.db as db_mod
+
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
+    rc = main(["--format", "json", "daemon", "stop"])
+    payload = json.loads(capsys.readouterr().out)
     assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["was_running"] is False
+
+
+def test_daemon_stop_confirms_against_the_guard_row(monkeypatch, capsys):
+    """A /end that ends nothing must not be reported as a stop.
+
+    `schtasks /end` returns success even when the task has no running
+    instance, and it cannot end an instance that is not the daemon's parent
+    -- which is what a uv-managed venv makes of every launch, the action's
+    python.exe being a launcher for the interpreter that runs the daemon.
+    """
+    import backseat_harness.cli as cli
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "stop", lambda: None)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 4242, "start": 7.0})
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+    # The fallback kill is real code; never let it reach a live pid from a test.
+    killed = []
+    monkeypatch.setattr(cli.spawn, "kill_pid_tree", lambda pid, budget_s=0: killed.append(pid))
+
+    rc = main(["daemon", "stop"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "stop failed" in out
+    assert "4242" in out
+    assert "daemon stopped" not in out, "a surviving daemon must not be reported stopped"
+    assert killed == [4242], "the recorded daemon is the only handle /end does not have"
+
+
+def test_daemon_stop_kills_recorded_daemon_when_end_reaches_nothing(monkeypatch, capsys):
+    """When /end ends no instance, stop ends the recorded process itself.
+
+    The guard row names the interpreter that runs the daemon; killing it is
+    what actually stops the daemon, and the row going quiet is the proof.
+    """
+    import backseat_harness.cli as cli
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "stop", lambda: None)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 4242, "start": 7.0})
+    live = [True]
+
+    def pid_live(pid, start):
+        return live[0]
+
+    monkeypatch.setattr(db_mod, "pid_live", pid_live)
+
+    def fake_kill(pid, budget_s=0):
+        live[0] = False
+
+    monkeypatch.setattr(cli.spawn, "kill_pid_tree", fake_kill)
+
+    rc = main(["--format", "json", "daemon", "stop"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["pid"] == 4242
+
+
+def test_daemon_stop_reports_success_when_guard_row_goes_quiet(monkeypatch, capsys):
+    """The live daemon before stop is dead after it: that is a real stop."""
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "stop", lambda: None)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 4242, "start": 7.0})
+
+    live = [True]
+
+    def pid_live(pid, start):
+        return live[0]
+
+    monkeypatch.setattr(db_mod, "pid_live", pid_live)
+    # The stop tears the tree down: the row's owner stops being live.
+    monkeypatch.setattr(platform_mod, "stop", lambda: live.__setitem__(0, False))
+
+    rc = main(["--format", "json", "daemon", "stop"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["pid"] == 4242
 
 
 def test_daemon_stop_unmanaged_live(monkeypatch, capsys):
@@ -949,13 +1060,18 @@ def test_daemon_install_registers_and_starts(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(platform_mod, "uninstall", lambda: None)
     import backseat_harness.db as db_mod
 
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
-    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
+    # A start only counts once a daemon has claimed the guard, so the record
+    # appears with the start rather than alongside it.
+    def record(conn):
+        return {"pid": 31337, "start": 1.0} if started[0] else None
+
+    monkeypatch.setattr(db_mod, "_daemon_record", record)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
     assert registered[0] is True
     assert started[0] is True
-    payload = __import__("json").loads(capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
     assert payload["installed"] is True
     assert payload.get("warn") is None
 
@@ -1007,6 +1123,101 @@ def test_daemon_install_start_failure_not_hidden(monkeypatch, capsys):
     assert payload["installed"] is False
     assert payload.get("start_ok") is False
     assert payload.get("start_error") == "start failed"
+
+
+def test_daemon_restart_reports_failure_when_daemon_survives(monkeypatch, capsys):
+    """A restart that leaves the same daemon live has restarted nothing.
+
+    /run returns as soon as the scheduler accepts the request, so the fresh
+    instance can die refusing a guard it cannot take while the command is
+    still told it succeeded. The reported claim comes from a new pid owning
+    the guard row.
+    """
+    import backseat_harness.cli as cli
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "restart", lambda: None)
+    monkeypatch.setattr(platform_mod, "start", lambda: None)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 4242, "start": 7.0})
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+    # The fallback kill is real code; never let it reach a live pid from a test.
+    killed = []
+    monkeypatch.setattr(cli.spawn, "kill_pid_tree", lambda pid, budget_s=0: killed.append(pid))
+
+    rc = main(["daemon", "restart"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "restart failed" in out
+    assert "4242" in out
+    assert "daemon restarted" not in out
+    assert killed == [4242], "the surviving daemon must be ended before a new one can start"
+
+
+def test_daemon_restart_ends_old_daemon_then_starts_a_new_one(monkeypatch, capsys):
+    """The uv-launcher shape: /end reaches no daemon, so restart ends the
+    recorded pid, asks the task to run again, and reports the new owner."""
+    import backseat_harness.cli as cli
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(platform_mod, "restart", lambda: None)
+    monkeypatch.setattr(platform_mod, "start", lambda: None)
+
+    # The guard row names whoever is live; the kill is what changes that.
+    live = {4242: 7.0}
+    killed = []
+
+    def record(conn):
+        pid, start = next(iter(live.items()))
+        return {"pid": pid, "start": start}
+
+    def pid_live(pid, start):
+        return live.get(pid) == start
+
+    def fake_kill(pid, budget_s=0):
+        killed.append(pid)
+        live.pop(pid, None)
+        live[5150] = 9.0
+
+    monkeypatch.setattr(db_mod, "_daemon_record", record)
+    monkeypatch.setattr(db_mod, "pid_live", pid_live)
+    monkeypatch.setattr(cli.spawn, "kill_pid_tree", fake_kill)
+
+    rc = main(["--format", "json", "daemon", "restart"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert killed == [4242]
+    assert payload["restarted"] is True
+    assert payload["pid"] == 5150
+
+
+def test_daemon_restart_reports_new_guard_owner(monkeypatch, capsys):
+    """A genuinely new daemon (different pid owning the guard) is reported."""
+    import backseat_harness.db as db_mod
+    import backseat_harness.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
+
+    records = [{"pid": 4242, "start": 7.0}, {"pid": 5150, "start": 8.0}]
+    reads = [0]
+
+    def record(conn):
+        index = min(reads[0], len(records) - 1)
+        reads[0] += 1
+        return records[index]
+
+    monkeypatch.setattr(db_mod, "_daemon_record", record)
+    monkeypatch.setattr(platform_mod, "restart", lambda: None)
+
+    rc = main(["--format", "json", "daemon", "restart"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["restarted"] is True
+    assert payload["pid"] == 5150
 
 
 def test_daemon_restart_without_install_exits_2(monkeypatch, capsys):
@@ -1092,9 +1303,19 @@ def test_daemon_install_reports_linger_without_mutating(monkeypatch, capsys):
         return type("R", (), {"returncode": 0, "stdout": "Linger=no\n", "stderr": ""})()
 
     monkeypatch.setattr(sp_mod, "run", fake_run)
+    # Each read hands back a fresh owner, so the start check sees a new daemon
+    # claim the guard after the (stubbed) start rather than the pre-install one.
+    counter = {"pid": 4242}
+
+    def record(conn):
+        counter["pid"] += 1
+        return {"pid": counter["pid"], "start": 9.0}
+
+    monkeypatch.setattr(db_mod, "_daemon_record", record)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
     rc = main(["--format", "json", "daemon", "install"])
     assert rc == 0
-    payload = __import__("json").loads(capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
     assert payload.get("start_ok") is True
 
 
@@ -1131,8 +1352,6 @@ def test_daemon_install_idempotent(monkeypatch, capsys):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
 
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
-    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
     register_calls = [0]
     start_calls = [0]
@@ -1145,6 +1364,16 @@ def test_daemon_install_idempotent(monkeypatch, capsys):
 
     monkeypatch.setattr(platform_mod, "register", spy_register)
     monkeypatch.setattr(platform_mod, "start", spy_start)
+    # This test is about register/start being repeatable, not about the start
+    # check (covered by the guard-owner tests below): the stub reports a live
+    # owner so each install's start is treated as real.
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(
+        cli, "_wait_new_guard_owner", lambda pid, start, grace: {"pid": 7001, "start": 5.0}
+    )
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: False)
 
     def _fake_path_artifact():
         return __import__("types").SimpleNamespace(exists=lambda s: True)()
