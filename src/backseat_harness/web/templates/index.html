@@ -1,6 +1,35 @@
 {% extends "base.html" %}
 {% block title %}Workspaces - backseat-harness{% endblock %}
 {% block content %}
+<style>
+  /* Search row: the input takes the left half of the page, the button sits
+     just to its right at its natural width (not stretched). Both use the
+     compact form scale -- padding from the compact --pico spacing variables
+     set in the shared layout, font-size matching the add forms. */
+  .search-form {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0 0 1rem;
+  }
+  .search-form input {
+    width: 50%;
+    flex-shrink: 0;
+    font-size: 0.85rem;
+  }
+  .search-form button {
+    width: auto;
+    flex-shrink: 0;
+    font-size: 0.85rem;
+    padding: 0.3rem 0.85rem;
+  }
+</style>
+<header class="chat-header">
+  <div class="chat-header-prompt">
+    <strong>backseat-harness</strong>
+    <small>Buckle up</small>
+  </div>
+</header>
 <section>
   <h3>Workspaces</h3>
   <div id="workspace-list" hx-get="/workspaces/fragment" hx-trigger="every 60s, workspaceAdded from:body" hx-swap="outerHTML">
@@ -35,6 +64,17 @@
     </form>
   </details>
 </section>
+<section>
+  <h3>Search</h3>
+  <form id="search-form" class="search-form"
+        hx-get="/search/results" hx-trigger="submit"
+        hx-target="#search-results" hx-swap="innerHTML">
+    <input id="search-input" name="q" type="text" placeholder="Search sessions..."
+           autocomplete="off">
+    <button type="submit" id="search-submit">Search</button>
+  </form>
+  <div id="search-results"></div>
+</section>
 <script>
   (function () {
     var input = document.getElementById('ws-path');
@@ -43,6 +83,15 @@
     var sync = function () { submit.disabled = input.value.trim().length === 0; };
     input.addEventListener('input', sync);
     sync();
+  })();
+</script>
+<script>
+  (function () {
+    var form = document.getElementById('search-form');
+    var button = document.getElementById('search-submit');
+    if (!form || !button) return;
+    form.addEventListener('htmx:beforeRequest', function () { button.disabled = true; });
+    form.addEventListener('htmx:afterRequest', function () { button.disabled = false; });
   })();
 </script>
 {% endblock %}

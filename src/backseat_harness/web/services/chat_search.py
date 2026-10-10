@@ -9,6 +9,7 @@ Also provides fork-provider selection helper (step 6.3).
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from typing import Protocol
 
 from backseat_harness import marker
 from backseat_harness.providers import on_path_providers
+from backseat_harness.web.services import task as task_service
+from backseat_harness.web.services import workspace as workspace_service
 from backseat_harness.web.services.workspace import _workspace_dir_for
 
 
@@ -43,26 +46,27 @@ def _prompt_excerpt(text: str, limit: int = 120) -> str:
     """The chat's prompt string, per the owner brief: the first 120 characters
     of the user's prompt, with newlines and tabs replaced by spaces.
 
-    1. Drop leading ``<meta>…</meta>`` marker line(s).
+    1. Strip the blockquote marker from every line -- a managed transcript is
+       stored as a quoted fork, so its ``<meta>`` lines read ``> <meta>…</meta>``
+       -- and drop ``<meta>…</meta>`` marker lines wherever they appear: they
+       are harness identity, never prompt text.
     2. Prefer the body of the first ``## USER`` turn (after the header up to
        the next ``## `` header or end of text); without a header, the whole
        remaining text.
-    3. Strip a leading ``"> "`` (or a bare ``">"``) from every line --
-       chat_fork quotes the USER/ASSISTANT messages, which is noise in a
-       listing.
-    4. Skip leading empty lines and a bare ``USER`` role label, so the excerpt
+    3. Skip leading empty lines and a bare ``USER`` role label, so the excerpt
        starts at the actual prompt text.
-    5. Collapse runs of whitespace into single spaces.
-    6. Cut to ``limit`` characters and append ``"..."`` when text was dropped.
+    4. Collapse runs of whitespace into single spaces.
+    5. Cut to ``limit`` characters and append ``"..."`` when text was dropped.
     """
     if not text:
         return ""
 
-    lines = text.splitlines()
-    start = 0
-    while start < len(lines) and _META_LINE_RE.match(lines[start]):
-        start += 1
-    body = "\n".join(lines[start:])
+    lines = [
+        line
+        for line in (_QUOTE_PREFIX_RE.sub("", raw) for raw in text.splitlines())
+        if not _META_LINE_RE.match(line)
+    ]
+    body = "\n".join(lines)
 
     header = re.search(r"^## USER\s*$", body, re.MULTILINE)
     if header:
@@ -71,7 +75,7 @@ def _prompt_excerpt(text: str, limit: int = 120) -> str:
         if nxt:
             body = body[: nxt.start()]
 
-    body_lines = [_QUOTE_PREFIX_RE.sub("", line) for line in body.splitlines()]
+    body_lines = body.splitlines()
     i = 0
     while i < len(body_lines):
         stripped = body_lines[i].strip()
@@ -97,6 +101,9 @@ class SessionSearchResult:
     mtime: float
     preview: str
     classification: str  # "backseat task" | "operator" | "other"
+    prompt: str = ""  # parsed user-prompt excerpt (other chats)
+    marker_id: str = ""  # backseat task root UUID (task chats)
+    operator_slug: str = ""  # task slug (operator chats)
 
 
 def _normalize(path: str | Path) -> str:
@@ -325,19 +332,32 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
         if text is None:
             classification = "other"
             preview = ""
+            prompt = ""
+            marker_id = ""
+            operator_slug = ""
         else:
             classification = classify_session(text)
             preview = text.strip()
             if len(preview) > 200:
                 preview = preview[:200] + "…"
+            prompt = _prompt_excerpt(text)
+            parsed_marker = marker.parse_marker(text)
+            marker_id = parsed_marker[0] if parsed_marker else ""
+            operator_slug = marker.parse_operator_marker(text) or ""
 
         results.append(SessionSearchResult(
             key=ref.key,
             native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
-            project=getattr(ref, "project", None),
+            # Absolute workspace dir: ``ChatRef.project`` is only a basename,
+            # so the dir is recovered from the provider's own store (the
+            # homepage search resolves task hits to their lane through it).
+            project=_ref_workspace_path(ref),
             mtime=getattr(ref, "mtime", 0),
             preview=preview,
             classification=classification,
+            prompt=prompt,
+            marker_id=marker_id,
+            operator_slug=operator_slug,
         ))
 
     return results
@@ -414,3 +434,208 @@ def pick_fork_provider(current_session_key: str, results: Sequence[_SessionKeyed
         f"no supported CLI found on PATH (looked for opencode, kiro-cli, claude); "
         f"current provider was {current_provider or 'unknown'}"
     )
+
+
+@dataclass(frozen=True)
+class HomepageResult:
+    """One row for the homepage search table.
+
+    Task rows carry ``status``/``badge`` for the status capsule; other-chat
+    rows leave them empty and render a plain ``N/A``.
+    """
+
+    href: str
+    prompt: str
+    provider: str
+    mtime: float
+    status: str = ""
+    badge: str = ""
+
+
+def _ref_workspace_path(ref: object) -> str | None:
+    """Absolute workspace dir for a search ref, or ``None`` when unrecoverable.
+
+    ``ChatRef.project`` is only a directory *basename* (models.py), so the
+    absolute dir is recovered from the provider's own store
+    (``_workspace_dir_for``) -- a ``project`` that is already absolute is
+    accepted as-is.
+    """
+    raw = _workspace_dir_for(ref)
+    if raw is not None:
+        return raw
+    project = getattr(ref, "project", None)
+    if project:
+        path = Path(project).expanduser()
+        if path.is_absolute():
+            return str(path)
+    return None
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_json(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def _lane_index(workspace: str) -> dict[str, Path]:
+    """Map a task's identities to its lane, for one workspace.
+
+    ``binding.json`` is the authoritative source: it carries the lane's root
+    UUID and every generation's native session id. The lane transcripts cannot
+    serve here -- their markers are redacted to ``<task-root>`` on disk, so
+    they never hold the real root UUID a chat's marker carries.
+    """
+    index: dict[str, Path] = {}
+    tasks_dir = Path(workspace) / ".backseat" / "tasks"
+    if not tasks_dir.is_dir():
+        return index
+    for lane in tasks_dir.iterdir():
+        if not lane.is_dir():
+            continue
+        binding = _read_json(lane / "binding.json")
+        if not isinstance(binding, dict):
+            continue
+        root = binding.get("root_uuid")
+        if isinstance(root, str) and root:
+            index.setdefault(root, lane)
+        generations = binding.get("generations")
+        if isinstance(generations, list):
+            for gen in generations:
+                native = gen.get("native_id") if isinstance(gen, dict) else None
+                if isinstance(native, str) and native:
+                    index.setdefault(native, lane)
+    return index
+
+
+def _task_lane(
+    result: SessionSearchResult, lane_index: dict[str, dict[str, Path]]
+) -> Path | None:
+    """The lane for a task hit, looked up in ``lane_index``.
+
+    The index is built once per workspace (keyed by its normalized path) from
+    the lanes' ``binding.json`` -- small reads, where re-scanning transcripts
+    per hit would re-read megabytes.
+    """
+    project = result.project
+    if not project:
+        return None
+    key = workspace_service._normalize(project)
+    index = lane_index.get(key)
+    if index is None:
+        index = _lane_index(project)
+        lane_index[key] = index
+    return index.get(result.marker_id) or index.get(result.native_id)
+
+
+def _task_row(
+    result: SessionSearchResult, lane: Path | None, ws_paths: dict[str, int]
+) -> HomepageResult:
+    """Enrich a task hit: resolve its lane for the goal prompt and status.
+
+    Falls back to the chat link and the chat's parsed prompt when the lane
+    (or its registered workspace) cannot be resolved.
+    """
+    provider = _extract_provider_from_key(result.key) or ""
+    if lane is None:
+        return HomepageResult(
+            href=f"/chat/{provider}/{result.native_id}",
+            prompt=result.prompt,
+            provider=provider,
+            mtime=result.mtime,
+        )
+
+    ws_id = ws_paths.get(workspace_service._normalize(result.project))
+    info = task_service._lane_info(lane)
+    href = (
+        f"/ws/{ws_id}/tasks/{lane.name}"
+        if ws_id is not None
+        else f"/chat/{provider}/{result.native_id}"
+    )
+    return HomepageResult(
+        href=href,
+        prompt=_prompt_excerpt(_read_text(lane / "goal.md")),
+        provider=lane.name,
+        mtime=result.mtime,
+        status=info.status,
+        badge=info.badge,
+    )
+
+
+def _operator_lane(result: SessionSearchResult) -> Path | None:
+    """The task lane an operator-session hit belongs to, or None.
+
+    The operator tag's slug names the lane; the lane-existence check also
+    disambiguates a task-less operator tag, whose slug position holds the
+    phase instead.
+    """
+    project = result.project
+    if not project or not result.operator_slug:
+        return None
+    lane = Path(project) / ".backseat" / "tasks" / result.operator_slug
+    return lane if lane.is_dir() else None
+
+
+def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
+    """Homepage search rows: task chats (deduped, enriched) interleaved with
+    other chats in chat-search order.
+
+    All hits for one task collapse into a single row -- managed chats (root
+    UUID marker) and operator chats (slug marker) alike -- keyed by the task's
+    lane, keeping the first hit's sort position and metadata. An operator hit
+    whose task lane no longer resolves is harness-internal and is dropped.
+    """
+    # Extra raw results so task dedup still fills the row cap.
+    raw = search_all_sessions(query, limit * 3)
+
+    ws_paths = {
+        workspace_service._normalize(p): ws_id
+        for ws_id, p in workspace_service.list_workspaces_with_ids()
+    }
+    lane_index: dict[str, dict[str, Path]] = {}
+
+    seen_tasks: set[tuple[str, str]] = set()
+    rows: list[HomepageResult] = []
+    for result in raw:
+        if len(rows) >= limit:
+            break
+
+        if result.classification == "backseat task":
+            lane = _task_lane(result, lane_index)
+            if lane is None:
+                # An unresolvable task hit is still a real user chat: keep it
+                # as a plain chat row rather than dropping it.
+                rows.append(_task_row(result, None, ws_paths))
+                continue
+            key = (workspace_service._normalize(result.project), lane.name)
+            if key in seen_tasks:
+                continue
+            seen_tasks.add(key)
+            rows.append(_task_row(result, lane, ws_paths))
+        elif result.classification == "operator":
+            lane = _operator_lane(result)
+            if lane is None:
+                continue
+            key = (workspace_service._normalize(result.project), lane.name)
+            if key in seen_tasks:
+                continue
+            seen_tasks.add(key)
+            rows.append(_task_row(result, lane, ws_paths))
+        else:
+            provider = _extract_provider_from_key(result.key) or ""
+            rows.append(
+                HomepageResult(
+                    href=f"/chat/{provider}/{result.native_id}",
+                    prompt=result.prompt,
+                    provider=provider,
+                    mtime=result.mtime,
+                )
+            )
+    return rows

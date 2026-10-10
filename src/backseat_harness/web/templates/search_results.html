@@ -1,0 +1,21 @@
+{% if rows %}
+<table class="data-table">
+  <thead>
+    <tr><th>Prompt</th><th>Provider</th><th>Status</th><th>Updated</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr data-href="{{ r.href }}">
+      <td class="prompt"><a href="{{ r.href }}">{{ r.prompt }}</a></td>
+      <td>{{ r.provider }}</td>
+      <td>
+        {% if r.status %}<span class="badge" data-status="{{ r.status }}">{{ r.badge }}</span>{% else %}N/A{% endif %}
+      </td>
+      <td><small>{{ r.mtime | format_datetime }}</small></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No sessions found.</p>
+{% endif %}

@@ -59,6 +59,8 @@
   <form id="takeover-form" class="chat-continue-form">
     <input type="hidden" name="cmd" value='{{ takeover_cmd|tojson }}'>
     <input type="hidden" name="cwd" value=".">
+    <input type="hidden" name="back_url" value="/ws/{{ ws_id }}/tasks/{{ task.slug }}">
+    <input type="hidden" name="back_label" value="{{ ws_name }}">
     <button type="submit" class="btn">Takeover</button>
   </form>
   {% endif %}
@@ -72,7 +74,9 @@
     const formData = new FormData(form);
     const cmd = JSON.parse(formData.get('cmd'));
     const cwd = formData.get('cwd');
-    
+    const backUrl = formData.get('back_url');
+    const backLabel = formData.get('back_label');
+
     try {
       const response = await fetch('/shell/start', {
         method: 'POST',
@@ -81,7 +85,8 @@
       });
       if (response.ok) {
         const data = await response.json();
-        window.location.href = `/shell/${data.session_id}`;
+        const params = new URLSearchParams({ from: backUrl, label: backLabel });
+        window.location.href = `/shell/${data.session_id}?${params}`;
       } else {
         alert('Failed to start shell session');
       }

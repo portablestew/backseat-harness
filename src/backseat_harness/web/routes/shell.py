@@ -8,9 +8,10 @@ import base64
 import json
 import queue
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
@@ -59,6 +60,44 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
+def _is_safe_relative(url: str) -> bool:
+    """Same-origin relative-URL check for back-navigation targets."""
+    return url.startswith("/") and not url.startswith("//")
+
+
+def _label_for_path(path: str) -> str:
+    if path == "/":
+        return "Workspaces"
+    if path.startswith("/ws/"):
+        return "Workspace"
+    if path.startswith("/chat/"):
+        return "Chat"
+    return "Back"
+
+
+def _resolve_back(request: Request) -> tuple[str, str]:
+    """Resolve (url, label) for the shell page's back link.
+
+    Prefers the opener-supplied ``?from=&label=`` query params, falls back
+    to a same-origin Referer path, and finally to the workspaces index.
+    """
+    raw = request.query_params.get("from", "")
+    if _is_safe_relative(raw):
+        label = request.query_params.get("label", "")
+        return raw, (label or _label_for_path(raw))
+
+    referer = request.headers.get("referer", "")
+    parts = urlsplit(referer)
+    if (
+        parts.scheme in ("http", "https")
+        and parts.netloc == request.url.netloc
+        and parts.path.startswith("/")
+    ):
+        return parts.path or "/", _label_for_path(parts.path)
+
+    return "/", "Workspaces"
+
+
 @router.get("/shell/{session_id}", response_class=HTMLResponse)
 def shell_page(request: Request, session_id: str):
     """Serve the xterm shell page for an existing session.
@@ -66,17 +105,31 @@ def shell_page(request: Request, session_id: str):
     The page connects to the WebSocket at /ws/shell/{session_id}.
     """
     manager = get_manager()
-    if not manager.get_session(session_id):
+    session = manager.get_session(session_id)
+    if not session:
         return HTMLResponse("Session not found", status_code=404)
 
+    back_url, back_label = _resolve_back(request)
     return templates.TemplateResponse(
         request,
         "shell.html",
         {
             "session_id": session_id,
             "ws_path": f"/ws/shell/{session_id}",
+            "cmd_display": " ".join(session.cmd),
+            "back_url": back_url,
+            "back_label": back_label,
         },
     )
+
+
+@router.post("/shell/{session_id}/stop")
+def shell_stop(session_id: str, back_url: str = Form("/")):
+    """Kill the session's PTY and redirect back to the origin page."""
+    manager = get_manager()
+    manager.kill_session(session_id)
+    target = back_url if _is_safe_relative(back_url) else "/"
+    return RedirectResponse(url=target, status_code=303)
 
 
 @router.websocket("/ws/shell/{session_id}")

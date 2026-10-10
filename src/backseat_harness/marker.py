@@ -22,6 +22,21 @@ _MARKER_RE = re.compile(r"<meta>START SESSION\s+([0-9a-fA-F-]{36})\s+#(\d+)</met
 # phase that may follow are human context only. Never contains a root UUID.
 OPERATOR_SESSION_RE = re.compile(r"<meta>OPERATOR SESSION[^<]*</meta>")
 
+# First token after the tag: the task slug for a task-scoped operator session.
+_OPERATOR_SLUG_RE = re.compile(r"<meta>OPERATOR SESSION\s+(\S+)")
+
+
+def parse_operator_marker(text: str) -> str | None:
+    """Extract the task slug from an operator session marker, or None.
+
+    The tag reads ``<meta>OPERATOR SESSION <slug> <phase></meta>``. A task-less
+    operator session (slug empty) leaves the phase token in the slug position;
+    callers disambiguate that against the filesystem, since a phase name is
+    never a valid lane slug in practice.
+    """
+    m = _OPERATOR_SLUG_RE.search(text)
+    return m.group(1) if m else None
+
 
 def new_root_uuid() -> str:
     return str(uuid.uuid4())

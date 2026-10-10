@@ -27,10 +27,16 @@
       --ring: 0 0 0 3px rgba(76, 141, 255, 0.35);
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.25);
       /* Align Pico's own component variables with the palette above; this
-         stylesheet follows the CDN link, so these win over its defaults. */
+         stylesheet follows the CDN link, so these win over its defaults.
+         Form spacing: Pico's default 0.75rem vertical padding towers over
+         the page, and its input:not(...) selector out-specifies any
+         contextual override -- so the compact scale is set here as the
+         default for every form control (owner brief). */
       --pico-border-radius: var(--radius);
       --pico-primary: var(--accent);
       --pico-primary-hover: var(--accent-hover);
+      --pico-form-element-spacing-vertical: 0.25rem;
+      --pico-form-element-spacing-horizontal: 0.6rem;
     }
     body {
       background: var(--bg);
@@ -325,15 +331,34 @@
       box-shadow: none;
     }
     /* Compact forms inside an expander (Add workspace / Add task): smaller
-       input text and a smaller submit button (owner brief). */
+       input text. Vertical/horizontal padding comes from the compact
+       --pico-form-element-spacing-* scale set above. */
     .expander input,
     .expander textarea {
       font-size: 0.85rem;
-      padding: 0.35rem 0.6rem;
     }
     .expander button[type="submit"] {
       font-size: 0.85rem;
-      padding: 0.35rem 0.8rem;
+      padding: 0.3rem 0.8rem;
+    }
+
+    /* Form-control metrics (owner brief: compact boxes). Two Pico rules work
+       against the compact scale set above: it pins an explicit height on
+       single-line inputs from its own 1.5 --pico-line-height variable --
+       release it so padding and line-height size the box -- and its
+       [type=submit] button group out-specifies a bare ``button`` selector --
+       match that specificity to carry the compact line-height. */
+    input:not([type=checkbox],[type=radio],[type=range]) {
+      height: auto;
+      line-height: 1.25;
+    }
+    textarea,
+    [type=submit],
+    [type=reset],
+    [type=button],
+    button,
+    [role=button] {
+      line-height: 1.25;
     }
 
     /* Badges */

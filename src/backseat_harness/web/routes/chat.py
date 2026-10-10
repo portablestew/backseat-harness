@@ -119,6 +119,7 @@ def chat_page(request: Request, provider: str, conversation_id: str):
         {
             "provider": provider,
             "conversation_id": conversation_id,
+            "current_session_key": search_key,
             "transcript": transcript,
             "resume_command": resume_command,
             "prompt": prompt,

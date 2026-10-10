@@ -1,73 +1,68 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>backseat-harness shell - {{ session_id }}</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            background: #1e1e1e;
-            color: #d4d4d4;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        }
-        .header {
-            padding: 8px 16px;
-            background: #252526;
-            border-bottom: 1px solid #3c3c3c;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .header h1 {
-            margin: 0;
-            font-size: 14px;
-            font-weight: 500;
-        }
-        .session-info {
-            font-size: 12px;
-            color: #888;
-            font-family: monospace;
-        }
-        #terminal-container {
-            height: calc(100vh - 48px);
-            width: 100%;
-        }
-        .status-bar {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 24px;
-            background: #007acc;
-            color: white;
-            font-size: 11px;
-            display: flex;
-            align-items: center;
-            padding: 0 12px;
-            z-index: 100;
-        }
-        .status-bar.hidden {
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>backseat-harness shell</h1>
-        <span class="session-info">{{ session_id }}</span>
-    </div>
-    <div id="terminal-container"></div>
-    <div class="status-bar hidden" id="status-bar">Connected</div>
+{% extends "base.html" %}
+{% block title %}{{ session_id }} - backseat-harness shell{% endblock %}
+{% block content %}
+<style>
+  /* Full-viewport terminal: the header and status bar take their natural
+     height and the terminal fills the rest, so no fixed calc() is needed. */
+  main.container {
+    padding: 0;
+    height: 100vh;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #terminal-container {
+    flex: 1;
+    min-height: 0;
+  }
+  .status-bar {
+    flex-shrink: 0;
+    height: 24px;
+    background: #007acc;
+    color: white;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+  }
+  .status-bar.hidden {
+    display: none;
+  }
+  /* The header's action control: a red Disconnect that tears the session
+     down (the back link leaves it running). */
+  .chat-continue-form .shell-disconnect {
+    background: #f85149;
+    border-color: #f85149;
+    color: #ffffff;
+  }
+  .chat-continue-form .shell-disconnect:hover {
+    background: #ffa198;
+    border-color: #ffa198;
+    color: #1c2128;
+  }
+</style>
+<header class="chat-header">
+  <div class="chat-header-prompt">
+    <a class="chat-header-back" href="{{ back_url }}">← {{ back_label }}</a>
+    <strong>{{ cmd_display }}</strong>
+    <small>{{ session_id }}</small>
+  </div>
+  <form class="chat-continue-form" method="post" action="/shell/{{ session_id }}/stop">
+    <input type="hidden" name="back_url" value="{{ back_url }}">
+    <button type="submit" class="btn shell-disconnect">Disconnect</button>
+  </form>
+</header>
+<div id="terminal-container"></div>
+<div class="status-bar hidden" id="status-bar">Connected</div>
 
-    <!-- xterm.js from CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+<!-- xterm.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
 
-    <script>
+<script>
         const sessionId = "{{ session_id }}";
         const wsPath = "{{ ws_path }}";
 
@@ -137,6 +132,9 @@
             ws.onopen = () => {
                 statusBar.textContent = 'Connected';
                 statusBar.classList.remove('hidden');
+                // The status bar entering flow shrinks the terminal: refit so
+                // the PTY matches the new viewport.
+                fitAddon.fit();
                 reconnectAttempts = 0;
                 // Announce the real terminal size right after connecting
                 // (plan 3g): the PTY stops defaulting to 80 columns and the
@@ -213,5 +211,4 @@
         // Initial connect
         connect();
     </script>
-</body>
-</html>
+{% endblock %}

@@ -23,6 +23,8 @@ class PTYSession:
     """A single PTY session with its backend, buffer, and subscribers."""
 
     id: str
+    cmd: list[str]
+    cwd: str
     backend: BasePTYBackend
     buffer: deque[bytes] = field(default_factory=lambda: deque(maxlen=10000))
     subscribers: set[Subscriber] = field(default_factory=set)
@@ -56,7 +58,7 @@ class PTYSessionManager:
         backend = get_pty_backend()
         backend.spawn(cmd, cwd, cols=cols, rows=rows)
 
-        session = PTYSession(id=session_id, backend=backend)
+        session = PTYSession(id=session_id, cmd=list(cmd), cwd=str(cwd), backend=backend)
         with self._lock:
             self._sessions[session_id] = session
 
@@ -166,6 +168,24 @@ class PTYSessionManager:
             return True
         except Exception:
             return False
+
+    def kill_session(self, session_id: str) -> bool:
+        """Kill a session's PTY and drop it from the manager.
+
+        Returns True if the session existed.
+        """
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
+
+        if session is None:
+            return False
+
+        session.dead = True
+        try:
+            session.backend.kill()
+        except Exception:
+            pass
+        return True
 
     def is_alive(self, session_id: str) -> bool:
         """Check if a session's PTY is still alive."""

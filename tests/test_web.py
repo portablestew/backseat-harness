@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -28,7 +29,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from backseat_harness import db
+from backseat_harness import db, marker
 from backseat_harness.web.main import create_app
 from backseat_harness.web.services import chat_search as chat_search_service
 from backseat_harness.web.services import task as task_service
@@ -407,6 +408,9 @@ def test_add_task_path_traversal_name_stays_inside_tasks(workspace: Path):
 
 _MARKER = "<meta>START SESSION 5bee533f-ab27-4fe2-a548-a675f597479c #1</meta>"
 
+# The root UUID inside ``_MARKER``, as a lane's ``binding.json`` stores it.
+_MARKER_ROOT_UUID = marker.parse_marker(_MARKER)[0]
+
 
 class _Ref:
     """Stand-in for a chat-mother-forker ChatRef (attrs the seams read)."""
@@ -472,53 +476,6 @@ def _data_rows(html: str) -> list[str]:
         for row in re.findall(r"<tr\b[^>]*>.*?</tr>", html, re.S)
         if "<td>" in row
     ]
-
-
-def test_search_page_classifies_sessions_and_renders_one_action_per_row(monkeypatch):
-    refs = [
-        _Ref("opencode:ses_backseat", mtime=300.0),
-        _Ref("opencode:ses_plain", mtime=200.0),
-        _Ref("kiro_ide:sess_k1", mtime=100.0),
-    ]
-    transcripts = {
-        "opencode:ses_backseat": f"working on the harness\n{_MARKER}\nmore text",
-        "opencode:ses_plain": "a plain chat about refactors",
-        "kiro_ide:sess_k1": "an IDE chat with no markers",
-    }
-    _stub_chat_history(monkeypatch, refs, transcripts)
-
-    with _client() as client:
-        resp = client.get("/search")
-
-    assert resp.status_code == 200
-    rows = _data_rows(resp.text)
-    assert len(rows) == 3
-
-    # (a1) marker-bearing session is classified as a backseat task.
-    backseat_row = next(r for r in rows if "ses_backseat" in r)
-    assert '<span class="badge">backseat task</span>' in backseat_row
-
-    # (a2) supported provider renders Resume with the 7.5 interactive argv;
-    # classification stays "other" (no marker), i.e. nothing is blanket-labeled.
-    resume_row = next(r for r in rows if "ses_plain" in r)
-    assert '<span class="badge">other</span>' in resume_row
-    assert '["opencode", "--session", "ses_plain"]' in resume_row
-    assert ">Resume<" in resume_row
-    assert "Fork" not in resume_row  # exactly one action per row
-    # Strict browser-style parse: the cmd attribute must survive attribute
-    # extraction as one JSON value (the double-quoted tojson bug).
-    assert json.loads(_hidden_input(resume_row, "cmd")) == [
-        "opencode",
-        "--session",
-        "ses_plain",
-    ]
-
-    # (a3) non-supported provider renders Fork instead, carrying the row key.
-    fork_row = next(r for r in rows if "sess_k1" in r)
-    assert 'action="/search/fork"' in fork_row
-    assert 'name="current_session_key" value="kiro_ide:sess_k1"' in fork_row
-    assert ">Fork<" in fork_row
-    assert "Resume" not in fork_row
 
 
 def _fork_result(key: str, mtime: float) -> chat_search_service.SessionSearchResult:
@@ -1190,11 +1147,9 @@ def test_page_and_section_headers_are_one_level_smaller(
     with _client() as client:
         home = client.get("/")
         page = client.get(f"/ws/{ws_id}")
-        search = client.get("/search")
 
     assert "<h3>Workspaces</h3>" in home.text
     assert "<h2>Workspaces</h2>" not in home.text
-    assert "<h3>Session Search</h3>" in search.text
     # The workspace page title is the chat-style header <strong>, not a heading.
     assert f"<h3>{workspace.name}</h3>" not in page.text
     assert "<h4>Active tasks</h4>" in page.text
@@ -2932,6 +2887,506 @@ def test_auto_refresh_keeps_homepage_poll_and_pauses_on_edit(workspace: Path):
     assert "details.expander[open]" in body
     assert "/^(input|textarea|select)$/i" in body
     assert "window.location.reload()" in body
+
+
+# --- shell header: back link, command heading, disconnect ----------------------
+
+
+def test_shell_page_header_matches_chat_style_with_back_link(tmp_path: Path):
+    """The shell page reuses the shared chat header: a back link, the command
+    as the top line over the session id, and a red Disconnect control."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                params={"from": "/ws/1/tasks/lane-a", "label": "my-ws"},
+            )
+            assert page.status_code == 200
+            header = page.text[
+                page.text.index('<header class="chat-header">') : page.text.index(
+                    "</header>"
+                )
+            ]
+            assert (
+                '<a class="chat-header-back" href="/ws/1/tasks/lane-a">← my-ws</a>'
+                in header
+            )
+            assert f"<strong>{' '.join(cmd)}</strong>" in header
+            assert f"<small>{session_id}</small>" in header
+            assert f'action="/shell/{session_id}/stop"' in header
+            assert ">Disconnect<" in header
+            # The disconnect button is red, not the shared accent fill.
+            assert ".shell-disconnect" in page.text
+            assert "#f85149" in page.text
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_page_back_link_falls_back_to_same_origin_referer(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                headers={"referer": f"http://localhost:{_PORT}/chat/opencode/ses_x"},
+            )
+            assert (
+                '<a class="chat-header-back" href="/chat/opencode/ses_x">← Chat</a>'
+                in page.text
+            )
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_page_back_link_rejects_foreign_referer(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                headers={"referer": "http://evil.com/chat/opencode/ses_x"},
+            )
+            assert (
+                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+            )
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_page_back_link_rejects_protocol_relative_from(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                params={"from": "//evil.com/x", "label": "x"},
+            )
+            assert (
+                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+            )
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_stop_kills_session_and_redirects_back(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        resp = client.post(
+            f"/shell/{session_id}/stop",
+            data={"back_url": "/ws/1/tasks/lane-a"},
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ws/1/tasks/lane-a"
+    assert _shell_manager().get_session(session_id) is None
+
+
+def test_shell_stop_unsafe_back_url_falls_back_to_home(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        resp = client.post(
+            f"/shell/{session_id}/stop",
+            data={"back_url": "https://evil.com/"},
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+
+
+def test_shell_stop_unknown_session_still_redirects():
+    with _client() as client:
+        resp = client.post("/shell/000000000000/stop", follow_redirects=False)
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+
+
+def test_task_takeover_form_carries_back_nav_hidden_inputs(workspace: Path):
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "back-nav-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": "back-nav-lane",
+                "status": "blocked",
+                "iteration": 0,
+                "generation": 1,
+                "reason": "Pick a palette color",
+                "updated_at": 1_700_000_300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/back-nav-lane")
+
+    assert _hidden_input(page.text, "back_url") == f"/ws/{ws_id}/tasks/back-nav-lane"
+    assert _hidden_input(page.text, "back_label") == workspace.name
+
+
+def test_chat_continue_form_carries_back_nav_hidden_inputs(monkeypatch):
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {k: "chat body" for k in keys}
+    )
+
+    with _client() as client:
+        resp = client.get("/chat/opencode/ses_backnav")
+
+    assert _hidden_input(resp.text, "back_url") == "/chat/opencode/ses_backnav"
+    assert _hidden_input(resp.text, "back_label") == "Workspaces"
+
+
+def test_search_fork_redirect_carries_back_nav_params(monkeypatch):
+    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
+    _capture_fork_command(monkeypatch)
+
+    with _client() as client:
+        resp = client.post(
+            "/search/fork",
+            data={
+                "conversation_id": "sess_cur",
+                "current_session_key": "kiro_ide:sess_cur",
+                "back_url": "/chat/kiro_ide/sess_cur",
+                "back_label": "Workspaces",
+            },
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert (
+        resp.headers["location"]
+        == "/shell/abc123def456?from=%2Fchat%2Fkiro_ide%2Fsess_cur&label=Workspaces"
+    )
+
+
+def test_compact_form_controls_override_pico_specificity():
+    """Owner brief: single-line inputs must actually be compact. Pico pins
+    their height from its own 1.5 ``--pico-line-height`` variable, and its
+    ``[type=submit]`` button group out-specifies a bare ``button`` selector --
+    so a lower-specificity padding override silently does nothing. The compact
+    scale therefore has to ride selectors that match Pico's specificity."""
+    with _client() as client:
+        page = client.get("/")
+
+    body = page.text
+    # Compact spacing values replace Pico's 0.75rem vertical default for
+    # every form control (the add forms and the search row included).
+    assert "--pico-form-element-spacing-vertical: 0.25rem" in body
+    assert "--pico-form-element-spacing-horizontal: 0.6rem" in body
+
+    rules = _css_rule_bodies(body)
+    # Pico's explicit input height is released, and the compact line-height
+    # rides the same high-specificity selector (verified in the browser:
+    # 40px -> 32px).
+    input_rule = rules.get(
+        "input:not([type=checkbox],[type=radio],[type=range])", [""]
+    )[0]
+    assert "height: auto" in input_rule
+    assert "line-height: 1.25" in input_rule
+    # The button group matches Pico's [type=submit] specificity.
+    button_rule = rules.get(
+        "textarea, [type=submit], [type=reset], [type=button], button, [role=button]",
+        [""],
+    )[0]
+    assert "line-height: 1.25" in button_rule
+    # The search input uses the compact font size.
+    search_rule = rules.get(".search-form input", [""])[0]
+    assert "font-size: 0.85rem" in search_rule
+
+
+def test_homepage_header_and_search_form():
+    """The homepage carries the shared chat header (no back link) and the
+    search form: an input covering the left half with a small submit button."""
+    with _client() as client:
+        page = client.get("/")
+
+    assert page.status_code == 200
+    header = page.text[
+        page.text.index('<header class="chat-header">') : page.text.index("</header>")
+    ]
+    assert "<strong>backseat-harness</strong>" in header
+    assert "<small>Buckle up</small>" in header
+    assert '<a class="chat-header-back"' not in header
+
+    assert 'id="search-form"' in page.text
+    assert 'name="q"' in page.text
+    assert 'id="search-submit"' in page.text
+    assert 'hx-get="/search/results"' in page.text
+    # The submit button stays disabled while the search is in flight.
+    assert "htmx:beforeRequest" in page.text
+    assert "htmx:afterRequest" in page.text
+    # The input takes the left half; the button is not stretched.
+    assert ".search-form input" in page.text
+    assert "width: 50%" in page.text
+
+
+def test_search_results_fragment_interleaves_task_and_other_rows(
+    monkeypatch, workspace: Path
+):
+    """The fragment interleaves task chats (deduped, enriched) with other
+    chats in chat-search order: a task row links to the task page with the
+    goal prompt, task name and status capsule; an other-chat row links to
+    the chat page with a plain N/A status.
+
+    The lane's identity comes from ``binding.json`` (its on-disk transcript
+    markers are redacted to ``<task-root>``, so they can never be matched
+    against a chat's real root UUID)."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "search-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal for search lane\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": "search-lane",
+                "status": "blocked",
+                "iteration": 0,
+                "generation": 1,
+                "reason": "waiting",
+                "updated_at": 1_700_000_300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "root_uuid": _MARKER_ROOT_UUID,
+                "provider": "opencode",
+                "generations": [{"n": 1, "native_id": "ses_task"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Two provider chats carry the same task marker: they collapse into one
+    # row, keeping the first hit's position.
+    refs = [
+        _Ref("opencode:ses_task", mtime=400.0, project=str(workspace)),
+        _Ref("claude_code:ses_task_dup", mtime=350.0, project=str(workspace)),
+        _Ref("opencode:ses_plain", mtime=200.0),
+    ]
+    transcripts = {
+        "opencode:ses_task": f"{_MARKER}\n## USER\nfix the thing\n",
+        "claude_code:ses_task_dup": f"{_MARKER}\n## USER\nfix the thing\n",
+        "opencode:ses_plain": "a plain chat about refactors",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    html = resp.text
+
+    # The deduped task row: goal prompt, task name, status capsule, task link.
+    assert f'data-href="/ws/{ws_id}/tasks/search-lane"' in html
+    assert "goal for search lane" in html
+    assert "search-lane" in html
+    assert '<span class="badge" data-status="blocked">needs attention</span>' in html
+    # The duplicate hit was skipped: exactly one row links to the task page.
+    assert html.count(f'data-href="/ws/{ws_id}/tasks/search-lane"') == 1
+
+    # The other-chat row: parsed prompt, provider, plain N/A, chat link.
+    assert 'data-href="/chat/opencode/ses_plain"' in html
+    assert "a plain chat about refactors" in html
+    assert "N/A" in html
+
+    # Chat-search order is preserved: the task row precedes the other row.
+    assert html.index("goal for search lane") < html.index("a plain chat about refactors")
+
+    # Both rows carry the formatted mtime.
+    assert datetime.fromtimestamp(400.0).strftime("%Y-%m-%d %H:%M") in html
+    assert datetime.fromtimestamp(200.0).strftime("%Y-%m-%d %H:%M") in html
+
+
+def test_search_results_caps_at_twenty_rows(monkeypatch):
+    refs = [_Ref(f"opencode:ses_{i:02d}", mtime=100.0 + i) for i in range(25)]
+    _stub_chat_history(monkeypatch, refs, {})
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    assert resp.text.count('data-href="/chat/') == 20
+
+
+def test_search_results_empty(monkeypatch):
+    _stub_chat_history(monkeypatch, [], {})
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": "nothing"})
+
+    assert resp.status_code == 200
+    assert "No sessions found." in resp.text
+    assert "<table" not in resp.text
+
+
+def test_search_results_collapses_operator_chat_into_task_row(
+    monkeypatch, workspace: Path
+):
+    """An operator session for a task collapses into that task's row: the
+    row keeps the first hit's position and metadata (the operator chat's
+    mtime), shows the goal prompt and status capsule, and the operator and
+    managed chat bodies never appear as rows of their own."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "op-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal for op lane\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps(
+            {
+                "slug": "op-lane",
+                "status": "blocked",
+                "iteration": 0,
+                "generation": 1,
+                "reason": "waiting",
+                "updated_at": 1_700_000_300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "root_uuid": _MARKER_ROOT_UUID,
+                "generations": [{"n": 1, "native_id": "ses_managed"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # The operator chat is the newer hit, so it comes first and supplies the
+    # row's metadata; the managed chat for the same lane is then skipped.
+    refs = [
+        _Ref("opencode:ses_op", mtime=500.0, project=str(workspace)),
+        _Ref("opencode:ses_managed", mtime=400.0, project=str(workspace)),
+    ]
+    transcripts = {
+        "opencode:ses_op": (
+            "<meta>OPERATOR SESSION op-lane review</meta>\n"
+            "## USER\noperator chat body\n"
+        ),
+        "opencode:ses_managed": f"{_MARKER}\n## USER\nmanaged chat body\n",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    html = resp.text
+    # Exactly one row, for the task: both hits collapsed into it.
+    assert html.count(f'data-href="/ws/{ws_id}/tasks/op-lane"') == 1
+    assert "goal for op lane" in html
+    assert '<span class="badge" data-status="blocked">needs attention</span>' in html
+    # Neither chat body shows up as its own row.
+    assert "operator chat body" not in html
+    assert "managed chat body" not in html
+    # The first hit (operator, newer) supplies the Updated timestamp.
+    assert datetime.fromtimestamp(500.0).strftime("%Y-%m-%d %H:%M") in html
+    assert datetime.fromtimestamp(400.0).strftime("%Y-%m-%d %H:%M") not in html
+
+
+def test_search_results_drops_operator_chat_without_a_task(monkeypatch):
+    """A task-less operator session (phase-only tag) maps to no lane, so it
+    is dropped rather than surfaced as its own row -- the slug position of the
+    tag holds the phase, which is never a lane."""
+    refs = [
+        _Ref("opencode:ses_op_only", mtime=500.0, project="somewhere"),
+        _Ref("opencode:ses_plain", mtime=200.0),
+    ]
+    transcripts = {
+        "opencode:ses_op_only": (
+            "<meta>OPERATOR SESSION plan</meta>\n## USER\noperator chat body\n"
+        ),
+        "opencode:ses_plain": "a plain chat about refactors",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    html = resp.text
+    assert "operator chat body" not in html
+    assert "ses_op_only" not in html
+    # The plain other chat still renders.
+    assert 'data-href="/chat/opencode/ses_plain"' in html
+    assert "a plain chat about refactors" in html
+
+
+def test_search_results_recovers_workspace_dir_from_the_provider_store(
+    monkeypatch, workspace: Path, tmp_path: Path
+):
+    """Real refs carry a bare ``project`` basename, so without the absolute-dir
+    recovery (from the provider's own store) no task row can resolve its lane
+    -- which is what made every task fall back to a plain chat row."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "recovered-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal for recovered lane\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps({"slug": "recovered-lane", "status": "continue"}),
+        encoding="utf-8",
+    )
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {"v": 1, "root_uuid": _MARKER_ROOT_UUID, "generations": []}
+        ),
+        encoding="utf-8",
+    )
+
+    # A claude_code store: the recovery reads the conversation's cwd from it,
+    # and the ref's own ``project`` is nothing but a basename.
+    store = tmp_path / "sess_recovered.jsonl"
+    store.write_text(
+        json.dumps({"type": "user", "cwd": str(workspace)}) + "\n", encoding="utf-8"
+    )
+    refs = [_Ref("claude_code:sess_recovered", mtime=400.0, locator=str(store))]
+    transcripts = {"claude_code:sess_recovered": f"{_MARKER}\n## USER\nmanaged body\n"}
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    assert f'data-href="/ws/{ws_id}/tasks/recovered-lane"' in resp.text
+    assert "goal for recovered lane" in resp.text
+    assert '<span class="badge" data-status="continue">in progress</span>' in resp.text
+
+
+def test_chat_fork_form_carries_back_nav_hidden_inputs(monkeypatch):
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide chat body" for k in keys},
+    )
+
+    with _client() as client:
+        resp = client.get("/chat/cline/sess_fork")
+
+    assert _hidden_input(resp.text, "back_url") == "/chat/cline/sess_fork"
+    assert _hidden_input(resp.text, "back_label") == "Workspaces"
 
 
 def test_prompt_excerpt_strips_indented_quotes_and_chat_header(monkeypatch):
