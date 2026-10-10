@@ -69,6 +69,26 @@ def test_windows_artifact_is_valid_task_xml_with_vbs_wrapper(monkeypatch, tmp_pa
     assert "<Limit>" not in text_content
     # InteractiveToken present
     assert "InteractiveToken" in text_content
+    # The daemon runs as the ordinary logged-on user, unelevated. HighestAvailable
+    # would hand a model-driven agent -- and every provider CLI it spawns -- a full
+    # admin token at every logon, silently, and make the daemon un-stoppable from
+    # a normal shell.
+    assert "<RunLevel>LeastPrivilege</RunLevel>" in text_content
+    assert "HighestAvailable" not in text_content
+    # The logon trigger is scoped to this account. Unscoped, it means "any user
+    # logging on": the daemon would start under whichever account logs in first,
+    # and registering that machine-wide trigger is an administrative write (the
+    # XML import is denied without elevation, where the plain one is not).
+    trigger = root.find(
+        "{http://schemas.microsoft.com/windows/2004/02/mit/task}Triggers/"
+        "{http://schemas.microsoft.com/windows/2004/02/mit/task}LogonTrigger"
+    )
+    assert trigger is not None
+    trigger_user = trigger.find(
+        "{http://schemas.microsoft.com/windows/2004/02/mit/task}UserId"
+    )
+    assert trigger_user is not None, "the logon trigger must name the account it runs for"
+    assert trigger_user.text == win._user_id()
     # Action runs wscript.exe (a windowless host) on the wrapper .vbs, never a
     # console app; naming the host directly also keeps a CScript file
     # association from putting a console window back.

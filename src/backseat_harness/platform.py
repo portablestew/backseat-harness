@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import subprocess
 import sys
@@ -146,10 +147,27 @@ class _WindowsPlatform(_PlatformImpl):
             'WScript.Quit rc\n'
         )
 
+    def _user_id(self) -> str:
+        """``DOMAIN\\user`` for the account installing this task.
+
+        A ``LogonTrigger`` with no ``UserId`` fires for *any* user logging on.
+        That is a machine-wide trigger: registering one is an administrative
+        write (plain ``schtasks /create`` needs no elevation, the XML import is
+        denied without it), and the daemon would then start under whichever
+        account logs in first rather than this one. Scoping the trigger to the
+        installing account is what makes the registration an ordinary,
+        unelevated one -- and the task itself already runs as that user via
+        ``InteractiveToken``.
+        """
+        user = os.environ.get("USERNAME") or getpass.getuser()
+        domain = os.environ.get("USERDOMAIN")
+        return f"{domain}\\{user}" if domain else user
+
     def _build_xml(self) -> str:
         wrapper = self._wrapper_path()
         wscript = self._wscript_path()
         arguments = _xml_text(f'"{wrapper}"')
+        user_id = _xml_text(self._user_id())
         xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -158,7 +176,7 @@ class _WindowsPlatform(_PlatformImpl):
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
+      <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -173,6 +191,7 @@ class _WindowsPlatform(_PlatformImpl):
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <UserId>{user_id}</UserId>
       <Delay>PT30S</Delay>
     </LogonTrigger>
   </Triggers>
@@ -213,9 +232,11 @@ class _WindowsPlatform(_PlatformImpl):
             stderr = result.stderr or ""
             if "Access is denied" in stderr or result.returncode == 5:
                 raise RuntimeError(
-                    "schtasks /create failed: Access is denied. "
-                    "Task Scheduler registration requires an elevated shell. "
-                    "Re-run the install command from an Administrator PowerShell/CMD."
+                    "schtasks /create failed: Access is denied. The task is "
+                    "registered for this user with LeastPrivilege, so this is "
+                    "not an elevation requirement -- check whether another "
+                    "policy or session is denying this account a write to the "
+                    "Task Scheduler store."
                 )
             raise RuntimeError(f"schtasks /create failed (rc={result.returncode}): {stderr}")
 
