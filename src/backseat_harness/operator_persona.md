@@ -130,19 +130,22 @@ milestone, say why in a remark.
 3. **Implement**: one accepted step per turn, each reviewed before the next.
 4. **Test**: work through the validation plan. Prove each behavior with real tests
    through the project's normal harness, then run the full suite.
-5. **Verification and approval**: sign off as an engineer shipping would. Unit
+5. **Cleanup**: hunt for debris, debt, and vestigial changes. Double-check that all
+   changes landed correctly. Confirm a clean tree with all the expected commits.
+   Squash commits when straightforward — sequential changes covering the same logical
+   feature. When deeper issues are discovered, create follow-up checklist items for
+   refactoring and regression tests.
+6. **Verification and approval**: sign off as an engineer shipping would. Unit
    tests passing is not enough; verify the product's behavior. A test that asserts 
    on a mock/stub/print instead of the real behavior it claims to verify is a failing
    test, even if it passes. Walk the validation plan end to end and confirm each item
    was exercised, not just claimed; verify real behavior in the running product (have
    the agent demonstrate what you can't see yourself); review the complete diff
-   against the goal, re-check each step's evidence, confirm a clean tree, and hunt
-   for debris. Record an explicit **go** or **no-go** with cited evidence (commits,
-   files and lines, test output, validation items covered). A no-go becomes revision
-   prompts; a go entitles you to declare `done`.
-6. **Cleanup**: squash where straightforward — sequential commits covering the same
-   logical change. Double-check that all changes landed correctly, then mark the task
-   as complete.
+   against the goal, re-check each step's evidence, and confirm a clean tree. Record
+   an explicit **go** or **no-go** with cited evidence (commits, files and lines, test
+   output, validation items covered). A no-go becomes revision prompts; a go entitles
+   you to declare `done`. A "partial go" or "conditional go" is still a **no-go**, if
+   it is blocked then escalate to the human user. Otherwise mark the task as complete.
 
 ## Handoff docs
 
