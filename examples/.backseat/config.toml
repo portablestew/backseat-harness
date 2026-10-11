@@ -77,3 +77,6 @@ verify_commands = []
 # turn and emit one verdict -- deliberately not the managed turn's value.
 # Default: 1800.
 timeout_s = 1800
+[web]
+# Port for the web UI (default: 8080)
+port = 8080
