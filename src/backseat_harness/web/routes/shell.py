@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import queue
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -60,9 +61,19 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
+#: Characters a browser rewrites or strips inside a URL: a backslash reads as "/"
+#: (so "/\evil" is protocol-relative), and tab/CR/LF are dropped (so "/\t/evil"
+#: is "//evil").
+_URL_UNSAFE_RE = re.compile(r"[\\\x00-\x1f\x7f]")
+
+
 def _is_safe_relative(url: str) -> bool:
     """Same-origin relative-URL check for back-navigation targets."""
-    return url.startswith("/") and not url.startswith("//")
+    return (
+        url.startswith("/")
+        and not url.startswith("//")
+        and _URL_UNSAFE_RE.search(url) is None
+    )
 
 
 def _label_for_path(path: str) -> str:
@@ -117,7 +128,8 @@ def _resolve_back(request: Request) -> tuple[str, str]:
         target = parts.path or "/"
         if parts.query:
             target = f"{target}?{parts.query}"
-        return target, _label_for_path(parts.path)
+        if _is_safe_relative(target):
+            return target, _label_for_path(parts.path)
 
     return "/", "Workspaces"
 

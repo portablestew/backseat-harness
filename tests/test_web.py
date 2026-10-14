@@ -3341,6 +3341,70 @@ def test_shell_page_back_link_rejects_protocol_relative_from(tmp_path: Path):
             _kill_session(session_id)
 
 
+@pytest.mark.parametrize(
+    "from_value",
+    [
+        "//evil.example/x",
+        "/\\evil.example/x",
+        "/\\\\evil.example/x",
+        "/\t/evil.example/x",
+        "/chat/opencode/ses_x\r\nLocation: evil",
+    ],
+)
+def test_shell_page_back_link_rejects_browser_rewritten_from(tmp_path: Path, from_value):
+    """A browser reads a backslash as "/" and drops tab/CR/LF, so these
+    values become protocol-relative: each must fall back to the workspaces index."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                params={"from": from_value, "label": "x"},
+            )
+            assert page.status_code == 200
+            assert (
+                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+            )
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_page_back_link_rejects_protocol_relative_referer(tmp_path: Path):
+    """The same-origin Referer keeps its query, so a path that starts "//" must
+    not come back as a protocol-relative back link."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        try:
+            page = client.get(
+                f"/shell/{session_id}",
+                headers={"referer": f"http://localhost:{_PORT}//evil.example/x?ws=3"},
+            )
+            assert page.status_code == 200
+            assert (
+                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+            )
+            assert 'href="//evil.example' not in page.text
+        finally:
+            _kill_session(session_id)
+
+
+def test_shell_stop_rejects_browser_rewritten_back_url(tmp_path: Path):
+    """shell_stop shares the check: a backslash back_url redirects to the home page."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with _client() as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        resp = client.post(
+            f"/shell/{session_id}/stop",
+            data={"back_url": "/\\evil.example/x"},
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+
+
 def test_shell_stop_kills_session_and_redirects_back(tmp_path: Path):
     cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
     with _client() as client:
