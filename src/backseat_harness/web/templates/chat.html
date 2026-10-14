@@ -30,6 +30,9 @@
   </form>
   {% else %}
   <form id="fork-form" class="fork-form chat-continue-form" method="post" action="/search/fork">
+    {% if ws_id is not none %}
+    <input type="hidden" name="ws" value="{{ ws_id }}">
+    {% endif %}
     <input type="hidden" name="conversation_id" value="{{ conversation_id }}">
     <input type="hidden" name="current_session_key" value="{{ current_session_key }}">
     <input type="hidden" name="back_url" value="{{ back_url }}">

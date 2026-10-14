@@ -444,12 +444,16 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
     - ``find_chats`` (the parse-per-row search) for the search page,
     - ``list_session_refs`` (the cheap, unparsed listing) for the workspace
       page's chat window, the suggestion list and the fork route,
-    - ``load_sessions`` (batched transcripts) for the rows' text.
+    - ``load_sessions`` (batched transcripts) for the rows' text,
+    - ``fork_session`` (the fork route's rendering) for ``/search/fork``.
 
     ``load_chat`` is deliberately *not* stubbed: a request for it means some
     path went back to the per-row tiered search that re-scans every stored
     conversation for each row, which is what made ``/ws/<id>`` take minutes
     (history.load_sessions).
+
+    Returns the recorded ``fork_session`` calls as ``(search, history_provider)``.
+    A fork returns ``transcripts["<provider>:<conversation id>"]`` or "".
     """
     from backseat_harness import history
 
@@ -460,6 +464,12 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
             return lambda: []
         raise AssertionError(f"unexpected history seam requested: {attr}")
 
+    forks: list[tuple[str, str]] = []
+
+    def _fake_fork(search: str, history_provider: str) -> str:
+        forks.append((search, history_provider))
+        return transcripts.get(f"{history_provider}:{search}", "")
+
     monkeypatch.setattr(history, "_load", _fake_load)
     monkeypatch.setattr(history, "list_session_refs", lambda limit=None: list(refs))
     monkeypatch.setattr(
@@ -467,6 +477,8 @@ def _stub_chat_history(monkeypatch, refs, transcripts) -> None:
         "load_sessions",
         lambda keys, providers=None: {k: transcripts[k] for k in keys if k in transcripts},
     )
+    monkeypatch.setattr(history, "fork_session", _fake_fork)
+    return forks
 
 
 def _data_rows(html: str) -> list[str]:
@@ -479,69 +491,66 @@ def _data_rows(html: str) -> list[str]:
     ]
 
 
-def _fork_result(key: str, mtime: float) -> chat_search_service.SessionSearchResult:
-    return chat_search_service.SessionSearchResult(
-        key=key,
-        native_id=key.partition(":")[2],
-        project=None,
-        mtime=mtime,
-        preview="",
-        classification="other",
-    )
-
-
-def test_pick_fork_provider_maps_kiro_ide_to_kiro(monkeypatch):
-    # Rule 1 fires before the PATH scan, so nothing needs to be installed.
+def test_pick_fork_provider_supported_source_keeps_its_own_provider(monkeypatch):
+    # Rule 1 fires before the configured provider and the PATH check, so no CLI
+    # needs to be installed for a supported source.
     monkeypatch.setattr("shutil.which", lambda exe: None)
 
-    assert chat_search_service.pick_fork_provider("kiro_ide:sess_1", []) == "kiro"
-    assert chat_search_service.pick_fork_provider("kiro_ide_v2:sess_1", []) == "kiro"
+    assert chat_search_service.pick_fork_provider("opencode:ses_1", "claude") == "opencode"
+    assert chat_search_service.pick_fork_provider("kiro_cli:ses_1", "claude") == "kiro"
+    assert chat_search_service.pick_fork_provider("claude_code:ses_1", "kiro") == "claude"
 
 
-def test_pick_fork_provider_most_recent_supported_chat_wins(monkeypatch):
-    # Input order = newest first, the order search_all_sessions guarantees.
-    results = [
-        _fork_result("cursor:sess_newest_unsupported", 400.0),
-        _fork_result("claude_code:sess_mid", 300.0),
-        _fork_result("opencode:sess_old", 100.0),
-    ]
-    monkeypatch.setattr("shutil.which", lambda exe: None)  # PATH must not decide
+def test_pick_fork_provider_kiro_ide_maps_to_kiro(monkeypatch):
+    # Rule 2 fires before the configured provider, so nothing needs to be installed.
+    monkeypatch.setattr("shutil.which", lambda exe: None)
 
-    assert (
-        chat_search_service.pick_fork_provider("unknown:sess_cur", results) == "claude"
-    )
-
-    # kiro_ide maps to the harness 'kiro' (accepted 6.3 mapping), so a newest
-    # kiro_ide chat is itself the most recent supported chat.
-    kiro_newest = [
-        _fork_result("kiro_ide:sess_k", 500.0),
-        _fork_result("claude_code:sess_c", 300.0),
-    ]
-    assert (
-        chat_search_service.pick_fork_provider("unknown:sess_cur", kiro_newest)
-        == "kiro"
-    )
+    assert chat_search_service.pick_fork_provider("kiro_ide:sess_1", "claude") == "kiro"
+    assert chat_search_service.pick_fork_provider("kiro_ide_v2:sess_1", "opencode") == "kiro"
 
 
-def test_pick_fork_provider_falls_back_to_first_path_match(monkeypatch):
-    results = [_fork_result("unknown:sess_cur", 1.0)]
-
-    # Only kiro-cli and claude are installed -> kiro wins the scan order.
-    monkeypatch.setattr(
-        "shutil.which", lambda exe: "/usr/bin/" + exe if exe != "opencode" else None
-    )
-    assert chat_search_service.pick_fork_provider("unknown:sess_cur", results) == "kiro"
-
-    # All installed -> opencode is first in scan order.
+def test_pick_fork_provider_other_source_uses_configured_provider(monkeypatch):
+    # kilo / cline / unmapped sources have no fork provider of their own (rule 3).
     monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
-    assert chat_search_service.pick_fork_provider("unknown:sess_cur", results) == "opencode"
+
+    for source in ("kilo:sess_1", "cline:sess_1", "unknown:sess_1"):
+        assert chat_search_service.pick_fork_provider(source, "claude") == "claude"
+        assert chat_search_service.pick_fork_provider(source, "opencode") == "opencode"
 
 
-def test_pick_fork_provider_raises_when_nothing_available(monkeypatch):
+def test_pick_fork_provider_ignores_recent_chats_and_path_scan_order(monkeypatch):
+    # Every CLI is installed, so the retired opencode-first PATH scan would have
+    # answered "opencode"; the configured provider wins instead.
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+
+    assert chat_search_service.pick_fork_provider("kilo:sess_1", "kiro") == "kiro"
+
+    # The candidate list is gone from the signature, so no recent chat can pick.
+    import inspect
+
+    params = list(inspect.signature(chat_search_service.pick_fork_provider).parameters)
+    assert params == ["current_session_key", "configured_provider"]
+
+
+@pytest.mark.parametrize("configured", ["bogus", "kilo", "kiro-cli", ""])
+def test_pick_fork_provider_guard_rejects_unsupported_configured(monkeypatch, configured):
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+
+    with pytest.raises(RuntimeError, match="cannot fork a chat"):
+        chat_search_service.pick_fork_provider("kilo:sess_1", configured)
+
+
+@pytest.mark.parametrize(
+    ("configured", "binary"),
+    [("claude", "claude"), ("kiro", "kiro-cli"), ("opencode", "opencode")],
+)
+def test_pick_fork_provider_guard_rejects_configured_cli_not_on_path(
+    monkeypatch, configured, binary
+):
     monkeypatch.setattr("shutil.which", lambda exe: None)
 
-    with pytest.raises(RuntimeError, match="no supported CLI"):
-        chat_search_service.pick_fork_provider("unknown:sess_cur", [])
+    with pytest.raises(RuntimeError, match=f"no CLI on PATH \\(looked for {binary}\\)"):
+        chat_search_service.pick_fork_provider("kilo:sess_1", configured)
 
 
 # --- shell routes (step 8.3-8.4, 9.4) ------------------------------------------
@@ -2622,6 +2631,43 @@ def test_chat_page_falls_back_to_fork_without_resume_command(monkeypatch):
     assert ">Fork<" in resp.text
 
 
+def _fork_form_html(html: str) -> str:
+    """The fork form's markup alone: the page's generate-task form also carries a
+    ``ws`` input, so a whole-page check cannot tell the two apart."""
+    start = html.index('id="fork-form"')
+    return html[start : html.index("</form>", start)]
+
+
+def test_chat_page_fork_form_posts_the_bound_workspace_id(monkeypatch, workspace: Path):
+    from backseat_harness import history
+
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide chat body" for k in keys},
+    )
+    with _client() as client:
+        resp = client.get(f"/chat/cline/sess_fork?ws={ws_id}")
+
+    form = _fork_form_html(resp.text)
+    assert f'<input type="hidden" name="ws" value="{ws_id}">' in form
+
+
+def test_chat_page_fork_form_omits_ws_without_a_bound_workspace(monkeypatch):
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "ide chat body" for k in keys},
+    )
+    with _client() as client:
+        resp = client.get("/chat/cline/sess_fork")
+
+    assert 'name="ws"' not in _fork_form_html(resp.text)
+
+
 def test_chat_page_fork_button_back_link_and_transcript_styling(monkeypatch):
     """Owner brief: the chat header's back link is blue like other pages, the
     Fork button is compact so it does not tower over the back link, and the
@@ -2696,24 +2742,43 @@ def test_build_fork_command_passes_initial_prompt_to_each_provider():
         search_routes._build_fork_command("bogus", prompt)
 
 
-def test_fork_prompt_names_the_source_provider_and_session():
-    """The prompt names the source provider, e.g.
-    "Please fork kilo chat session XXXXX" (owner brief)."""
+_RECAP_INSTRUCTION = (
+    "Then give a very brief recap of the conversation, and ask the user what "
+    "they want to do next."
+)
+
+
+def test_fork_prompt_names_source_session_and_file_and_ends_with_recap_instruction(
+    tmp_path,
+):
+    """The prompt names the source provider and session and the transcript file
+    to read first, and ends with the recap-then-ask instruction."""
     from backseat_harness.web.routes import search as search_routes
 
-    assert (
-        search_routes._fork_prompt("kilo", "sess_42")
-        == "Please fork kilo chat session sess_42"
-    )
-    assert (
-        search_routes._fork_prompt("kiro", "sess_43")
-        == "Please fork kiro chat session sess_43"
-    )
+    transcript = tmp_path / "transcript-sess_42.txt"
+    prompt = search_routes._fork_prompt("kilo", "sess_42", transcript)
+
+    assert prompt.startswith("This chat picks up from kilo chat session sess_42.")
+    assert f"Read the transcript file {transcript} first" in prompt
+    assert prompt.endswith(_RECAP_INSTRUCTION)
+    assert prompt.index(str(transcript)) < prompt.index("recap")
 
 
-def _capture_fork_command(monkeypatch) -> dict:
-    """Capture the argv the fork route hands to the PTY manager -- the real
-    launch command -- without spawning a child."""
+def test_fork_prompt_never_tells_the_cli_to_fork():
+    """The prompt is a read-this-file request: no sentence may ask the CLI to
+    fork, or the CLI goes looking for a fork command to run."""
+    from backseat_harness.web.routes import search as search_routes
+
+    prompt = search_routes._fork_prompt("kiro_ide", "sess_1", Path("t.txt"))
+
+    assert "fork" not in prompt.lower()
+
+
+def _capture_fork_command(monkeypatch, chat_root: Path) -> dict:
+    """Capture the argv and cwd the fork route hands to the PTY manager -- the
+    real launch command -- without spawning a child. The server's cwd is moved
+    to ``chat_root`` so a route call without ``?ws=`` writes under it, never into
+    the repo."""
     from backseat_harness.web.shell.manager import PTYSessionManager
 
     captured: dict[str, object] = {}
@@ -2723,38 +2788,51 @@ def _capture_fork_command(monkeypatch) -> dict:
         captured["cwd"] = cwd
         return "abc123def456"
 
+    monkeypatch.chdir(chat_root)
     monkeypatch.setattr(PTYSessionManager, "create_session", _fake_create_session)
     return captured
 
 
-def test_search_fork_launches_kiro_with_initial_prompt(monkeypatch):
-    """A kiro_ide source chat forks via kiro-cli, and the launch command ends
-    with the initial prompt (no delayed PTY write)."""
-    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
-    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
-    captured = _capture_fork_command(monkeypatch)
-
+def _post_fork(conversation_id: str, key: str, **extra) -> object:
     with _client() as client:
-        resp = client.post(
+        return client.post(
             "/search/fork",
-            data={
-                "conversation_id": "sess_cur",
-                "current_session_key": "kiro_ide:sess_cur",
-            },
+            data={"conversation_id": conversation_id, "current_session_key": key, **extra},
             follow_redirects=False,
         )
 
+
+def _assert_fork_prompt(cmd: list[str], transcript: Path, source: str, session: str) -> None:
+    """argv carries the prompt last: source, session, file path, then the instruction."""
+    prompt = cmd[-1]
+    assert f"This chat picks up from {source} chat session {session}." in prompt
+    assert str(transcript.resolve()) in prompt
+    assert prompt.index(str(transcript.resolve())) < prompt.index("recap")
+    assert prompt.endswith(_RECAP_INSTRUCTION)
+
+
+def test_search_fork_launches_kiro_with_initial_prompt(monkeypatch, tmp_path):
+    """A kiro_ide source chat forks via kiro-cli, and the launch command ends
+    with the initial prompt that names the transcript file (no delayed PTY write)."""
+    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_cur", "kiro_ide:sess_cur")
+
     assert resp.status_code == 303
-    assert captured["cmd"] == [
-        "kiro-cli",
-        "chat",
-        "Please fork kiro_ide chat session sess_cur",
-    ]
+    cmd = captured["cmd"]
+    assert cmd[:2] == ["kiro-cli", "chat"]
+    _assert_fork_prompt(
+        cmd, tmp_path / ".backseat" / "tmp" / "transcript-sess_cur.txt",
+        "kiro_ide", "sess_cur",
+    )
 
 
-def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch):
-    """A kilo source chat forks via the opencode-family CLI (rule 2 picks the
-    supported opencode chat), and the prompt names the kilo source."""
+def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch, tmp_path):
+    """A kilo source chat has no fork provider of its own, so it forks via the
+    configured [harness] provider (the default, opencode), and the prompt names
+    the kilo source. PATH is pinned so the guard does not depend on the host."""
     refs = [
         _Ref("opencode:ses_recent", mtime=100.0, project=None),
         _Ref("kilo:sess_k", mtime=200.0, project=None),
@@ -2762,24 +2840,238 @@ def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch)
     _stub_chat_history(
         monkeypatch, refs, {"opencode:ses_recent": "x", "kilo:sess_k": "y"}
     )
-    captured = _capture_fork_command(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+    captured = _capture_fork_command(monkeypatch, tmp_path)
 
-    with _client() as client:
-        resp = client.post(
-            "/search/fork",
-            data={
-                "conversation_id": "sess_k",
-                "current_session_key": "kilo:sess_k",
-            },
-            follow_redirects=False,
-        )
+    resp = _post_fork("sess_k", "kilo:sess_k")
 
     assert resp.status_code == 303
-    assert captured["cmd"] == [
-        "opencode",
-        "--prompt",
-        "Please fork kilo chat session sess_k",
-    ]
+    cmd = captured["cmd"]
+    assert cmd[:2] == ["opencode", "--prompt"]
+    _assert_fork_prompt(
+        cmd, tmp_path / ".backseat" / "tmp" / "transcript-sess_k.txt", "kilo", "sess_k"
+    )
+
+
+_FORK_ROOT = "11111111-2222-3333-4444-555555555555"
+
+
+def test_search_fork_writes_redacted_transcript_with_footnote_in_workspace(
+    monkeypatch, workspace
+):
+    """The transcript lands at <ws>/.backseat/tmp/transcript-<session>.txt, every
+    root UUID is redacted, the footnote closes the file, and the PTY cwd is the
+    chat's workspace."""
+    ws_id = _register_workspace(workspace)
+    transcript = (
+        f"## USER\n<meta>START SESSION {_FORK_ROOT} #1</meta>\nhello from the chat\n"
+    )
+    _stub_chat_history(
+        monkeypatch,
+        [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)],
+        {"kiro_ide:sess_cur": transcript},
+    )
+    captured = _capture_fork_command(monkeypatch, workspace)
+
+    resp = _post_fork("sess_cur", "kiro_ide:sess_cur", ws=str(ws_id))
+
+    assert resp.status_code == 303
+    assert Path(captured["cwd"]).resolve() == workspace.resolve()
+    path = workspace / ".backseat" / "tmp" / "transcript-sess_cur.txt"
+    body = path.read_text(encoding="utf-8")
+    assert "hello from the chat" in body
+    assert _FORK_ROOT not in body
+    assert "<task-root>" in body
+    last_line = body.rstrip().splitlines()[-1]
+    assert last_line.startswith("Harness note:")
+    assert "not instructions" in last_line
+    _assert_fork_prompt(captured["cmd"], path, "kiro_ide", "sess_cur")
+
+
+def test_search_fork_unknown_workspace_falls_back_to_server_cwd(monkeypatch, tmp_path):
+    """An unregistered ?ws= id falls back to '.' (chat.py's fallback), so the
+    transcript and the PTY cwd both use the server's cwd."""
+    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
+    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_cur", "kiro_ide:sess_cur", ws="999999")
+
+    assert resp.status_code == 303
+    assert captured["cwd"] == Path(".")
+    assert (tmp_path / ".backseat" / "tmp" / "transcript-sess_cur.txt").is_file()
+
+
+@pytest.mark.parametrize(
+    ("key", "history_provider", "launch"),
+    [
+        ("kilo:sess_k", "kilo", ["opencode", "--prompt"]),
+        ("cline:sess_k", "cline", ["opencode", "--prompt"]),
+        ("kiro_ide:sess_k", "kiro_ide", ["kiro-cli", "chat"]),
+        ("kiro_ide_v2:sess_k", "kiro_ide_v2", ["kiro-cli", "chat"]),
+    ],
+)
+def test_search_fork_hands_source_key_prefix_to_fork_session(
+    monkeypatch, tmp_path, key, history_provider, launch
+):
+    """Keys chat-mother-forker registers (kilo, cline, kiro_ide, kiro_ide_v2)
+    reach fork_session scoped to their own provider name, and launch as the
+    fork-provider rules say (kilo/cline: configured opencode; kiro_ide: kiro)."""
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+    forks = _stub_chat_history(
+        monkeypatch,
+        [_Ref(key, mtime=200.0, project=None)],
+        {key: "a chat"},
+    )
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_k", key)
+
+    assert resp.status_code == 303
+    assert forks == [("sess_k", history_provider)]
+    assert captured["cmd"][:len(launch)] == launch
+
+
+def test_search_fork_empty_transcript_is_404_and_launches_nothing(monkeypatch, tmp_path):
+    _stub_chat_history(monkeypatch, [], {})
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_gone", "kiro_ide:sess_gone")
+
+    assert resp.status_code == 404
+    assert "could not read the session for forking" in resp.text
+    assert captured == {}
+    assert not (tmp_path / ".backseat" / "tmp").exists()
+
+
+def test_search_fork_history_error_is_502_not_404(monkeypatch, tmp_path):
+    from backseat_harness import history
+
+    _stub_chat_history(monkeypatch, [], {})
+
+    def _unknown_provider(search, provider):
+        raise history.HistoryError("chat-mother-forker has no provider named 'kilo'")
+
+    monkeypatch.setattr(history, "fork_session", _unknown_provider)
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_k", "kilo:sess_k")
+
+    assert resp.status_code == 502
+    assert "Could not read the session for forking" in resp.text
+    assert "no provider named 'kilo'" in resp.text
+    assert captured == {}
+
+
+def test_search_fork_refork_overwrites_the_transcript(monkeypatch, tmp_path):
+    from backseat_harness import history
+
+    _stub_chat_history(monkeypatch, [], {})
+    outputs = iter(["first copy of the chat", "second copy of the chat"])
+    monkeypatch.setattr(history, "fork_session", lambda search, provider: next(outputs))
+    _capture_fork_command(monkeypatch, tmp_path)
+
+    _post_fork("sess_k", "kiro_ide:sess_k")
+    _post_fork("sess_k", "kiro_ide:sess_k")
+
+    body = (tmp_path / ".backseat" / "tmp" / "transcript-sess_k.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "second copy of the chat" in body
+    assert "first copy of the chat" not in body
+
+
+def test_search_fork_sanitizes_the_session_id_in_the_file_name(monkeypatch, tmp_path):
+    """A session id with path separators cannot escape the tmp dir: unsafe
+    characters become underscores in the file name."""
+    key = "kiro_ide:sess/../x"
+    _stub_chat_history(monkeypatch, [], {key: "a chat"})
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess/../x", key)
+
+    assert resp.status_code == 303
+    tmp_dir = tmp_path / ".backseat" / "tmp"
+    assert [p.name for p in tmp_dir.iterdir()] == ["transcript-sess_.._x.txt"]
+    assert str((tmp_dir / "transcript-sess_.._x.txt").resolve()) in captured["cmd"][-1]
+
+
+@pytest.mark.parametrize("extra", [{}, {"ws": ""}], ids=["no-ws", "empty-ws"])
+def test_search_fork_without_a_workspace_id_posts_cleanly_to_the_server_cwd(
+    monkeypatch, tmp_path, extra
+):
+    """A fork with no bound workspace (the form omits ``ws``, or sends it empty)
+    is accepted, not a 422, and uses the server's cwd like an unknown id."""
+    _stub_chat_history(monkeypatch, [], {"kiro_ide:sess_k": "a chat"})
+    captured = _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_k", "kiro_ide:sess_k", **extra)
+
+    assert resp.status_code == 303
+    assert captured["cwd"] == Path(".")
+    assert (tmp_path / ".backseat" / "tmp" / "transcript-sess_k.txt").is_file()
+
+
+@pytest.mark.parametrize(
+    ("configured", "which_missing", "message"),
+    [
+        ("codex", None, "cannot fork a chat"),
+        ("claude", "claude", "has no CLI on PATH"),
+    ],
+    ids=["unsupported-provider", "cli-not-on-path"],
+)
+def test_search_fork_guard_refusal_is_a_readable_500_and_launches_nothing(
+    monkeypatch, workspace, configured, which_missing, message
+):
+    """A non-resumable source (kilo) forks via the configured [harness] provider.
+    When that provider is refused by pick_fork_provider's guard, the route answers
+    a readable 500 with the guard's message, creates no PTY session and writes no
+    transcript -- not a bare Starlette 500."""
+    ws_id = _register_workspace(workspace)
+    (workspace / ".backseat" / "config.toml").write_text(
+        f'[harness]\nprovider = "{configured}"\n', encoding="utf-8"
+    )
+    _stub_chat_history(monkeypatch, [], {"kilo:sess_k": "a kilo chat"})
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda exe: None if exe == which_missing else "/usr/bin/" + exe,
+    )
+    captured = _capture_fork_command(monkeypatch, workspace)
+
+    resp = _post_fork("sess_k", "kilo:sess_k", ws=str(ws_id))
+
+    assert resp.status_code == 500
+    assert message in resp.text
+    assert captured == {}
+    assert not (workspace / ".backseat" / "tmp").exists()
+
+
+def test_search_fork_store_read_runs_off_the_event_loop(monkeypatch, tmp_path):
+    """The store read is blocking, so it must run in a worker thread: an asyncio
+    loop is not running in the thread that calls fork_session."""
+    import asyncio
+
+    from backseat_harness import history
+
+    on_loop: list[bool] = []
+
+    def _fake_fork(search, provider):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop.append(False)
+        else:
+            on_loop.append(True)
+        return "a kilo chat"
+
+    _stub_chat_history(monkeypatch, [], {})
+    monkeypatch.setattr(history, "fork_session", _fake_fork)
+    _capture_fork_command(monkeypatch, tmp_path)
+
+    resp = _post_fork("sess_k", "kilo:sess_k")
+
+    assert resp.status_code == 303
+    assert on_loop == [False]
 
 
 # --- step 3a: shared polish ----------------------------------------------------
@@ -3211,10 +3503,10 @@ def test_shell_page_back_link_keeps_referer_query(tmp_path: Path):
             _kill_session(session_id)
 
 
-def test_search_fork_redirect_carries_back_nav_params(monkeypatch):
+def test_search_fork_redirect_carries_back_nav_params(monkeypatch, tmp_path):
     refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
     _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
-    _capture_fork_command(monkeypatch)
+    _capture_fork_command(monkeypatch, tmp_path)
 
     with _client() as client:
         resp = client.post(
@@ -3794,10 +4086,10 @@ def test_chat_fork_title_is_the_prompt_excerpt(monkeypatch):
     assert _hidden_input(resp.text, "title") == "fix the flaky test now"
 
 
-def test_search_fork_redirect_carries_title(monkeypatch):
+def test_search_fork_redirect_carries_title(monkeypatch, tmp_path):
     refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
     _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
-    _capture_fork_command(monkeypatch)
+    _capture_fork_command(monkeypatch, tmp_path)
 
     with _client() as client:
         resp = client.post(

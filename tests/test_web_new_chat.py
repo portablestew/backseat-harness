@@ -22,7 +22,6 @@ from backseat_harness.providers import (
 )
 from backseat_harness.providers.base import ProviderError
 from backseat_harness.web.main import create_app
-from backseat_harness.web.services import chat_search as chat_search_service
 from backseat_harness.web.shell.manager import PTYSessionManager
 
 _PORT = 8080
@@ -87,13 +86,6 @@ def test_binary_matches_adapter_interactive_argv0(name):
     # Drift guard: the shared map must name the executable each adapter
     # actually launches for a fresh chat (no native session id).
     assert binary_for(name) == get_provider(name).interactive_command(None)[0]
-
-
-def test_pick_fork_provider_scan_order_is_opencode_first(monkeypatch):
-    # Behaviour preserved through the shared helper: when several CLIs are
-    # present, the fork picker still prefers opencode, then kiro, then claude.
-    monkeypatch.setattr("shutil.which", _which_only("claude", "opencode"))
-    assert chat_search_service.pick_fork_provider("unknown:sess_cur", []) == "opencode"
 
 
 # --- Step 3: POST /ws/{id}/chats -----------------------------------------------

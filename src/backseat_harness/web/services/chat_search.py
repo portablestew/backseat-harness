@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from backseat_harness import marker
-from backseat_harness.providers import on_path_providers
+from backseat_harness.providers import binary_for, on_path_providers
 from backseat_harness.web.services import task as task_service
 from backseat_harness.web.services import workspace as workspace_service
 from backseat_harness.web.services.workspace import _workspace_dir_for
@@ -375,7 +373,7 @@ _CHAT_PROVIDER_TO_FORK_PROVIDER = {
     "claude_code": "claude",
 }
 
-# Supported fork providers in scan order (plan §6 lines 110-111), using harness provider names.
+# Harness provider names a fork can launch as; the guard in pick_fork_provider checks this.
 _SUPPORTED_FORK_PROVIDERS = ("opencode", "kiro", "claude")
 
 
@@ -386,54 +384,46 @@ def _extract_provider_from_key(key: str) -> str | None:
     return key.split(":", 1)[0]
 
 
-class _SessionKeyed(Protocol):
-    """Structural type for what :func:`pick_fork_provider` reads: a session key.
-
-    Lets the fork button pass the cheap ``history.SessionRef`` listing (which
-    parses nothing) as well as full ``SessionSearchResult`` rows from the
-    search page -- both carry ``key``, which is all the rules below look at.
-    """
-
-    key: str
-
-
-def pick_fork_provider(current_session_key: str, results: Sequence[_SessionKeyed]) -> str:
+def pick_fork_provider(current_session_key: str, configured_provider: str) -> str:
     """Select the provider to use for forking a session.
 
-    Rules (per 2-plan.md §6 lines 106-111):
-    1. Current provider is Kiro IDE (kiro_ide or kiro_ide_v2) -> kiro
-    2. Else, if results contain any supported-provider chat -> provider of the
-       most recent such chat (by mtime).
-    3. Else -> first of opencode / kiro / claude found on PATH.
-    4. None on PATH -> raise RuntimeError.
+    Rules (goal.md, "Provider selection"):
+    1. Source chat is already a supported fork provider (opencode, kiro_cli,
+       claude_code) -> its own fork provider via ``_CHAT_PROVIDER_TO_FORK_PROVIDER``.
+    2. Source is Kiro IDE (kiro_ide or kiro_ide_v2) -> kiro (kiro-cli).
+    3. Otherwise -> ``configured_provider``, the effective ``[harness]`` provider
+       from ``load_config``.
+    4. Guard: a configured provider outside ``_SUPPORTED_FORK_PROVIDERS``, or
+       whose CLI is not on PATH, raises RuntimeError.
 
-    ``results`` is read newest-first; only ``key`` is consulted, so callers
-    need no transcript text (the fork route lists keys only).
+    Only the session key is read; no candidate list, so no recent-chat or PATH
+    scan preference can override the configured provider.
     """
     current_provider = _extract_provider_from_key(current_session_key)
 
-    # Rule 1: Current provider is Kiro IDE -> kiro (harness provider)
+    # Rule 1: a source that is already a supported fork provider keeps its own.
+    fork_provider = _CHAT_PROVIDER_TO_FORK_PROVIDER.get(current_provider)
+    if fork_provider in _SUPPORTED_FORK_PROVIDERS:
+        return fork_provider
+
+    # Rule 2: Kiro IDE -> kiro (kiro-cli)
     if current_provider in ("kiro_ide", "kiro_ide_v2"):
         return "kiro"
 
-    # Rule 2: Most recent supported-provider chat in results
-    for r in results:
-        result_provider = _extract_provider_from_key(r.key)
-        fork_provider = _CHAT_PROVIDER_TO_FORK_PROVIDER.get(result_provider)
-        if fork_provider in _SUPPORTED_FORK_PROVIDERS:
-            return fork_provider
-
-    # Rule 3: PATH fallback in scan order
-    on_path = set(on_path_providers())
-    for provider in _SUPPORTED_FORK_PROVIDERS:
-        if provider in on_path:
-            return provider
-
-    # Rule 4: Nothing on PATH
-    raise RuntimeError(
-        f"no supported CLI found on PATH (looked for opencode, kiro-cli, claude); "
-        f"current provider was {current_provider or 'unknown'}"
-    )
+    # Rule 3: the configured harness provider.
+    # Rule 4 (guard): it must be a supported fork provider with its CLI on PATH.
+    if configured_provider not in _SUPPORTED_FORK_PROVIDERS:
+        raise RuntimeError(
+            f"configured [harness] provider {configured_provider!r} cannot fork a chat; "
+            f"expected one of {', '.join(_SUPPORTED_FORK_PROVIDERS)}"
+        )
+    if configured_provider not in on_path_providers():
+        raise RuntimeError(
+            f"configured [harness] provider {configured_provider!r} has no CLI on PATH "
+            f"(looked for {binary_for(configured_provider)}); "
+            f"current provider was {current_provider or 'unknown'}"
+        )
+    return configured_provider
 
 
 @dataclass(frozen=True)
