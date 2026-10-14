@@ -29,9 +29,9 @@ from pathlib import Path
 
 import psutil
 
-from backseat_harness import __version__, db, exitwatch, logs, progress, spawn, storage
+from backseat_harness import __version__, db, exitwatch, logs, manager, progress, spawn, storage
 from backseat_harness import platform as platform_mod
-from backseat_harness.config import Config, OperatorConfig, TaskPaths, load_config
+from backseat_harness.config import Config, OperatorConfig, TaskPaths, is_task_lane, load_config
 from backseat_harness.daemon import Daemon
 from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.models import Binding, TaskStatus
@@ -206,6 +206,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="workspace root containing .backseat/ (default: cwd, or -C value)",
     )
     web.set_defaults(func=_cmd_web)
+
+    gen = sub.add_parser(
+        "generate-task",
+        help="draft a task's goal.md from a finished chat, then promote it to tasks/",
+    )
+    gen.add_argument("source_key", help="chat to distil, as provider:conversation_id")
+    gen.add_argument(
+        "--staging",
+        default=None,
+        help="an existing _gen-* staging dir under tasks/ (the web route creates it); "
+        "default: create one",
+    )
+    gen.set_defaults(func=_cmd_generate_task)
 
     return p
 
@@ -513,7 +526,11 @@ def _cmd_status(args) -> int:
 def _cmd_list(args) -> int:
     config = load_config(args.workspace)
     tasks_dir = config.tasks_dir
-    slugs = sorted(p.name for p in tasks_dir.iterdir()) if tasks_dir.exists() else []
+    slugs = (
+        sorted(p.name for p in tasks_dir.iterdir() if is_task_lane(p))
+        if tasks_dir.exists()
+        else []
+    )
     _emit(args, {"tasks": slugs}, "\n".join(slugs) if slugs else "(no tasks)")
     return 0
 
@@ -957,6 +974,72 @@ def _cmd_web(args) -> int:
     return 0
 
 
+def _cmd_generate_task(args) -> int:
+    """Draft a task's goal.md from a finished chat, then promote it to ``tasks/<slug>/``.
+
+    Exit 0 when promoted, 1 when parked (the reason is in the payload and in the
+    staging manifest, and the staging dir is kept), 2 for bad arguments. An
+    unregistered workspace is refused, not registered here: registering a
+    workspace is the user's act.
+    """
+    config = load_config(args.workspace)
+    source_key = args.source_key
+    provider, _, conversation_id = source_key.partition(":")
+    if not (provider and conversation_id):
+        return _generate_refused(args, f"source key {source_key!r} is not provider:conversation_id")
+    with db.open_db() as conn:
+        registered = {Path(path).resolve() for path in db.list_workspaces(conn)}
+    if config.workspace_root.resolve() not in registered:
+        return _generate_refused(
+            args, f"{config.workspace_root} is not a registered workspace; register it first"
+        )
+    if args.staging is None:
+        staging = manager.new_staging(config.tasks_dir, source_key, str(config.workspace_root))
+    else:
+        staging = config.tasks_dir / args.staging
+        if (
+            staging.parent != config.tasks_dir
+            or not staging.name.startswith(manager.STAGING_PREFIX)
+            or manager.read_manifest(staging) is None
+        ):
+            return _generate_refused(args, f"{args.staging!r} is not a staging dir under tasks/")
+    # The child is the sole writer of its pid after spawn , so the record
+    # names the process that does the work, not the route that launched it.
+    manifest = manager.read_manifest(staging) or {}
+    manifest.update(pid=os.getpid(), pid_start=db.process_start(os.getpid()))
+    manager.write_manifest(staging, manifest)
+
+    invoker = _make_oneshot_invoker(
+        config, config.manager_profile(), load_persona("manager_persona.md"), role="manager"
+    )
+    result = manager.run_generation(config, staging, source_key, invoker)
+    slug: str | None = None
+    reason = result.reason
+    if result.approved:
+        try:
+            slug = manager.promote(staging, config.tasks_dir)
+        except manager.PromotionParked as park:
+            reason = park.reason
+    if slug is None:
+        _emit(
+            args,
+            {"status": "failed", "final_slug": None, "reason": reason, "staging": str(staging)},
+            f"Generation parked: {reason}\nStaging kept at {staging}",
+        )
+        return 1
+    _emit(
+        args,
+        {"status": "promoted", "final_slug": slug, "reason": "", "staging": None},
+        f"Promoted task '{slug}' at {config.task_dir(slug)}",
+    )
+    return 0
+
+
+def _generate_refused(args, error: str) -> int:
+    _emit(args, {"status": "error", "error": error}, error)
+    return 2
+
+
 def _ensure_goal(paths: TaskPaths, text: str | None) -> tuple[str | None, str | None]:
     """Resolve the ``run``/``init`` positional into ``(error, brief)``.
 
@@ -996,42 +1079,52 @@ owner repeating their own brief back at the operator is noise, not signal.
 
 
 def _make_operator_invoker(config: Config, op_config: OperatorConfig):
-    """Build the operator invoker: one-shot CLI call, capture the final text.
+    """Build the operator invoker: the shared one-shot call, with the operator persona.
 
-    Uses the operator provider (may differ from the managed provider) and runs
-    its default agent -- or ``[operator].agent`` when set. The persona is
-    prepended to every operator prompt, so one source of truth serves all
-    providers and a workspace's own agent still gets the guidance. Permissions
-    are the workspace owner's; the harness only forwards
-    ``[operator].model``/``extra_args``. The persona is read once, here.
-
-    The call is bounded by ``[operator].timeout_s``, not the managed turn's
-    ceiling, and a timeout yields an empty reply flagged ``timed_out``
-    (``OperatorReply``), so the loop tells a killed call from silence instead
-    of inferring a kill from the emptiness. The loop owns what happens next;
-    this layer only launches.
-
-    The output goes to this call's log file, declared by the loop immediately
-    before the call (``logs.set_current``), so an operator that hangs is
-    tailable, and the verdict is parsed out of that file. That is the same text
-    the CLI emitted, read a moment later rather than off a pipe; the loop
-    redacts the file afterwards, after parsing. See logs.py.
+    The operator's persona is read once, here, and the invoker is the shared
+    one-shot path (``_make_oneshot_invoker``) that the generate-task manager uses
+    too, with its own persona and profile.
     """
-    provider: Provider = get_provider(op_config.provider)
-    persona = load_persona()
-    base_extra: tuple[str, ...] = ("--agent", op_config.agent) if op_config.agent else ()
+    return _make_oneshot_invoker(config, op_config, load_persona(), role="operator")
+
+
+def _make_oneshot_invoker(
+    config: Config, profile: OperatorConfig, persona: str, *, role: str = "operator"
+):
+    """Build a one-shot CLI invoker: one call, capture the final text.
+
+    Uses ``profile``'s provider (may differ from the managed provider) and runs
+    its default agent -- or ``profile.agent`` when set. The persona is prepended
+    to every prompt, so one source of truth serves all providers and a
+    workspace's own agent still gets the guidance. Permissions are the
+    workspace owner's; the harness only forwards ``profile.model``/
+    ``extra_args``.
+
+    The call is bounded by ``profile.timeout_s``, not the managed turn's
+    ceiling, and a timeout yields an empty reply flagged ``timed_out``
+    (``OperatorReply``), so the caller tells a killed call from silence instead
+    of inferring a kill from the emptiness. The caller owns what happens next;
+    this layer only launches. ``role`` names the caller in the timeout warning.
+
+    The output goes to this call's log file, declared by the caller immediately
+    before the call (``logs.set_current``), so a call that hangs is tailable, and
+    the reply is parsed out of that file. That is the same text the CLI emitted,
+    read a moment later rather than off a pipe. See logs.py.
+    """
+    provider: Provider = get_provider(profile.provider)
+    base_extra: tuple[str, ...] = ("--agent", profile.agent) if profile.agent else ()
 
     def invoke(prompt: str) -> str:
         prompt = f"{persona}\n\n{prompt}"
         extra: list[str] = list(base_extra)
-        if op_config.model:
-            extra += ["--model", op_config.model]
-        extra += list(op_config.extra_args)
+        if profile.model:
+            extra += ["--model", profile.model]
+        extra += list(profile.extra_args)
         spec = SpawnSpec(
             prompt=prompt,
             cwd=config.workspace_root,
             resume_native_id=None,
-            timeout_s=op_config.timeout_s,
+            timeout_s=profile.timeout_s,
             extra_args=tuple(extra),
         )
         cmd = spawn.resolve_argv(provider.build_command(spec))
@@ -1039,12 +1132,12 @@ def _make_operator_invoker(config: Config, op_config: OperatorConfig):
             cmd,
             cwd=config.workspace_root,
             input=prompt,
-            timeout_s=op_config.timeout_s,
+            timeout_s=profile.timeout_s,
             log_path=logs.current(),
         )
         if call.timed_out:
             print(
-                f"[warn] task: operator call hit its {op_config.timeout_s}s timeout "
+                f"[warn] task: {role} call hit its {profile.timeout_s}s timeout "
                 "and its process tree was terminated",
                 file=sys.stderr,
             )

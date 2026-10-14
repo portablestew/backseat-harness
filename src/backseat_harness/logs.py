@@ -66,6 +66,18 @@ def call_log(paths: TaskPaths, iteration: int, role: str, attempt: int = 0) -> P
     return paths.logs / f"iter-{iteration:04d}.{role}.{attempt}.log"
 
 
+def manager_log(root: Path, phase: str, n: int) -> Path:
+    """Log path for one generate-task call: ``<root>/logs/manager.<phase>.<n>.log``.
+
+    Numbered per call, so a re-asked call keeps the reply that came back
+    unusable, the same reason the operator's attempts are numbered. ``root`` is
+    the staging dir, which is removed with the rest of the staging at promotion.
+    """
+    logs_dir = root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir / f"manager.{phase}.{n}.log"
+
+
 def set_current(path: Path | None) -> None:
     """Declare the log path of the call the next invoked callable will make."""
     _current.set(path)

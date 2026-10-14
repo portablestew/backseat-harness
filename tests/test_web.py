@@ -2461,7 +2461,7 @@ def test_chat_viewer_renders_resume_argv_for_native_cli(monkeypatch):
 
     assert resp.status_code == 200
     assert "fix the flaky test" in resp.text
-    assert ">Continue<" in resp.text
+    assert ">Resume<" in resp.text
     # Browser-parseable argv for the web-shell resume.
     assert json.loads(_hidden_input(resp.text, "cmd")) == [
         "opencode",
@@ -2513,7 +2513,7 @@ def test_chat_page_sticky_header_shows_prompt_and_continue(monkeypatch):
     # Header CSS: position sticky, top 0 (base.html style block).
     assert "position: sticky;\n      top: 0;" in resp.text
     # The continue button is the resume form's submit control.
-    assert ">Continue<" in resp.text
+    assert ">Resume<" in resp.text
     assert json.loads(_hidden_input(resp.text, "cmd")) == [
         "opencode",
         "--session",
@@ -2540,7 +2540,7 @@ def test_chat_page_falls_back_to_fork_without_resume_command(monkeypatch):
     # No continue form for a provider without an interactive resume; instead
     # a fork form posting conversation_id + current_session_key to /search/fork.
     assert 'id="resume-form"' not in resp.text
-    assert ">Continue<" not in resp.text
+    assert ">Resume<" not in resp.text
     assert 'action="/search/fork"' in resp.text
     assert _hidden_input(resp.text, "conversation_id") == "sess_fork"
     assert _hidden_input(resp.text, "current_session_key") == "cline:sess_fork"

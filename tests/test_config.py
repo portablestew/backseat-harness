@@ -2,6 +2,7 @@ from pathlib import Path
 
 from backseat_harness.config import (
     DEFAULT_COMPACT_THRESHOLD_BYTES,
+    DEFAULT_MANAGER_PROVIDER,
     DEFAULT_OPERATOR_RETRY_BUDGET,
     DEFAULT_OPERATOR_TIMEOUT_S,
     DEFAULT_TURN_TIMEOUT_S,
@@ -193,6 +194,115 @@ def test_defaults_with_no_layers(tmp_path, fake_home):
     assert cfg.turn_timeout_s == DEFAULT_TURN_TIMEOUT_S
     assert cfg.provider == "opencode"
     assert cfg.operator.provider == "opencode"
+
+
+# --- provider and model defaults roll downhill: manager -> operator -> harness ---
+
+
+def test_the_chain_starts_at_the_manager_defaults(tmp_path, fake_home):
+    cfg = load_config(tmp_path, home=fake_home)
+    for provider, model in (
+        (cfg.manager.provider, cfg.manager.model),
+        (cfg.operator.provider, cfg.operator.model),
+        (cfg.provider, cfg.model),
+    ):
+        assert (provider, model) == (DEFAULT_MANAGER_PROVIDER, None)
+
+
+def test_the_operator_inherits_the_manager_agent_and_keeps_its_own(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nagent = "mgr-agent"\n',
+    )
+    assert load_config(tmp_path, home=fake_home).operator.agent == "mgr-agent"
+
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nagent = "mgr-agent"\n[operator]\nagent = "op-agent"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert cfg.operator.agent == "op-agent"
+    assert cfg.manager.agent == "mgr-agent"
+
+
+def test_the_harness_agent_is_not_inherited(tmp_path, fake_home):
+    _write(tmp_path / ".backseat" / "config.toml", '[manager]\nagent = "mgr-agent"\n')
+    assert load_config(tmp_path, home=fake_home).agent is None
+
+
+def test_the_operator_falls_back_to_the_manager(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nprovider = "claude"\nmodel = "m-x"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.operator.provider, cfg.operator.model) == ("claude", "m-x")
+    assert (cfg.provider, cfg.model) == ("claude", "m-x")
+
+
+def test_the_harness_falls_back_to_the_operator_not_the_manager(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nprovider = "claude"\nmodel = "m-x"\n'
+        '[operator]\nprovider = "kiro_cli"\nmodel = "op-m"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.provider, cfg.model) == ("kiro_cli", "op-m")
+    assert (cfg.manager.provider, cfg.manager.model) == ("claude", "m-x")
+
+
+def test_an_explicit_harness_value_wins_at_every_level(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nprovider = "claude"\nmodel = "m-x"\n'
+        '[operator]\nprovider = "kiro_cli"\nmodel = "op-m"\n'
+        '[harness]\nprovider = "opencode"\nmodel = "h-m"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.provider, cfg.model) == ("opencode", "h-m")
+    assert (cfg.operator.provider, cfg.operator.model) == ("kiro_cli", "op-m")
+
+
+def test_a_later_layer_changes_the_source_an_inherited_default_falls_back_to(tmp_path, fake_home):
+    """The user layer sets the manager's model; the workspace layer sets it again.
+    The operator inherits the final value, not the one from the earlier layer."""
+    _write(fake_home / ".backseat" / "config.toml", '[manager]\nmodel = "user-m"\n')
+    _write(tmp_path / ".backseat" / "config.toml", '[manager]\nmodel = "ws-m"\n')
+    cfg = load_config(tmp_path, home=fake_home)
+    assert cfg.operator.model == "ws-m"
+    assert cfg.model == "ws-m"
+
+
+def test_an_explicit_operator_provider_does_not_take_the_managers_model(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nprovider = "claude"\nmodel = "sonnet"\n'
+        '[operator]\nprovider = "opencode"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.operator.provider, cfg.operator.model) == ("opencode", None)
+    assert (cfg.provider, cfg.model) == ("opencode", None)
+    assert (cfg.manager.provider, cfg.manager.model) == ("claude", "sonnet")
+
+
+def test_an_explicit_harness_provider_does_not_take_the_operators_model(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[operator]\nprovider = "kiro"\nmodel = "k-m"\n[harness]\nprovider = "opencode"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.provider, cfg.model) == ("opencode", None)
+    assert (cfg.operator.provider, cfg.operator.model) == ("kiro", "k-m")
+
+
+def test_an_own_model_is_kept_when_the_provider_is_inherited(tmp_path, fake_home):
+    _write(
+        tmp_path / ".backseat" / "config.toml",
+        '[manager]\nprovider = "claude"\nmodel = "sonnet"\n[operator]\nmodel = "op-m"\n',
+    )
+    cfg = load_config(tmp_path, home=fake_home)
+    assert (cfg.operator.provider, cfg.operator.model) == ("claude", "op-m")
+    assert (cfg.provider, cfg.model) == ("claude", "op-m")
 
 
 def test_home_routing_canary(tmp_path, fake_home):

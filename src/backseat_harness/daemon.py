@@ -197,7 +197,11 @@ def _lane_stamp(lane: Path) -> float | None:
     forever. The stamp orders candidates: ``state.json`` mtime, or ``goal.md``
     mtime when there is no state (goal:42). A state file that will not parse
     is not confirmably ``continue``, so it is skipped rather than guessed.
+    A ``_gen-*`` staging dir is never a lane, even with a ``goal.md`` in it
+    (``config.is_task_lane``), so a generation can never be run by accident.
     """
+    if not config.is_task_lane(lane):
+        return None
     goal = lane / "goal.md"
     state = lane / "state.json"
     try:

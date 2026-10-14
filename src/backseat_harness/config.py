@@ -14,7 +14,9 @@ at import time.
 
 from __future__ import annotations
 
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,16 @@ DEFAULT_TURN_TIMEOUT_S = 3600
 # worst case bounded, since the budget multiplies this -- each call costs at most
 # this plus one grace budget (spawn's enforced bound).
 DEFAULT_OPERATOR_TIMEOUT_S = 1800
+
+# The generate-task manager is a one-shot judging agent. It is the root of the
+# provider, model, and agent defaults: the operator falls back to it, and the
+# harness's managed agent falls back to the operator (see _resolve_defaults). The whole run
+# is one manager call, which includes its reviewer subagent rounds, so the timeout
+# bounds the run. Review rounds are the reviews the prompt allows before the draft
+# is judged as it stands.
+DEFAULT_MANAGER_PROVIDER = "opencode"
+DEFAULT_MANAGER_TIMEOUT_S = 1800
+DEFAULT_MANAGER_REVIEW_ROUNDS = 3
 
 # ~1MB transcript ~= 250-300k tokens: the preemptive compaction trigger.
 DEFAULT_COMPACT_THRESHOLD_BYTES = 1_000_000
@@ -84,7 +96,7 @@ class OperatorConfig:
     ``agent`` and ``extra_args`` are the workspace owner's channel.
     """
 
-    provider: str = "opencode"
+    provider: str | None = None
     model: str | None = None
     agent: str | None = None  # maps to --agent / profile name where supported
     verify_commands: list[str] = field(default_factory=list)
@@ -97,11 +109,28 @@ class OperatorConfig:
 
 
 @dataclass(frozen=True)
+class ManagerConfig:
+    """Settings for the generate-task manager (optional ``[manager]`` table).
+
+    ``None`` provider and model fall back to the manager defaults (see
+    ``_resolve_defaults``). ``extra_args`` is not overridable here: the manager
+    shares the operator's extra arguments, with its own provider, model, agent,
+    and ceiling.
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    agent: str | None = None
+    timeout_s: int = DEFAULT_MANAGER_TIMEOUT_S
+    review_rounds: int = DEFAULT_MANAGER_REVIEW_ROUNDS
+
+
+@dataclass(frozen=True)
 class Config:
     """Resolved harness configuration for a workspace."""
 
     workspace_root: Path
-    provider: str = "opencode"
+    provider: str | None = None
     model: str | None = None
     # Named provider agent for the managed side (e.g. opencode ``--agent``).
     # Unlike the operator, the harness writes no managed profile: this simply
@@ -141,7 +170,24 @@ class Config:
     # profiles the operator itself, which is never routed per step.
     models: dict[str, str] = field(default_factory=dict)
     operator: OperatorConfig = field(default_factory=OperatorConfig)
+    manager: ManagerConfig = field(default_factory=ManagerConfig)
     web: WebConfig = field(default_factory=WebConfig)
+
+    def manager_profile(self) -> OperatorConfig:
+        """The one-shot profile the generate-task manager runs under.
+
+        Returned as an ``OperatorConfig`` so the shared invoker factory takes one
+        shape for both roles. ``verify_commands`` is cleared: the manager judges
+        text and never runs the workspace's validation.
+        """
+        return replace(
+            self.operator,
+            provider=self.manager.provider or DEFAULT_MANAGER_PROVIDER,
+            model=self.manager.model,
+            agent=self.manager.agent,
+            timeout_s=self.manager.timeout_s,
+            verify_commands=[],
+        )
 
     # --- Path helpers: the entire .backseat/ contract lives here. ---
 
@@ -162,6 +208,26 @@ class Config:
 
     def task_paths(self, slug: str) -> TaskPaths:
         return TaskPaths(self.task_dir(slug))
+
+
+#: A sanitized slug is a valid directory name: lowercase alphanumerics,
+#: dash, underscore (2-plan.md §5).
+_SLUG_CHARS = re.compile(r"[^a-z0-9_-]+")
+
+
+def sanitize_slug(name: str) -> str:
+    """Task name → filesystem-safe slug (V9).
+
+    ``"My Task!"`` → ``"my-task"``; ``"a/b"`` → ``"a-b"``; Unicode is
+    NFKD-folded to ASCII (``"Ünïcodé"`` → ``"unicode"``). Raises
+    ``ValueError`` when nothing usable remains.
+    """
+    folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    slug = _SLUG_CHARS.sub("-", folded.lower()).strip("-_")
+    slug = re.sub(r"-{2,}", "-", slug)
+    if not slug or slug in (".", ".."):
+        raise ValueError(f"task name {name!r} has no usable slug characters")
+    return slug
 
 
 @dataclass(frozen=True)
@@ -227,6 +293,22 @@ class TaskPaths:
         return self.root / "state.json"
 
 
+#: Prefix of a generate-task staging dir under ``tasks/`` (the protocol is in manager.py).
+STAGING_PREFIX = "_gen-"
+
+
+def is_task_lane(task_dir: Path) -> bool:
+    """Whether ``task_dir`` is a task lane that listings and the daemon may use.
+
+    A lane is a directory with a ``goal.md`` file. An empty ``goal.md`` still
+    counts, because ``init`` scaffolds one. A ``_gen-*`` staging dir never counts,
+    even with a ``goal.md`` in it, so a parked generation can never run.
+    """
+    if task_dir.name.startswith(STAGING_PREFIX):
+        return False
+    return task_dir.is_dir() and (task_dir / "goal.md").is_file()
+
+
 def _tomllib():
     # tomllib is stdlib on 3.11+; fall back gracefully on 3.10.
     if sys.version_info >= (3, 11):
@@ -277,6 +359,7 @@ def load_config(
         if path is not None and path.exists():
             data: dict[str, Any] = _tomllib().loads(path.read_text(encoding="utf-8"))
             cfg = _apply_overrides(cfg, data)
+    cfg = _resolve_defaults(cfg)
     # Warn once, here, on the value that actually resolved -- not per layer in
     # _apply_overrides, which would name a value a higher layer may immediately
     # override (user sets -1, task sets 5) and so report a cap that is not in
@@ -292,6 +375,15 @@ def load_config(
             "deliberately",
             file=sys.stderr,
         )
+    # Same resolved-value rule: a review cap below one would park every draft
+    # before it is reviewed, so it is clamped here, with a warning.
+    if cfg.manager.review_rounds < 1:
+        print(
+            f"[warn] config: [manager] review_rounds = {cfg.manager.review_rounds} "
+            "must be at least 1; using 1",
+            file=sys.stderr,
+        )
+        cfg = replace(cfg, manager=replace(cfg.manager, review_rounds=1))
     return cfg
 
 
@@ -375,6 +467,36 @@ def _merge_web(current: WebConfig, data: dict[str, Any]) -> WebConfig:
     return replace(current, host=host, port=port)
 
 
+def _resolve_defaults(cfg: Config) -> Config:
+    """Fill unset provider, model, and agent from the layer above, once every layer is read.
+
+    The provider runs downhill from the manager: the operator falls back to it,
+    and the harness's managed agent falls back to the operator. A model is
+    inherited only along with its provider: a section that sets its own provider
+    takes only its own model, so a manager model is never sent to another CLI. A
+    model that nothing sets stays unset, and the provider CLI's own default applies.
+    The operator's agent falls back to the manager's. This runs after all layers,
+    so a value set in a later layer is never frozen in early.
+    """
+    manager_provider = cfg.manager.provider or DEFAULT_MANAGER_PROVIDER
+    operator_inherits = cfg.operator.provider is None
+    operator_provider = cfg.operator.provider or manager_provider
+    operator_model = cfg.operator.model or (cfg.manager.model if operator_inherits else None)
+    harness_inherits = cfg.provider is None
+    return replace(
+        cfg,
+        provider=cfg.provider or operator_provider,
+        model=cfg.model or (operator_model if harness_inherits else None),
+        operator=replace(
+            cfg.operator,
+            provider=operator_provider,
+            model=operator_model,
+            agent=cfg.operator.agent or cfg.manager.agent,
+        ),
+        manager=replace(cfg.manager, provider=manager_provider),
+    )
+
+
 def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
     harness = data.get("harness", {})
     op_data = data.get("operator", {})
@@ -386,6 +508,15 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         verify_commands=list(op_data.get("verify_commands", cfg.operator.verify_commands)),
         extra_args=tuple(op_data.get("extra_args", cfg.operator.extra_args)),
         timeout_s=int(op_data.get("timeout_s", cfg.operator.timeout_s)),
+    )
+    mgr_data = data.get("manager", {})
+    manager = replace(
+        cfg.manager,
+        provider=mgr_data.get("provider", cfg.manager.provider),
+        model=mgr_data.get("model", cfg.manager.model),
+        agent=mgr_data.get("agent", cfg.manager.agent),
+        timeout_s=int(mgr_data.get("timeout_s", cfg.manager.timeout_s)),
+        review_rounds=int(mgr_data.get("review_rounds", cfg.manager.review_rounds)),
     )
     return replace(
         cfg,
@@ -408,5 +539,6 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         ),
         models=_merge_models(cfg, data),
         operator=operator,
+        manager=manager,
         web=_merge_web(cfg.web, data),
     )

@@ -22,33 +22,12 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from backseat_harness import storage
-from backseat_harness.config import TaskPaths
+from backseat_harness import manager, storage
+from backseat_harness.config import STAGING_PREFIX, TaskPaths, is_task_lane, sanitize_slug
 from backseat_harness.models import TaskStatus
-
-#: A sanitized slug is a valid directory name: lowercase alphanumerics,
-#: dash, underscore (2-plan.md §5).
-_SLUG_CHARS = re.compile(r"[^a-z0-9_-]+")
-
-
-def sanitize_slug(name: str) -> str:
-    """Task name → filesystem-safe slug (V9).
-
-    ``"My Task!"`` → ``"my-task"``; ``"a/b"`` → ``"a-b"``; Unicode is
-    NFKD-folded to ASCII (``"Ünïcodé"`` → ``"unicode"``). Raises
-    ``ValueError`` when nothing usable remains.
-    """
-    folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    slug = _SLUG_CHARS.sub("-", folded.lower()).strip("-_")
-    slug = re.sub(r"-{2,}", "-", slug)
-    if not slug or slug in (".", ".."):
-        raise ValueError(f"task name {name!r} has no usable slug characters")
-    return slug
 
 
 def create_task(workspace: Path | str, name: str, goal: str) -> str:
@@ -166,7 +145,7 @@ def list_tasks(workspace: Path | str) -> list[TaskInfo]:
     tasks_dir = Path(workspace).expanduser().resolve() / ".backseat" / "tasks"
     if not tasks_dir.is_dir():
         return []
-    lanes = [p for p in tasks_dir.iterdir() if p.is_dir()]
+    lanes = [p for p in tasks_dir.iterdir() if is_task_lane(p)]
     infos = [_lane_info(p) for p in lanes]
     infos.sort(key=lambda i: (i.updated_at, i.slug), reverse=True)
     return infos
@@ -204,7 +183,7 @@ def list_recent_task_dirs(
         return [], 0
     lanes: list[tuple[float, str]] = []
     for lane in tasks_dir.iterdir():
-        if not lane.is_dir():
+        if not is_task_lane(lane):
             continue
         try:
             mtime = lane.stat().st_mtime
@@ -214,6 +193,59 @@ def list_recent_task_dirs(
     lanes.sort(key=lambda item: (item[0], item[1]), reverse=True)
     slugs = [name for _, name in lanes]
     return slugs[:limit], max(0, len(slugs) - limit)
+
+
+#: Badge text for each :func:`manager.generation_state` value.
+GENERATION_BADGES = {
+    "generating": "generating",
+    "failed": "generation failed",
+    "interrupted": "interrupted",
+}
+
+#: Reason shown on an interrupted row when the manifest has none.
+INTERRUPTED_REASON = "the generator stopped before it finished"
+
+
+def list_generating(workspace: Path | str) -> list[dict]:
+    """Generation staging dirs to show above the task lanes, newest first.
+
+    Each dict has ``name`` (the ``_gen-*`` dir), ``status`` and ``badge`` (from
+    :data:`GENERATION_BADGES`), ``reason``, ``source_key``, and ``created_at``.
+    A staging dir has no task page, so these are plain rows, not links. A dir
+    with no readable manifest, or one :func:`manager.generation_state` leaves
+    out, is skipped.
+    """
+    tasks_dir = Path(workspace).expanduser().resolve() / ".backseat" / "tasks"
+    if not tasks_dir.is_dir():
+        return []
+    rows: list[dict] = []
+    for staging in tasks_dir.glob(f"{STAGING_PREFIX}*"):
+        if not staging.is_dir():
+            continue
+        manifest = manager.read_manifest(staging)
+        status = manager.generation_state(manifest) if manifest is not None else None
+        if status is None:
+            continue
+        reason = str(manifest.get("reason") or "")
+        if status == "interrupted" and not reason:
+            reason = INTERRUPTED_REASON
+        created = manifest.get("created_at")
+        source_key = str(manifest.get("source_key") or "")
+        provider, _, conversation_id = source_key.partition(":")
+        rows.append(
+            {
+                "name": staging.name,
+                "status": status,
+                "badge": GENERATION_BADGES[status],
+                "reason": reason,
+                "source_key": source_key,
+                "provider": provider,
+                "conversation_id": conversation_id,
+                "created_at": float(created) if isinstance(created, int | float) else 0.0,
+            }
+        )
+    rows.sort(key=lambda row: (row["created_at"], row["name"]), reverse=True)
+    return rows
 
 
 def resolve_workspace(ws_id: int) -> Path | None:
@@ -360,3 +392,46 @@ def run_task_detached(workspace: Path | str, slug: str, brief: str | None = None
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def generate_task_detached(workspace: Path | str, source_key: str, staging_name: str):
+    """Launch ``backseat-harness generate-task`` for a chat as a detached subprocess.
+
+    ``staging_name`` is the ``_gen-*`` dir the route already created with its
+    ``queued`` manifest. The child writes its own pid into it first. Stdio
+    is discarded and stdin is closed, because the child builds its own prompts.
+    The Popen handle is returned but never waited on, so the request returns as
+    soon as the child has started.
+    """
+    import subprocess
+    import sys
+
+    ws_path = Path(workspace).expanduser().resolve()
+    cmd = [
+        sys.executable,
+        "-m",
+        "backseat_harness.cli",
+        "-C",
+        str(ws_path),
+        "generate-task",
+        source_key,
+        "--staging",
+        staging_name,
+    ]
+    if sys.platform == "win32":
+        return subprocess.Popen(
+            cmd,
+            cwd=str(ws_path),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    return subprocess.Popen(
+        cmd,
+        cwd=str(ws_path),
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )

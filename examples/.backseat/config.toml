@@ -9,9 +9,10 @@
 # config.toml at any layer.
 
 [harness]
-# Managed-agent CLI: "opencode" | "claude" | "kiro".
-provider = "opencode"
-# model = "anthropic/claude-opus-4"   # optional, the managed agent's model
+# Managed-agent CLI: "opencode" | "claude" | "kiro". Unset, it is the operator's,
+# and a model is inherited only along with it.
+provider = "kiro"
+# model = "anthropic/claude-opus-4"   # optional, the managed agent's model; unset, the operator's
 # agent = "my-builder"                # optional named agent (--agent)
 
 # Extra flags for every managed turn, on top of the auto-approve grant each
@@ -62,9 +63,11 @@ operator_retry_budget = 3
 [operator]
 # The operator is the same CLI as the managed agent by default, often a stronger
 # model. The persona is prepended to every operator prompt, so one source of truth
-# serves all providers; the harness writes no operator profile.
+# serves all providers; the harness writes no operator profile. Unset provider
+# falls back to [manager], and so does a model, but only along with that provider.
+# An unset agent falls back to [manager] too.
 provider = "opencode"
-# model = "anthropic/claude-opus-4"  # optional
+# model = "anthropic/claude-opus-4"  # optional; unset, [manager].model
 # agent = "my-operator"              # optional named agent, and the supported
 #                                    # way to narrow what the operator may do
 # extra_args = []                    # optional, as above
@@ -77,6 +80,21 @@ verify_commands = []
 # turn and emit one verdict -- deliberately not the managed turn's value.
 # Default: 1800.
 timeout_s = 1800
+[manager]
+# The generate-task manager writes a task's goal.md from a finished chat. It is the
+# root of the provider and model defaults: [operator] falls back to it, and
+# [harness] falls back to [operator].
+provider = "claude"
+# model = "opencode/mimo-v2.6-flash-free"  # optional; unset, the provider CLI's default
+# agent = "my-manager"  # optional named agent; [operator] inherits it when unset
+
+# Hard ceiling for the whole generation run, reviewer rounds included. Default: 1800.
+timeout_s = 1800
+
+# Reviews the manager may run before it stops. It also stops early when a review
+# comes back clean. Default: 3.
+review_rounds = 3
+
 [web]
 # Port for the web UI (default: 8080)
 port = 8080

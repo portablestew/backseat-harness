@@ -10,6 +10,15 @@
 {% block heading %}{{ prompt }}{% endblock %}
 {% block sub %}<small>{{ provider }}:{{ conversation_id }}</small>{% endblock %}
 {% block action %}
+  <div class="chat-header-actions">
+  {% if ws_id is not none and not live %}
+  <form id="generate-task-form" class="chat-continue-form" method="post"
+        action="/chat/{{ provider }}/{{ conversation_id }}/generate-task">
+    <input type="hidden" name="ws" value="{{ ws_id }}">
+    <input type="hidden" name="confirmed" value="">
+    <button type="submit" class="btn generate-task-btn" title="Generate a task from this chat: a manager agent drafts its requirements from the conversation, and you confirm the workspace first">✨ Task</button>
+  </form>
+  {% endif %}
   {% if resume_command %}
   <form id="resume-form" class="chat-continue-form">
     <input type="hidden" name="cmd" value='{{ resume_command|tojson }}'>
@@ -17,7 +26,7 @@
     <input type="hidden" name="back_url" value="{{ back_url }}">
     <input type="hidden" name="back_label" value="{{ ws_name or 'Workspaces' }}">
     <input type="hidden" name="title" value="{{ prompt }}">
-    <button type="submit" class="btn">Continue</button>
+    <button type="submit" class="btn">Resume</button>
   </form>
   {% else %}
   <form id="fork-form" class="fork-form chat-continue-form" method="post" action="/search/fork">
@@ -29,6 +38,7 @@
     <button type="submit" class="btn">Fork</button>
   </form>
   {% endif %}
+  </div>
 {% endblock %}
 
 {% block body %}
@@ -68,6 +78,22 @@
       alert('Error: ' + err.message);
     }
   });
+</script>
+{% endif %}
+{% if ws_id is not none and not live %}
+<script>
+  (() => {
+    const form = document.getElementById('generate-task-form');
+    const message = {{ generate_message|tojson }};
+    form.addEventListener('submit', (e) => {
+      if (!window.confirm(message)) {
+        e.preventDefault();
+        return;
+      }
+      form.querySelector('input[name="confirmed"]').value = 'yes';
+      form.querySelector('button').disabled = true;
+    });
+  })();
 </script>
 {% endif %}
 {% endblock %}

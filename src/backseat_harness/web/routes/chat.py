@@ -15,17 +15,26 @@ which is what load_sessions expects in a key.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from backseat_harness import history
+from backseat_harness import history, manager
+from backseat_harness.config import load_config
 from backseat_harness.web.services import chat_search as chat_search_service
 from backseat_harness.web.services import task as task_service
 
 router = APIRouter()
+
+#: Serializes the double-submit check with the staging claim. The route is sync,
+#: so two POSTs for one chat can run in parallel threads; without this lock both
+#: could pass the check before either creates its staging dir. The lock covers
+#: only the claim, not the spawn, so a request never waits on the child.
+_GENERATE_CLAIM_LOCK = threading.Lock()
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -34,6 +43,7 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 def _fmt_dt(ts: float) -> str:
     """Format timestamp as YYYY-MM-DD HH:MM."""
     from datetime import datetime
+
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
@@ -66,6 +76,26 @@ def _build_resume_command(provider: str, conversation_id: str) -> list[str] | No
     if not template:
         return None
     return [arg.format(conversation_id=conversation_id) for arg in template]
+
+
+#: A chat whose store was written this recently is still in progress, so its
+#: discussion is not finished and it cannot become a task yet.
+LIVE_WINDOW_S = 120
+
+
+def _is_live(key: str) -> bool:
+    mtime = history.session_mtime(key)
+    return mtime is not None and time.time() - mtime <= LIVE_WINDOW_S
+
+
+def _generate_message(ws_name: str, ws_path: Path) -> str:
+    """The confirm dialog text for Generate Task. It names the target workspace."""
+    return (
+        "Generate a task from this chat?\n\n"
+        "Task requirements will be generated automatically from this conversation. "
+        "Ensure the idea is thoroughly fleshed out before you proceed.\n\n"
+        f"Target workspace: {ws_name} ({ws_path})"
+    )
 
 
 @router.get("/chat/{provider}/{conversation_id}", response_class=HTMLResponse)
@@ -113,6 +143,13 @@ def chat_page(request: Request, provider: str, conversation_id: str):
     # cwd, not the chat's).
     chat_cwd = str(ws_path_resolved) if ws_path_resolved is not None else "."
 
+    # Generate Task: offered only with a known workspace (?ws=), and hidden
+    # while the chat is live. The mtime lookup is skipped without a workspace.
+    live = ws_id is not None and _is_live(search_key)
+    generate_message = ""
+    if ws_id is not None and ws_path_resolved is not None:
+        generate_message = _generate_message(ws_name, ws_path_resolved)
+
     # The shell page's back link is this page, reached through ``?from=``, so
     # the payload must re-carry ``?ws=``; without it the round trip lands on
     # the bare transcript and the header degrades to the "Workspaces" homepage.
@@ -134,5 +171,53 @@ def chat_page(request: Request, provider: str, conversation_id: str):
             "ws_id": ws_id,
             "ws_name": ws_name,
             "chat_cwd": chat_cwd,
+            "live": live,
+            "generate_message": generate_message,
         },
     )
+
+
+@router.post("/chat/{provider}/{conversation_id}/generate-task")
+def generate_task(
+    provider: str,
+    conversation_id: str,
+    ws: int = Form(...),
+    confirmed: str = Form(""),
+):
+    """Start a background generate-task run for this chat, then go to the workspace.
+
+    Refusals, in order: 404 for an unknown provider, an unregistered workspace,
+    or a missing transcript; 400 when the confirm dialog did not say yes; 409
+    when the chat is live or a generation for it is already running. The run is
+    the ``generate-task`` CLI, detached, so this request never waits on it.
+    """
+    if provider not in _VALID_HISTORY_PROVIDERS:
+        return HTMLResponse(f"Unknown provider: {provider}", status_code=404)
+    ws_path = task_service.resolve_workspace(ws)
+    if ws_path is None:
+        return HTMLResponse(f"Unknown workspace: {ws}", status_code=404)
+    if confirmed != "yes":
+        return HTMLResponse("Generate Task needs confirmation", status_code=400)
+
+    key = f"{provider}:{conversation_id}"
+    if _is_live(key):
+        return HTMLResponse(
+            "This chat is still in progress. Finish the discussion, then generate.",
+            status_code=409,
+        )
+    try:
+        transcript = history.load_sessions([key]).get(key)
+    except history.HistoryError as e:
+        return HTMLResponse(str(e), status_code=404)
+    if not transcript:
+        return HTMLResponse("Session not found or transcript empty", status_code=404)
+
+    config = load_config(ws_path)
+    with _GENERATE_CLAIM_LOCK:
+        if manager.active_generation(config.tasks_dir, key):
+            return HTMLResponse(
+                "A task is already being generated from this chat.", status_code=409
+            )
+        staging = manager.new_staging(config.tasks_dir, key, str(ws_path))
+    task_service.generate_task_detached(ws_path, key, staging.name)
+    return RedirectResponse(url=f"/ws/{ws}", status_code=303)

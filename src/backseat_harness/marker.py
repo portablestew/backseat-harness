@@ -23,7 +23,7 @@ _MARKER_RE = re.compile(r"<meta>START SESSION\s+([0-9a-fA-F-]{36})\s+#(\d+)</met
 OPERATOR_SESSION_RE = re.compile(r"<meta>OPERATOR SESSION[^<]*</meta>")
 
 # First token after the tag: the task slug for a task-scoped operator session.
-_OPERATOR_SLUG_RE = re.compile(r"<meta>OPERATOR SESSION\s+(\S+)")
+_OPERATOR_SLUG_RE = re.compile(r"<meta>OPERATOR SESSION\s+([^\s<]+)")
 
 
 def parse_operator_marker(text: str) -> str | None:
@@ -79,6 +79,19 @@ def redact(text: str, root_uuid: str) -> str:
     instead of the managed agent. The generation ordinal stays visible.
     """
     return text.replace(root_uuid, REDACTED_ROOT)
+
+
+def redact_all(text: str) -> str:
+    """Remove every task root UUID that a ``START SESSION`` marker in ``text`` names.
+
+    For a source transcript that is itself a backseat session. Every marker's
+    UUID is replaced, not only the first, so a second chain's marker cannot
+    survive into a prompt and match that task's session search. A UUID that
+    appears bare, outside any marker, is replaced too: it is the same identity.
+    """
+    for root_uuid in {m.group(1) for m in _MARKER_RE.finditer(text)}:
+        text = text.replace(root_uuid, REDACTED_ROOT)
+    return text
 
 
 def parse_marker(text: str) -> tuple[str, int] | None:

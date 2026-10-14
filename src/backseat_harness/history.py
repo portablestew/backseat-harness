@@ -260,6 +260,30 @@ def load_sessions(
     return rendered
 
 
+def session_mtime(key: str) -> float | None:
+    """Last-modified time of the stored session named by an exact ``provider:id`` key.
+
+    Lists only that key's provider and parses nothing, so it costs one cheap
+    store scan. None when the key is malformed, the provider is unknown, the
+    session is gone, or the store cannot be read.
+    """
+    provider_name, sep, conversation_id = key.partition(":")
+    if not sep or not provider_name or not conversation_id:
+        return None
+    try:
+        provs = [p for p in _load("default_providers")() if p.name == provider_name]
+    except HistoryError:
+        return None
+    for provider in provs:
+        try:
+            for candidate in provider.list_candidates():
+                if candidate.conversation_id == conversation_id:
+                    return candidate.mtime
+        except Exception:  # noqa: BLE001 - an unreadable store means no mtime
+            return None
+    return None
+
+
 class _MemoProvider:
     """Provider proxy whose ``load`` results are shared for one request.
 

@@ -60,6 +60,7 @@ def workspace_page(request: Request, ws_id: int):
         return HTMLResponse("Workspace not found", status_code=404)
 
     name = ws_path.name
+    generating = task_service.list_generating(ws_path)
     incomplete = task_service.list_incomplete(ws_path)
     complete = task_service.list_complete(ws_path)
     chats = chat_search_service.list_recent_chats(ws_path, limit=10)
@@ -74,6 +75,7 @@ def workspace_page(request: Request, ws_id: int):
             "ws_id": ws_id,
             "ws_name": name,
             "ws_path": str(ws_path),
+            "generating": generating,
             "incomplete": incomplete,
             "complete": complete,
             "chats": chats,

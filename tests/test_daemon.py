@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from backseat_harness import db
+from backseat_harness import daemon as daemon_mod
+from backseat_harness import db, manager
 from backseat_harness.daemon import DB_WATCH_KEY, Daemon, checkin_job, file_watch_job
 from backseat_harness.scheduler import Scheduler
 
@@ -758,3 +759,47 @@ def test_daemon_module_does_not_import_web():
             f"daemon.py imports {name!r}; the embedded web bridge belongs to "
             "cli -> web.cli (2-plan A/3a)"
         )
+
+
+# --- a promoted generation is a lane; a staging dir is not -----------
+
+GOOD_DRAFT = (
+    "# Token guard\n\n"
+    "Guard each run with one token budget.\n\n"
+    "## Why\n\nKeep spend bounded.\n\n"
+    "## User decisions (hard)\n\n"
+    "> keep it to the token budget guard, not a full quota system\n\n"
+    "Rationale: the user said so.\n\n"
+    "## Requirements (high level)\n\n- one guard per run\n\n"
+    "## Unresolved\n\n- none\n\n"
+    "## Definition of done\n\n- the guard runs once per run\n\n"
+    "## Out of scope\n\n- quota system\n"
+)
+
+
+def test_a_promoted_lane_is_picked_and_a_staging_lane_is_not(workspace):
+    """A draft-only generation is not runnable; promoted, it is an ordinary lane."""
+    tasks = workspace / ".backseat" / "tasks"
+    staging = manager.new_staging(tasks, "claude_code:d5", str(workspace))
+    (staging / manager.GOAL_DRAFT).write_text(GOOD_DRAFT, encoding="utf-8")
+    data = manager.read_manifest(staging)
+    data.update(status="running", approved=True, suggested_slug="token-guard")
+    manager.write_manifest(staging, data)
+    assert daemon_mod._pick_lane(tasks) is None
+
+    slug = manager.promote(staging, tasks)
+
+    assert daemon_mod._pick_lane(tasks) == slug
+    lane = tasks / slug
+    assert daemon_mod._lane_stamp(lane) == (lane / "goal.md").stat().st_mtime
+
+
+def test_a_staging_dir_holding_a_goal_md_is_never_picked(workspace):
+    """A parked generation that somehow holds a goal.md must still never run."""
+    tasks = workspace / ".backseat" / "tasks"
+    staging = tasks / "_gen-20260101000000-abcdef"
+    staging.mkdir(parents=True)
+    (staging / "goal.md").write_text("Do the thing.\n", encoding="utf-8")
+
+    assert daemon_mod._pick_lane(tasks) is None
+    assert daemon_mod._lane_stamp(staging) is None

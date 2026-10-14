@@ -45,7 +45,7 @@
     }
     /* Threaded-chat header (goal G6): sticky row at the top of the chat page
        -- opaque background so the transcript scrolls under it; prompt excerpt
-       on the left, continue/fork button on the right. */
+       on the left, resume/fork button on the right. */
     .chat-header {
       position: sticky;
       top: 0;
@@ -89,14 +89,34 @@
     .chat-header-prompt small {
       color: var(--muted);
     }
-    /* Push the Continue/Fork/Takeover control to the bottom of the header so
+    /* Push the Resume/Fork/Takeover control to the bottom of the header so
        it never overlaps the back link at the top of the prompt column. */
     .chat-header .chat-continue-form {
       align-self: flex-end;
       margin: 0.6rem 0 0;
       flex-shrink: 0;
     }
-    /* The Continue/Fork button: compact, so it does not tower over the
+    /* The action group sits at the right edge whatever the prompt's length, so
+       the prompt column takes the slack and the buttons never drift inward. */
+    .chat-header-actions {
+      display: flex;
+      align-items: flex-end;
+      gap: 0.5rem;
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+    /* The generate button is purple: it starts an AI run that writes a task, so it
+       must read as different from Resume and Fork. */
+    .chat-header .generate-task-btn {
+      background: #6d28d9;
+      border-color: #6d28d9;
+      color: #ffffff;
+    }
+    .chat-header .generate-task-btn:hover {
+      background: #7c3aed;
+      border-color: #7c3aed;
+    }
+    /* The Resume/Fork button: compact, so it does not tower over the
        back link in the sticky row (owner brief: less tall, no overlap). */
     .chat-header .chat-continue-form button {
       width: auto;

@@ -17,17 +17,25 @@
       </tr>
     </thead>
     <tbody>
+      {% for g in generating %}
+      <tr class="generation-row">
+        <td>From chat {% if g.provider and g.conversation_id %}<a href="/chat/{{ g.provider | urlencode }}/{{ g.conversation_id | urlencode }}?ws={{ ws_id }}"><code>{{ g.source_key }}</code></a>{% else %}<code>{{ g.source_key }}</code>{% endif %}{% if g.reason %}<br><small>{{ g.reason }}</small>{% endif %}</td>
+        <td><span class="badge" data-status="{{ g.status }}">{{ g.badge }}</span></td>
+        <td><small>{{ g.created_at | format_datetime }}</small></td>
+      </tr>
+      {% endfor %}
       {% for t in incomplete %}
       <tr data-href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">
         <td><a href="/ws/{{ ws_id }}/tasks/{{ t.slug }}">{{ t.slug }}</a></td>
         <td><span class="badge" data-status="{{ t.status }}">{{ t.badge }}</span></td>
         <td><small>{{ t.updated_at | format_datetime }}</small></td>
       </tr>
-      {% else %}
+      {% endfor %}
+      {% if not generating and not incomplete %}
       <tr class="empty-row">
         <td colspan="3">No active tasks.</td>
       </tr>
-      {% endfor %}
+      {% endif %}
     </tbody>
   </table>
 </section>

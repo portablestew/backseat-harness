@@ -33,13 +33,9 @@ from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, Verdict
 
 
-def load_persona() -> str:
-    """Return the operator persona shipped with the package."""
-    return (
-        resources.files("backseat_harness")
-        .joinpath("operator_persona.md")
-        .read_text(encoding="utf-8")
-    )
+def load_persona(name: str = "operator_persona.md") -> str:
+    """Return a persona file shipped with the package (the operator's by default)."""
+    return resources.files("backseat_harness").joinpath(name).read_text(encoding="utf-8")
 
 
 @dataclass(frozen=True)
