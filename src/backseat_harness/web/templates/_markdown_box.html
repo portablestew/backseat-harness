@@ -12,8 +12,41 @@
     const pre = document.querySelector({{ (md_selector or 'pre.transcript')|tojson }});
     if (!pre || !window.marked || !window.DOMPurify) return;
     try {
+      // The source is plain text that can itself contain HTML (a transcript
+      // quoting an HTML diff, a goal with raw tags). marked passes raw HTML
+      // through, and one unclosed <!-- or stray <pre> in it would either
+      // reshape the box or -- once DOMPurify drops the swallowed comment --
+      // silently truncate most of it. Escape the source's & and < first so no
+      // source HTML can reach the output; > stays unescaped so blockquote
+      // lines (the transcript's own format) still parse.
+      const source = pre.textContent
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;");
+      // marked escapes code content and link URLs itself, which would show
+      // the just-escaped entities twice there; undo the escape for those
+      // tokens before marked's own escaping runs. &lt; goes first: after the
+      // source escape it is the only form a plain < can take, while a literal
+      // "&lt;" arrived as "&amp;lt;".
+      const undo = (s) => s.replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+      const base = new marked.Renderer();
+      const md = new marked.Marked();
+      md.use({ renderer: {
+        code(token) {
+          return base.code.call(this, { ...token, text: undo(token.text ?? "") });
+        },
+        codespan(token) {
+          return base.codespan.call(this, { ...token, text: undo(token.text ?? "") });
+        },
+        link(token) {
+          return base.link.call(this, {
+            ...token,
+            href: token.href ? undo(token.href) : token.href,
+            title: token.title ? undo(token.title) : token.title,
+          });
+        },
+      }});
       // breaks: a single newline in a message stays a line break.
-      const html = DOMPurify.sanitize(marked.parse(pre.textContent, { breaks: true }));
+      const html = DOMPurify.sanitize(md.parse(source, { breaks: true }));
       const div = document.createElement('div');
       div.className = {{ (md_class or 'transcript transcript-md')|tojson }};
       div.innerHTML = html;

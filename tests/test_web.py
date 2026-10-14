@@ -1659,6 +1659,12 @@ def _assert_transcript_markdown_page(html: str) -> None:
     assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;" in html
     assert "<script>alert(1)</script>" not in html
     assert "transcript-md" in html
+    # The renderer escapes the source's raw HTML before marked parses it: a
+    # transcript quoting an HTML diff (an unclosed <!-- or a stray <pre>)
+    # must not be able to truncate or reshape the rendered box.
+    assert ".replace(/&/g, \"&amp;\")" in html
+    assert ".replace(/</g, \"&lt;\")" in html
+    assert "md.parse(source" in html
 
 
 def test_chat_page_includes_transcript_markdown_renderer(monkeypatch):
