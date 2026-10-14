@@ -137,7 +137,7 @@
       overflow: auto;
       overscroll-behavior: auto;
     }
-    /* Rendered transcript (_transcript_markdown.html): the same box as
+    /* Rendered transcript (_markdown_box.html): the same box as
        .transcript, but a <div> now, so Pico's <pre> panel look is re-created
        here. Text stays monospace; each turn body is its own blockquote, and
        the role labels sit between them, so it reads as a panel, not an aside. */
@@ -147,8 +147,8 @@
       border-radius: var(--radius);
       font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
         "Liberation Mono", monospace;
-      font-size: 0.85rem;
-      line-height: 1.5;
+      font-size: 0.65rem;
+      line-height: 1.45;
     }
     .transcript-md > * + * {
       margin-top: 0.6em;
@@ -160,13 +160,13 @@
     .transcript-md h5,
     .transcript-md h6 {
       font-family: inherit;
-      font-size: 1rem;
+      font-size: 0.72rem;
       font-weight: 700;
       color: var(--text);
       margin: 0;
     }
     .transcript-md h2 {
-      font-size: 1.05rem;
+      font-size: 0.75rem;
     }
     .transcript-md blockquote {
       margin: 0;

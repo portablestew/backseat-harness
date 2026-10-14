@@ -39,6 +39,38 @@
     margin: 0.5rem 0 1rem;
     overflow: auto;
   }
+  /* Rendered goal (_markdown_box.html): the same panel as .goal, but
+     prose rather than monospace, so the markdown reads as text. */
+  .goal-md {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+  .goal-md > * + * {
+    margin-top: 0.6em;
+  }
+  .goal-md h1,
+  .goal-md h2,
+  .goal-md h3,
+  .goal-md h4,
+  .goal-md h5,
+  .goal-md h6 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--text);
+    margin: 0;
+  }
+  .goal-md pre {
+    margin: 0;
+    overflow-x: auto;
+  }
+  .goal-md ul,
+  .goal-md ol {
+    margin: 0;
+    padding-left: 1.4rem;
+  }
   .run-form button[type="submit"] {
     font-size: 0.85rem;
     padding: 0.35rem 0.8rem;
@@ -146,6 +178,9 @@
 <section>
   <h4>Goal</h4>
   <pre class="goal">{{ task.goal }}</pre>
+  {% with md_selector='pre.goal', md_class='goal goal-md' %}
+  {% include "_markdown_box.html" %}
+  {% endwith %}
 </section>
 
 <section>

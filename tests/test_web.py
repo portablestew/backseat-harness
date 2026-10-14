@@ -1688,6 +1688,29 @@ def test_task_transcript_page_includes_transcript_markdown_renderer(workspace: P
     _assert_transcript_markdown_page(resp.text)
 
 
+def test_task_page_renders_goal_as_markdown(workspace: Path):
+    """The task page's goal gets the same renderer, scoped to the goal <pre>,
+    with the escaped <pre> kept as the fallback and prose styling instead of
+    the transcript's monospace panel."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "goal-md-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("## Ship it\n\n- <b>one</b>\n- two\n", encoding="utf-8")
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}/tasks/goal-md-lane")
+
+    assert resp.status_code == 200
+    html = resp.text
+    assert _MARKED_TAG in html and _DOMPURIFY_TAG in html
+    assert '<pre class="goal">## Ship it' in html
+    assert "document.querySelector(\"pre.goal\")" in html
+    assert '"goal goal-md"' in html
+    # The fallback <pre> keeps the goal escaped, so raw HTML in it never reaches the page.
+    assert "- &lt;b&gt;one&lt;/b&gt;" in html
+    assert "- <b>one</b>" not in html
+
+
 def test_workspace_page_loads_no_transcript_renderer(workspace: Path, monkeypatch):
     """Only the chat and task transcript pages load marked and DOMPurify; the
     workspace page has no transcript box and must not pull them in."""
