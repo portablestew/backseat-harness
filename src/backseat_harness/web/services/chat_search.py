@@ -432,7 +432,10 @@ class HomepageResult:
     """One row for the homepage search table.
 
     Task rows carry ``status``/``badge`` for the status capsule; other-chat
-    rows leave them empty and render a plain ``N/A``.
+    rows leave them empty and render a plain ``N/A``. ``workspace`` is the
+    registered workspace the chat's project belongs to and ``workspace_path``
+    its full path (the cell's tooltip); both empty mean the project is not a
+    known workspace, which renders ``N/A`` as well.
     """
 
     href: str
@@ -441,6 +444,8 @@ class HomepageResult:
     mtime: float
     status: str = ""
     badge: str = ""
+    workspace: str = ""
+    workspace_path: str = ""
 
 
 def _ref_workspace_path(ref: object) -> str | None:
@@ -526,24 +531,57 @@ def _task_lane(
     return index.get(result.marker_id) or index.get(result.native_id)
 
 
+#: Registered-workspace lookup keyed by normalized path: ``(id, name, path)``.
+WsIndex = dict[str, tuple[int, str, str]]
+
+
+def _ws_index() -> WsIndex:
+    """Every registered workspace by normalized path, for one search request.
+
+    One pass over the registry feeds both the ``?ws=`` hrefs and the
+    Workspace column, so the ids, names and paths can never disagree.
+    """
+    index: WsIndex = {}
+    for ws_id, p in workspace_service.list_workspaces_with_ids():
+        index[workspace_service._normalize(p)] = (ws_id, workspace_service.display_name(p), p)
+    return index
+
+
+def _ws_entry(project: str | None, ws_index: WsIndex) -> tuple[int, str, str] | None:
+    """The registered workspace a search hit's project belongs to, or None.
+
+    ``project`` is the hit's absolute dir (unrecoverable -> None); an
+    unregistered dir simply has no entry, which the caller renders as ``N/A``.
+    """
+    if not project:
+        return None
+    return ws_index.get(workspace_service._normalize(project))
+
+
 def _task_row(
-    result: SessionSearchResult, lane: Path | None, ws_paths: dict[str, int]
+    result: SessionSearchResult, lane: Path | None, ws_index: WsIndex
 ) -> HomepageResult:
     """Enrich a task hit: resolve its lane for the goal prompt and status.
 
     Falls back to the chat link and the chat's parsed prompt when the lane
-    (or its registered workspace) cannot be resolved.
+    (or its registered workspace) cannot be resolved. The Workspace column
+    reads the hit's project whether or not the lane resolved; the ``/ws/``
+    href still requires a resolved lane (and a registered workspace).
     """
     provider = _extract_provider_from_key(result.key) or ""
+    entry = _ws_entry(result.project, ws_index)
+    ws_name, ws_path = (entry[1], entry[2]) if entry else ("", "")
     if lane is None:
         return HomepageResult(
             href=f"/chat/{provider}/{result.native_id}",
             prompt=result.prompt,
             provider=provider,
             mtime=result.mtime,
+            workspace=ws_name,
+            workspace_path=ws_path,
         )
 
-    ws_id = ws_paths.get(workspace_service._normalize(result.project))
+    ws_id = entry[0] if entry else None
     info = task_service._lane_info(lane)
     href = (
         f"/ws/{ws_id}/tasks/{lane.name}"
@@ -557,6 +595,8 @@ def _task_row(
         mtime=result.mtime,
         status=info.status,
         badge=info.badge,
+        workspace=ws_name,
+        workspace_path=ws_path,
     )
 
 
@@ -586,10 +626,7 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
     # Extra raw results so task dedup still fills the row cap.
     raw = search_all_sessions(query, limit * 3)
 
-    ws_paths = {
-        workspace_service._normalize(p): ws_id
-        for ws_id, p in workspace_service.list_workspaces_with_ids()
-    }
+    ws_index = _ws_index()
     lane_index: dict[str, dict[str, Path]] = {}
 
     seen_tasks: set[tuple[str, str]] = set()
@@ -603,13 +640,13 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
             if lane is None:
                 # An unresolvable task hit is still a real user chat: keep it
                 # as a plain chat row rather than dropping it.
-                rows.append(_task_row(result, None, ws_paths))
+                rows.append(_task_row(result, None, ws_index))
                 continue
             key = (workspace_service._normalize(result.project), lane.name)
             if key in seen_tasks:
                 continue
             seen_tasks.add(key)
-            rows.append(_task_row(result, lane, ws_paths))
+            rows.append(_task_row(result, lane, ws_index))
         elif result.classification == "operator":
             lane = _operator_lane(result)
             if lane is None:
@@ -618,23 +655,23 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
             if key in seen_tasks:
                 continue
             seen_tasks.add(key)
-            rows.append(_task_row(result, lane, ws_paths))
+            rows.append(_task_row(result, lane, ws_index))
         else:
             provider = _extract_provider_from_key(result.key) or ""
             # A chat in a registered workspace carries ``?ws=`` so its transcript
             # can offer Generate Task; an unmapped chat stays bare.
-            ws_id = None
-            if result.project:
-                ws_id = ws_paths.get(workspace_service._normalize(result.project))
+            entry = _ws_entry(result.project, ws_index)
             href = f"/chat/{provider}/{quote(result.native_id, safe='')}"
-            if ws_id is not None:
-                href = f"{href}?ws={ws_id}"
+            if entry is not None:
+                href = f"{href}?ws={entry[0]}"
             rows.append(
                 HomepageResult(
                     href=href,
                     prompt=result.prompt,
                     provider=provider,
                     mtime=result.mtime,
+                    workspace=entry[1] if entry else "",
+                    workspace_path=entry[2] if entry else "",
                 )
             )
     return rows

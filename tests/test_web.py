@@ -3945,6 +3945,49 @@ def test_search_plain_chat_in_an_unmapped_project_stays_bare(
     assert "ses_plain?ws=" not in resp.text
 
 
+def test_search_results_workspace_column_names_the_registered_workspace(
+    monkeypatch, workspace: Path, tmp_path: Path
+):
+    """The Workspace column sits between Provider and Status and names the
+    registered workspace the hit's project maps to -- the full path rides the
+    cell's tooltip. A project outside every registered workspace reads N/A,
+    the same fallback the Status column uses for a plain chat."""
+    _register_workspace(workspace)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    refs = [
+        _Ref("opencode:ses_in_ws", mtime=300.0, project=str(workspace)),
+        _Ref("opencode:ses_outside", mtime=200.0, project=str(elsewhere)),
+    ]
+    transcripts = {
+        "opencode:ses_in_ws": "a plain chat",
+        "opencode:ses_outside": "another plain chat",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    html = resp.text
+    assert resp.status_code == 200
+    assert (
+        "<th>Prompt</th><th>Provider</th><th>Workspace</th>"
+        "<th>Status</th><th>Updated</th>" in html
+    )
+
+    def _workspace_cell(conversation_id: str) -> str:
+        row = next(r for r in _data_rows(html) if conversation_id in r)
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
+        assert len(cells) == 5  # prompt, provider, workspace, status, updated
+        return cells[2].strip()
+
+    resolved = str(workspace.resolve())
+    assert _workspace_cell("ses_in_ws") == (
+        f'<span title="{resolved}">{workspace.name}</span>'
+    )
+    assert _workspace_cell("ses_outside") == "N/A"
+
+
 def test_search_unresolved_task_hit_fallback_stays_bare(
     monkeypatch, workspace: Path
 ):
