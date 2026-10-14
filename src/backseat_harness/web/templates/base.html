@@ -137,6 +137,64 @@
       overflow: auto;
       overscroll-behavior: auto;
     }
+    /* Rendered transcript (_transcript_markdown.html): the same box as
+       .transcript, but a <div> now, so Pico's <pre> panel look is re-created
+       here. Text stays monospace; each turn body is its own blockquote, and
+       the role labels sit between them, so it reads as a panel, not an aside. */
+    .transcript-md {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    .transcript-md > * + * {
+      margin-top: 0.6em;
+    }
+    .transcript-md h1,
+    .transcript-md h2,
+    .transcript-md h3,
+    .transcript-md h4,
+    .transcript-md h5,
+    .transcript-md h6 {
+      font-family: inherit;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text);
+      margin: 0;
+    }
+    .transcript-md h2 {
+      font-size: 1.05rem;
+    }
+    .transcript-md blockquote {
+      margin: 0;
+      padding: 0 0 0 0.9rem;
+      min-width: 0;
+      border-left: 3px solid var(--border-hover);
+      color: var(--text);
+      font-style: normal;
+    }
+    .transcript-md blockquote > * + * {
+      margin-top: 0.6em;
+    }
+    /* Wide code fences scroll inside themselves, not the whole transcript box. */
+    .transcript-md pre {
+      margin: 0;
+      padding: 0.6rem 0.8rem;
+      max-width: 100%;
+      overflow-x: auto;
+      background: var(--surface);
+      border-radius: var(--radius);
+      white-space: pre;
+    }
+    .transcript-md pre code {
+      padding: 0;
+      background: none;
+      font-size: inherit;
+      white-space: inherit;
+    }
 
     a {
       color: var(--accent);

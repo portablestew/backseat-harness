@@ -1633,6 +1633,81 @@ def test_task_transcript_page_unknown_task_or_workspace_are_404(workspace: Path)
         assert client.get(f"/ws/{ws_id}/tasks/no-such-lane/transcript").status_code == 404
 
 
+_MARKED_TAG = '<script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.min.js"></script>'
+_DOMPURIFY_TAG = '<script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js"></script>'
+_MD_PAYLOAD = "## USER\n> <script>alert(1)</script> & <b>bold</b>\n"
+
+
+def _assert_transcript_markdown_page(html: str) -> None:
+    """Both transcript pages: pinned renderer tags, the escaped <pre> fallback,
+    and the renderer's ``transcript-md`` swap."""
+    assert _MARKED_TAG in html
+    assert _DOMPURIFY_TAG in html
+    # The server still emits the escaped plain-text <pre> the renderer falls back to.
+    assert '<pre class="transcript">' in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;" in html
+    assert "<script>alert(1)</script>" not in html
+    assert "transcript-md" in html
+
+
+def test_chat_page_includes_transcript_markdown_renderer(monkeypatch):
+    """The chat page loads the pinned marked and DOMPurify builds and carries
+    the renderer that swaps the transcript <pre> for sanitized markdown."""
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {k: _MD_PAYLOAD for k in keys}
+    )
+    with _client() as client:
+        resp = client.get("/chat/opencode/ses_md")
+
+    assert resp.status_code == 200
+    _assert_transcript_markdown_page(resp.text)
+
+
+def test_task_transcript_page_includes_transcript_markdown_renderer(workspace: Path):
+    """The task transcript page loads the same renderer and fallback <pre>."""
+    ws_id = _register_workspace(workspace)
+    _write_transcript_lane(workspace, "md-lane", _MD_PAYLOAD)
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}/tasks/md-lane/transcript")
+
+    assert resp.status_code == 200
+    _assert_transcript_markdown_page(resp.text)
+
+
+def test_workspace_page_loads_no_transcript_renderer(workspace: Path, monkeypatch):
+    """Only the chat and task transcript pages load marked and DOMPurify; the
+    workspace page has no transcript box and must not pull them in."""
+    ws_id = _register_workspace(workspace)
+    _stub_chat_history(monkeypatch, [], {})
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+
+    assert resp.status_code == 200
+    assert "marked.umd" not in resp.text
+    assert "dompurify" not in resp.text
+    # base.html's .transcript-md CSS is always served, so check the renderer's code.
+    assert "marked.parse" not in resp.text
+    assert "DOMPurify.sanitize" not in resp.text
+
+
+def test_base_css_has_transcript_markdown_rules():
+    """The rendered-transcript panel styles ship in the shared base stylesheet,
+    beside the unchanged ``.transcript`` rule."""
+    with _client() as client:
+        css = client.get("/").text
+
+    assert ".transcript-md {" in css
+    start = css.index(".transcript-md {")
+    rule = css[start : css.index("}", start)]
+    assert "font-family: ui-monospace" in rule
+    assert ".transcript-md pre {" in css
+    assert "overflow-x: auto" in css[css.index(".transcript-md pre {") :]
+
+
 def test_badge_css_covers_all_and_unknown_status(workspace: Path):
     """Goal G5 / plan 3d: the served CSS colors complete green, continue amber
     and blocked red via ``data-status``; a lane with an unknown status value

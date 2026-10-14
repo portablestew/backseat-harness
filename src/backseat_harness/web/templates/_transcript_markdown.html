@@ -1,0 +1,23 @@
+<!-- Included after the transcript <pre class="transcript"> on the chat and task
+     transcript pages only. The <pre> stays as the escaped plain-text fallback. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js"></script>
+<script>
+  (() => {
+    // Swap the transcript <pre> for sanitized markdown. The new box is built
+    // and sanitized before it touches the DOM, so any failure (scripts blocked,
+    // CDN down, parse error) leaves the escaped <pre> in place.
+    const pre = document.querySelector('pre.transcript');
+    if (!pre || !window.marked || !window.DOMPurify) return;
+    try {
+      // breaks: a single newline in a message stays a line break.
+      const html = DOMPurify.sanitize(marked.parse(pre.textContent, { breaks: true }));
+      const div = document.createElement('div');
+      div.className = 'transcript transcript-md';
+      div.innerHTML = html;
+      pre.replaceWith(div);
+    } catch (err) {
+      // Keep the plain-text <pre>.
+    }
+  })();
+</script>
