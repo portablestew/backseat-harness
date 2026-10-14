@@ -6,7 +6,7 @@
   <tbody>
     {% for r in rows %}
     <tr data-href="{{ r.href }}">
-      <td class="prompt"><a href="{{ r.href }}">{{ r.prompt }}</a></td>
+      <td class="prompt">{% if r.task_name %}<h4>{{ r.task_name }}</h4>{% endif %}<a href="{{ r.href }}">{{ r.prompt }}</a></td>
       <td>{{ r.provider }}</td>
       <td>{% if r.workspace %}<span title="{{ r.workspace_path }}">{{ r.workspace }}</span>{% else %}N/A{% endif %}</td>
       <td>

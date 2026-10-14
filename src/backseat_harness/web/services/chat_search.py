@@ -431,11 +431,13 @@ def pick_fork_provider(current_session_key: str, configured_provider: str) -> st
 class HomepageResult:
     """One row for the homepage search table.
 
-    Task rows carry ``status``/``badge`` for the status capsule; other-chat
-    rows leave them empty and render a plain ``N/A``. ``workspace`` is the
-    registered workspace the chat's project belongs to and ``workspace_path``
-    its full path (the cell's tooltip); both empty mean the project is not a
-    known workspace, which renders ``N/A`` as well.
+    ``provider`` is always the chat's own provider (the session key's prefix),
+    never a task name. Task rows carry ``status``/``badge`` for the status
+    capsule and ``task_name`` (the lane's slug) for the prompt cell's heading;
+    other-chat rows leave all three empty and render a plain ``N/A`` status.
+    ``workspace`` is the registered workspace the chat's project belongs to and
+    ``workspace_path`` its full path (the cell's tooltip); both empty mean the
+    project is not a known workspace, which renders ``N/A`` as well.
     """
 
     href: str
@@ -446,6 +448,7 @@ class HomepageResult:
     badge: str = ""
     workspace: str = ""
     workspace_path: str = ""
+    task_name: str = ""
 
 
 def _ref_workspace_path(ref: object) -> str | None:
@@ -563,6 +566,10 @@ def _task_row(
 ) -> HomepageResult:
     """Enrich a task hit: resolve its lane for the goal prompt and status.
 
+    The row's ``provider`` is always the chat's own provider (its key prefix),
+    even on a task row -- the task name rides ``task_name`` (rendered as the
+    prompt cell's heading) so the Provider column never holds a lane slug.
+
     Falls back to the chat link and the chat's parsed prompt when the lane
     (or its registered workspace) cannot be resolved. The Workspace column
     reads the hit's project whether or not the lane resolved; the ``/ws/``
@@ -591,12 +598,13 @@ def _task_row(
     return HomepageResult(
         href=href,
         prompt=_prompt_excerpt(_read_text(lane / "goal.md")),
-        provider=lane.name,
+        provider=provider,
         mtime=result.mtime,
         status=info.status,
         badge=info.badge,
         workspace=ws_name,
         workspace_path=ws_path,
+        task_name=lane.name,
     )
 
 

@@ -314,6 +314,17 @@
       font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
         "Liberation Mono", monospace;
     }
+    /* A task row's name rides the prompt cell as a compact heading (same
+       scale as the transcript's h4s, browser margins replaced by a small
+       0.3rem gap) so the name reads as a label above the goal excerpt
+       without floating away from it. */
+    .data-table .prompt h4 {
+      margin: 0 0 0.3rem;
+      font-family: inherit;
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--text);
+    }
 
     /* Expander: a disclosure whose collapsed control is a round "+" and whose
        expanded state becomes a bounded panel with the control pinned at its

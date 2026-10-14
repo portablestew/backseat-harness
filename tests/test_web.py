@@ -1419,10 +1419,10 @@ def test_task_page_links_back_to_workspace(workspace: Path):
 def test_task_page_matches_the_polish_brief(workspace: Path):
     """[6c]: the task page is one sticky chat-style header (name over date,
     Takeover right), Status first with its capsule on the heading, a
-    header-less Iteration/Generation/Reason table, a required-brief Run block
-    with the in progress copy beside a 2/3 Status column, state-colored
-    checklist capsules, no Logs section and no inline transcript -- just a
-    "Raw transcript" link to the 6d page."""
+    header-less Provider/Iteration/Generation/Reason table, a required-brief
+    Run block with the in progress copy beside a 2/3 Status column,
+    state-colored checklist capsules, no Logs section and no inline
+    transcript -- just a "Raw transcript" link to the 6d page."""
     ws_id = _register_workspace(workspace)
     lane = workspace / ".backseat" / "tasks" / "polish-lane"
     lane.mkdir(parents=True)
@@ -1436,6 +1436,17 @@ def test_task_page_matches_the_polish_brief(workspace: Path):
                 "generation": 2,
                 "reason": "waiting on a decision",
                 "updated_at": 1_700_000_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "root_uuid": "11111111-2222-3333-4444-555555555555",
+                "provider": "claude",
+                "generations": [],
             }
         ),
         encoding="utf-8",
@@ -1482,10 +1493,13 @@ def test_task_page_matches_the_polish_brief(workspace: Path):
     assert '<span class="badge" data-status="continue">in progress</span>' in status
     assert "(continue)" not in status and "(complete)" not in status
 
-    # Iteration / Generation / Reason: a header-less table.
+    # Provider / Iteration / Generation / Reason: a header-less table, with the
+    # lane's binding provider first.
     meta_start = html.index('<table class="task-meta">')
     meta = html[meta_start : html.index("</table>", meta_start)]
     assert "<thead>" not in meta
+    assert "<td>Provider</td>" in meta and "<td>claude</td>" in meta
+    assert meta.index("<td>Provider</td>") < meta.index("<td>Iteration</td>")
     assert "<td>Iteration</td>" in meta and "<td>3</td>" in meta
     assert "<td>Generation</td>" in meta and "<td>2</td>" in meta
     assert "waiting on a decision" in meta
@@ -1592,6 +1606,38 @@ def test_task_status_table_has_margin_and_dividers(workspace: Path):
     for selector in (".task-meta td", ".data-table td"):
         for body in bodies.get(selector, []):
             assert "padding" not in body and "border" not in body, selector
+
+
+def test_task_page_provider_row_falls_back_to_the_configured_provider(
+    workspace: Path,
+):
+    """A never-run lane has no binding.json, so the Status table's Provider
+    row reads the workspace's configured [harness] provider -- and the plain
+    manager default when nothing configures one."""
+    (workspace / ".backseat" / "config.toml").write_text(
+        '[harness]\nprovider = "kiro"\n', encoding="utf-8"
+    )
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "fresh-lane", status="continue", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/fresh-lane")
+
+    assert page.status_code == 200
+    meta_start = page.text.index('<table class="task-meta">')
+    meta = page.text[meta_start : page.text.index("</table>", meta_start)]
+    assert "<td>Provider</td>" in meta and "<td>kiro</td>" in meta
+
+    # With no binding and no workspace config, the manager default applies.
+    (workspace / ".backseat" / "config.toml").unlink()
+    _write_lane(workspace, "default-lane", status="continue", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/default-lane")
+
+    meta_start = page.text.index('<table class="task-meta">')
+    meta = page.text[meta_start : page.text.index("</table>", meta_start)]
+    assert "<td>Provider</td>" in meta and "<td>opencode</td>" in meta
 
 
 def test_workspace_expander_control_uses_shared_crossed_glyph(workspace: Path):
@@ -3853,18 +3899,32 @@ def test_search_results_fragment_interleaves_task_and_other_rows(
     assert resp.status_code == 200
     html = resp.text
 
-    # The deduped task row: goal prompt, task name, status capsule, task link.
+    # The deduped task row: goal prompt under the task-name heading, status
+    # capsule, task link, and the chat's own provider (never the lane slug)
+    # in the Provider column.
     assert f'data-href="/ws/{ws_id}/tasks/search-lane"' in html
     assert "goal for search lane" in html
-    assert "search-lane" in html
     assert '<span class="badge" data-status="blocked">needs attention</span>' in html
     # The duplicate hit was skipped: exactly one row links to the task page.
     assert html.count(f'data-href="/ws/{ws_id}/tasks/search-lane"') == 1
+
+    def _cells(row: str) -> list[str]:
+        return re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
+
+    task_row = next(r for r in _data_rows(html) if "search-lane" in r)
+    task_cells = _cells(task_row)
+    assert task_cells[0] == (
+        f'<h4>search-lane</h4><a href="/ws/{ws_id}/tasks/search-lane">'
+        "goal for search lane</a>"
+    )
+    assert task_cells[1].strip() == "opencode"
 
     # The other-chat row: parsed prompt, provider, plain N/A, chat link.
     assert 'data-href="/chat/opencode/ses_plain"' in html
     assert "a plain chat about refactors" in html
     assert "N/A" in html
+    plain_row = next(r for r in _data_rows(html) if "ses_plain" in r)
+    assert _cells(plain_row)[1].strip() == "opencode"
 
     # Chat-search order is preserved: the task row precedes the other row.
     assert html.index("goal for search lane") < html.index("a plain chat about refactors")
@@ -3872,6 +3932,19 @@ def test_search_results_fragment_interleaves_task_and_other_rows(
     # Both rows carry the formatted mtime.
     assert datetime.fromtimestamp(400.0).strftime("%Y-%m-%d %H:%M") in html
     assert datetime.fromtimestamp(200.0).strftime("%Y-%m-%d %H:%M") in html
+
+
+def test_search_task_name_heading_is_compacted_by_the_shared_style():
+    """The task row's prompt-cell <h4> must not inherit the browser's large
+    default: the shared style pins it to the transcript h4 scale with a small
+    0.3rem gap, so the task name reads as a label above the goal excerpt."""
+    with _client() as client:
+        page = client.get("/")
+
+    rule = _css_rule_bodies(page.text)[".data-table .prompt h4"][0]
+    assert "margin: 0 0 0.3rem" in rule
+    assert "0.72rem" in rule
+    assert "font-weight: 700" in rule
 
 
 def test_search_results_caps_at_twenty_rows(monkeypatch):
@@ -3961,6 +4034,12 @@ def test_search_results_collapses_operator_chat_into_task_row(
     # The first hit (operator, newer) supplies the Updated timestamp.
     assert datetime.fromtimestamp(500.0).strftime("%Y-%m-%d %H:%M") in html
     assert datetime.fromtimestamp(400.0).strftime("%Y-%m-%d %H:%M") not in html
+    # The row is marked as a task by the heading and status capsule, while the
+    # Provider column holds the first hit's chat provider.
+    task_row = next(r for r in _data_rows(html) if "op-lane" in r)
+    cells = re.findall(r"<td\b[^>]*>(.*?)</td>", task_row, re.S)
+    assert cells[0].startswith("<h4>op-lane</h4>")
+    assert cells[1].strip() == "opencode"
 
 
 def test_search_results_drops_operator_chat_without_a_task(monkeypatch):
@@ -4029,6 +4108,10 @@ def test_search_results_recovers_workspace_dir_from_the_provider_store(
     assert f'data-href="/ws/{ws_id}/tasks/recovered-lane"' in resp.text
     assert "goal for recovered lane" in resp.text
     assert '<span class="badge" data-status="continue">in progress</span>' in resp.text
+    # The Provider column shows the chat's provider, not the lane name.
+    row = next(r for r in _data_rows(resp.text) if "recovered-lane" in r)
+    cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
+    assert cells[1].strip() == "claude_code"
 
 
 def test_search_plain_chat_in_a_registered_workspace_links_with_ws(

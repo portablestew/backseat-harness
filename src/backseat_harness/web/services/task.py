@@ -26,7 +26,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backseat_harness import manager, storage
-from backseat_harness.config import STAGING_PREFIX, TaskPaths, is_task_lane, sanitize_slug
+from backseat_harness.config import (
+    DEFAULT_MANAGER_PROVIDER,
+    STAGING_PREFIX,
+    TaskPaths,
+    is_task_lane,
+    load_config,
+    sanitize_slug,
+)
 from backseat_harness.models import TaskStatus
 
 
@@ -272,6 +279,7 @@ class TaskDetail:
     status: str
     badge: str
     run_action: str
+    provider: str
     iteration: int
     generation: int
     reason: str
@@ -279,6 +287,28 @@ class TaskDetail:
     checklist: dict
     remarks: list[str]
     transcript: str | None
+
+
+def _task_provider(ws_path: Path, task_dir: Path) -> str:
+    """The provider that owns this lane, for the Status table's first row.
+
+    A lane's ``binding.json`` is authoritative when present -- it records which
+    CLI owns the lane's session chain (same precedence as
+    ``cli._managed_provider``). A never-run lane has no binding, so it falls
+    back to the workspace's configured ``[harness]`` provider; an unreadable
+    binding or config resolves to the manager default rather than failing the
+    page.
+    """
+    try:
+        binding = storage.load_binding(TaskPaths(task_dir))
+        if binding is not None and binding.provider:
+            return binding.provider
+    except Exception:
+        pass
+    try:
+        return load_config(ws_path).provider or DEFAULT_MANAGER_PROVIDER
+    except Exception:
+        return DEFAULT_MANAGER_PROVIDER
 
 
 def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
@@ -342,6 +372,7 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         status=status,
         badge=badge_for(status),
         run_action=run_action_for(task_dir, status),
+        provider=_task_provider(ws_path, task_dir),
         iteration=iteration,
         generation=generation,
         reason=reason,
