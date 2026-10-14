@@ -1,0 +1,6 @@
+<form id="generate-task-form" class="chat-continue-form" method="post"
+        action="/chat/{{ generate_task.provider }}/{{ generate_task.conversation_segment }}/generate-task">
+    <input type="hidden" name="ws" value="{{ generate_task.ws_id }}">
+    <input type="hidden" name="confirmed" value="">
+    <button type="submit" class="btn generate-task-btn" title="Generate a task from this chat: a manager agent drafts its requirements from the conversation, and you confirm the workspace first">✨ Task</button>
+  </form>

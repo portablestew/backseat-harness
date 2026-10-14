@@ -11,13 +11,8 @@
 {% block sub %}<small>{{ provider }}:{{ conversation_id }}</small>{% endblock %}
 {% block action %}
   <div class="chat-header-actions">
-  {% if ws_id is not none and not live %}
-  <form id="generate-task-form" class="chat-continue-form" method="post"
-        action="/chat/{{ provider }}/{{ conversation_id }}/generate-task">
-    <input type="hidden" name="ws" value="{{ ws_id }}">
-    <input type="hidden" name="confirmed" value="">
-    <button type="submit" class="btn generate-task-btn" title="Generate a task from this chat: a manager agent drafts its requirements from the conversation, and you confirm the workspace first">✨ Task</button>
-  </form>
+  {% if generate_task %}
+  {% include "_generate_task_button.html" %}
   {% endif %}
   {% if resume_command %}
   <form id="resume-form" class="chat-continue-form">
@@ -84,20 +79,7 @@
   });
 </script>
 {% endif %}
-{% if ws_id is not none and not live %}
-<script>
-  (() => {
-    const form = document.getElementById('generate-task-form');
-    const message = {{ generate_message|tojson }};
-    form.addEventListener('submit', (e) => {
-      if (!window.confirm(message)) {
-        e.preventDefault();
-        return;
-      }
-      form.querySelector('input[name="confirmed"]').value = 'yes';
-      form.querySelector('button').disabled = true;
-    });
-  })();
-</script>
+{% if generate_task %}
+{% include "_generate_task_script.html" %}
 {% endif %}
 {% endblock %}

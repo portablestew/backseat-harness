@@ -48,11 +48,19 @@
     <strong>{{ title }}</strong>
     <small>{{ session_id }}</small>
   </div>
+  <div class="chat-header-actions">
+  {% if generate_task %}
+  {% include "_generate_task_button.html" %}
+  {% endif %}
   <form class="chat-continue-form" method="post" action="/shell/{{ session_id }}/stop">
     <input type="hidden" name="back_url" value="{{ back_url }}">
     <button type="submit" class="btn shell-disconnect">Disconnect</button>
   </form>
+  </div>
 </header>
+{% if generate_task %}
+{% include "_generate_task_script.html" %}
+{% endif %}
 <div id="terminal-container"></div>
 <div class="status-bar hidden" id="status-bar">Connected</div>
 

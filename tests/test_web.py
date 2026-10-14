@@ -25,6 +25,7 @@ from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,6 +33,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from backseat_harness import db, marker
 from backseat_harness.web.main import create_app
+from backseat_harness.web.routes import shell as shell_routes
 from backseat_harness.web.services import chat_search as chat_search_service
 from backseat_harness.web.services import task as task_service
 from backseat_harness.web.services import workspace as workspace_service
@@ -3888,6 +3890,115 @@ def test_search_results_recovers_workspace_dir_from_the_provider_store(
     assert f'data-href="/ws/{ws_id}/tasks/recovered-lane"' in resp.text
     assert "goal for recovered lane" in resp.text
     assert '<span class="badge" data-status="continue">in progress</span>' in resp.text
+
+
+def test_search_plain_chat_in_a_registered_workspace_links_with_ws(
+    monkeypatch, workspace: Path
+):
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_plain", mtime=200.0, project=str(workspace))]
+    _stub_chat_history(monkeypatch, refs, {"opencode:ses_plain": "a plain chat"})
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert f'data-href="/chat/opencode/ses_plain?ws={ws_id}"' in resp.text
+    assert f'<a href="/chat/opencode/ses_plain?ws={ws_id}">' in resp.text
+
+
+def test_search_plain_chat_in_an_unmapped_project_stays_bare(
+    monkeypatch, workspace: Path, tmp_path: Path
+):
+    _register_workspace(workspace)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    refs = [_Ref("opencode:ses_plain", mtime=200.0, project=str(elsewhere))]
+    _stub_chat_history(monkeypatch, refs, {"opencode:ses_plain": "a plain chat"})
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert 'data-href="/chat/opencode/ses_plain"' in resp.text
+    assert "ses_plain?ws=" not in resp.text
+
+
+def test_search_unresolved_task_hit_fallback_stays_bare(
+    monkeypatch, workspace: Path
+):
+    """A managed task hit whose lane does not resolve falls back to a plain
+    chat row. Its project is a registered workspace, yet the href stays bare:
+    the task's ws mapping is only for resolved lanes."""
+    _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_orphan", mtime=400.0, project=str(workspace))]
+    transcripts = {"opencode:ses_orphan": f"{_MARKER}\n## USER\norphan body\n"}
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert 'data-href="/chat/opencode/ses_orphan"' in resp.text
+    assert "ses_orphan?ws=" not in resp.text
+
+
+def test_search_href_round_trips_to_a_transcript_with_generate_task(
+    monkeypatch, workspace: Path
+):
+    """End to end: the search row's href, followed, shows the Generate Task
+    form for the same workspace id."""
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_plain", mtime=200.0, project=str(workspace))]
+    _stub_chat_history(monkeypatch, refs, {"opencode:ses_plain": "a plain chat"})
+
+    with _client() as client:
+        search = client.get("/search/results", params={"q": ""}).text
+        href = re.search(r'data-href="(/chat/opencode/ses_plain\?ws=\d+)"', search).group(1)
+        page = client.get(href).text
+
+    assert 'id="generate-task-form"' in page
+    assert 'action="/chat/opencode/ses_plain/generate-task"' in page
+    assert f'<input type="hidden" name="ws" value="{ws_id}">' in page
+
+
+class _ShellSessionStub:
+    """Knows one shell session, so the shell page can render without a child."""
+
+    SESSION_ID = "abc123def456"
+
+    def get_session(self, session_id: str):
+        return SimpleNamespace(cmd=["opencode"]) if session_id == self.SESSION_ID else None
+
+
+@pytest.mark.parametrize(
+    "provider, conversation_id",
+    [("opencode", "ses_plain"), ("cline", "sess_plain")],  # Resume and Fork-only providers
+)
+def test_search_row_to_resume_back_url_to_shell_shows_generate_task(
+    monkeypatch, workspace: Path, provider: str, conversation_id: str
+):
+    """The full chain of requirement 2: a search row links to the transcript
+    with ``?ws=``; the transcript's Resume/Fork forms carry that ``back_url``;
+    the shell opened from it shows Generate Task for the same workspace."""
+    ws_id = _register_workspace(workspace)
+    key = f"{provider}:{conversation_id}"
+    refs = [_Ref(key, mtime=200.0, project=str(workspace))]
+    _stub_chat_history(monkeypatch, refs, {key: "a plain chat"})
+    monkeypatch.setattr(shell_routes, "get_manager", lambda: _ShellSessionStub())
+
+    with _client() as client:
+        search = client.get("/search/results", params={"q": ""}).text
+        href = re.search(rf'data-href="(/chat/{provider}/{conversation_id}\?ws=\d+)"', search)
+        assert href is not None, search
+        chat = client.get(href.group(1)).text
+        shell = client.get(
+            f"/shell/{_ShellSessionStub.SESSION_ID}",
+            params={
+                "from": _hidden_input(chat, "back_url"),
+                "label": _hidden_input(chat, "back_label"),
+            },
+        ).text
+
+    assert f'action="/chat/{provider}/{conversation_id}/generate-task"' in shell
+    assert f'<input type="hidden" name="ws" value="{ws_id}">' in shell
 
 
 def test_chat_fork_form_carries_back_nav_hidden_inputs(monkeypatch):

@@ -16,8 +16,9 @@ which is what load_sessions expects in a key.
 from __future__ import annotations
 
 import threading
-import time
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -79,22 +80,58 @@ def _build_resume_command(provider: str, conversation_id: str) -> list[str] | No
 
 
 #: A chat whose store was written this recently is still in progress, so its
-#: discussion is not finished and it cannot become a task yet.
-LIVE_WINDOW_S = 120
-
-
-def _is_live(key: str) -> bool:
-    mtime = history.session_mtime(key)
-    return mtime is not None and time.time() - mtime <= LIVE_WINDOW_S
-
-
 def _generate_message(ws_name: str, ws_path: Path) -> str:
     """The confirm dialog text for Generate Task. It names the target workspace."""
     return (
         "Generate a task from this chat?\n\n"
-        "Task requirements will be generated automatically from this conversation. "
-        "Ensure the idea is thoroughly fleshed out before you proceed.\n\n"
-        f"Target workspace: {ws_name} ({ws_path})"
+        "Task requirements will be automatically generated from this conversation. "
+        "Ensure the chat is finished and the ideas are thoroughly fleshed out "
+        "before you proceed.\n\n"
+        f"Target workspace: {ws_name}\nPath: {ws_path}"
+    )
+
+
+@dataclass(frozen=True)
+class GenerateTaskOffer:
+    """A chat's registered workspace, and the Generate Task state for it."""
+
+    provider: str
+    conversation_id: str
+    ws_id: int
+    ws_name: str
+    ws_path: Path
+    message: str  # the confirm dialog text
+
+    @property
+    def conversation_segment(self) -> str:
+        """The conversation id as one percent-encoded URL path segment."""
+        return quote(self.conversation_id, safe="")
+
+
+def generate_task_offer(
+    provider: str, conversation_id: str, raw_ws: str | None
+) -> GenerateTaskOffer | None:
+    """The workspace context for a chat reached with ``?ws=<raw_ws>``, or None.
+
+    None when there is no ``ws`` parameter, it is not an integer, or it names no
+    registered workspace. Liveness is read only once the workspace resolves.
+    """
+    if raw_ws is None:
+        return None
+    try:
+        ws_id = int(raw_ws)
+    except ValueError:
+        return None
+    ws_path = task_service.resolve_workspace(ws_id)
+    if ws_path is None:
+        return None
+    return GenerateTaskOffer(
+        provider=provider,
+        conversation_id=conversation_id,
+        ws_id=ws_id,
+        ws_name=ws_path.name,
+        ws_path=ws_path,
+        message=_generate_message(ws_path.name, ws_path),
     )
 
 
@@ -125,35 +162,20 @@ def chat_page(request: Request, provider: str, conversation_id: str):
 
     # Back-nav (3c pattern) to the workspace the chat list lives on, when the
     # referral carries ``?ws=<id>``; without it, fall back to the homepage.
-    ws_id: int | None = None
-    ws_name: str | None = None
-    ws_path_resolved: Path | None = None
-    raw_ws = request.query_params.get("ws")
-    if raw_ws is not None:
-        try:
-            ws_path_resolved = task_service.resolve_workspace(int(raw_ws))
-        except ValueError:
-            ws_path_resolved = None
-        if ws_path_resolved is not None:
-            ws_id = int(raw_ws)
-            ws_name = ws_path_resolved.name
+    # The same workspace context also drives Generate Task (see the helper).
+    generate_task = generate_task_offer(provider, conversation_id, request.query_params.get("ws"))
+    ws_id = generate_task.ws_id if generate_task is not None else None
+    ws_name = generate_task.ws_name if generate_task is not None else None
 
     # Goal G7: the continue button launches the web shell in the chat's own
     # workspace when it is known (fixing the cwd='.' default: the *server's*
     # cwd, not the chat's).
-    chat_cwd = str(ws_path_resolved) if ws_path_resolved is not None else "."
-
-    # Generate Task: offered only with a known workspace (?ws=), and hidden
-    # while the chat is live. The mtime lookup is skipped without a workspace.
-    live = ws_id is not None and _is_live(search_key)
-    generate_message = ""
-    if ws_id is not None and ws_path_resolved is not None:
-        generate_message = _generate_message(ws_name, ws_path_resolved)
+    chat_cwd = str(generate_task.ws_path) if generate_task is not None else "."
 
     # The shell page's back link is this page, reached through ``?from=``, so
     # the payload must re-carry ``?ws=``; without it the round trip lands on
     # the bare transcript and the header degrades to the "Workspaces" homepage.
-    back_url = f"/chat/{provider}/{conversation_id}"
+    back_url = f"/chat/{provider}/{quote(conversation_id, safe='')}"
     if ws_id is not None:
         back_url = f"{back_url}?ws={ws_id}"
 
@@ -171,8 +193,7 @@ def chat_page(request: Request, provider: str, conversation_id: str):
             "ws_id": ws_id,
             "ws_name": ws_name,
             "chat_cwd": chat_cwd,
-            "live": live,
-            "generate_message": generate_message,
+            "generate_task": generate_task,
         },
     )
 
@@ -188,7 +209,7 @@ def generate_task(
 
     Refusals, in order: 404 for an unknown provider, an unregistered workspace,
     or a missing transcript; 400 when the confirm dialog did not say yes; 409
-    when the chat is live or a generation for it is already running. The run is
+    when a generation for it is already running. The run is
     the ``generate-task`` CLI, detached, so this request never waits on it.
     """
     if provider not in _VALID_HISTORY_PROVIDERS:
@@ -200,11 +221,6 @@ def generate_task(
         return HTMLResponse("Generate Task needs confirmation", status_code=400)
 
     key = f"{provider}:{conversation_id}"
-    if _is_live(key):
-        return HTMLResponse(
-            "This chat is still in progress. Finish the discussion, then generate.",
-            status_code=409,
-        )
     try:
         transcript = history.load_sessions([key]).get(key)
     except history.HistoryError as e:

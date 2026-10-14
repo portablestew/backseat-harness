@@ -1,0 +1,14 @@
+<script>
+  (() => {
+    const form = document.getElementById('generate-task-form');
+    const message = {{ generate_task.message|tojson }};
+    form.addEventListener('submit', (e) => {
+      if (!window.confirm(message)) {
+        e.preventDefault();
+        return;
+      }
+      form.querySelector('input[name="confirmed"]').value = 'yes';
+      form.querySelector('button').disabled = true;
+    });
+  })();
+</script>

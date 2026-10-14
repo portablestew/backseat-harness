@@ -13,6 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from backseat_harness import marker
 from backseat_harness.providers import binary_for, on_path_providers
@@ -620,9 +621,17 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
             rows.append(_task_row(result, lane, ws_paths))
         else:
             provider = _extract_provider_from_key(result.key) or ""
+            # A chat in a registered workspace carries ``?ws=`` so its transcript
+            # can offer Generate Task; an unmapped chat stays bare.
+            ws_id = None
+            if result.project:
+                ws_id = ws_paths.get(workspace_service._normalize(result.project))
+            href = f"/chat/{provider}/{quote(result.native_id, safe='')}"
+            if ws_id is not None:
+                href = f"{href}?ws={ws_id}"
             rows.append(
                 HomepageResult(
-                    href=f"/chat/{provider}/{result.native_id}",
+                    href=href,
                     prompt=result.prompt,
                     provider=provider,
                     mtime=result.mtime,

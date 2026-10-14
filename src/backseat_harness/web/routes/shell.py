@@ -9,13 +9,18 @@ import json
 import queue
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import APIRouter, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from backseat_harness.web.routes.chat import (
+    _VALID_HISTORY_PROVIDERS,
+    GenerateTaskOffer,
+    generate_task_offer,
+)
 from backseat_harness.web.shell.manager import PTYSessionManager
 
 router = APIRouter()
@@ -74,6 +79,44 @@ def _is_safe_relative(url: str) -> bool:
         and not url.startswith("//")
         and _URL_UNSAFE_RE.search(url) is None
     )
+
+
+def parse_chat_back(url: str) -> tuple[str, str, int] | None:
+    """(provider, conversation_id, ws_id) when ``url`` is a chat reached with ``?ws=N``.
+
+    Only the exact shape ``/chat/<provider>/<conversation_id>?ws=<N>`` counts:
+    one ``ws`` of digits that is at least 1, a known provider, and percent-encoded
+    segments decoded once. Anything else returns None, and so does a safe-looking
+    URL whose workspace is unregistered (that check runs in ``generate_task_offer``).
+    """
+    if not _is_safe_relative(url):
+        return None
+    parts = urlsplit(url)
+    if parts.fragment:
+        return None
+    segments = parts.path.split("/")
+    if len(segments) != 4 or segments[0] != "" or segments[1] != "chat":
+        return None
+    provider = unquote(segments[2])
+    conversation_id = unquote(segments[3])
+    if provider not in _VALID_HISTORY_PROVIDERS or not conversation_id or "/" in conversation_id:
+        return None
+    ws_values = parse_qs(parts.query, keep_blank_values=True).get("ws", [])
+    if len(ws_values) != 1 or not re.fullmatch(r"[0-9]+", ws_values[0]):
+        return None
+    ws_id = int(ws_values[0])
+    if ws_id < 1:
+        return None
+    return provider, conversation_id, ws_id
+
+
+def _generate_task_for(back_url: str) -> GenerateTaskOffer | None:
+    """The Generate Task offer for a chat back URL, or None for any other page."""
+    parsed = parse_chat_back(back_url)
+    if parsed is None:
+        return None
+    provider, conversation_id, ws_id = parsed
+    return generate_task_offer(provider, conversation_id, str(ws_id))
 
 
 def _label_for_path(path: str) -> str:
@@ -155,6 +198,7 @@ def shell_page(request: Request, session_id: str):
             "title": _shell_title(request, " ".join(session.cmd)),
             "back_url": back_url,
             "back_label": back_label,
+            "generate_task": _generate_task_for(back_url),
         },
     )
 

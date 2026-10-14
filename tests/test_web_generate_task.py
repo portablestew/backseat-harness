@@ -62,11 +62,10 @@ def spawned(monkeypatch):
 
 @pytest.fixture
 def chat(monkeypatch):
-    """A readable chat that was last written long ago, so it is not live."""
+    """A readable chat."""
     monkeypatch.setattr(
         history, "load_sessions", lambda keys, providers=None: {k: TRANSCRIPT for k in keys}
     )
-    monkeypatch.setattr(history, "session_mtime", lambda key: time.time() - 3600)
 
 
 def _client() -> TestClient:
@@ -153,17 +152,17 @@ def test_button_is_hidden_without_a_workspace(chat):
     assert "✨ Task" not in html
 
 
-def test_button_is_hidden_for_a_live_chat(workspace, monkeypatch):
+def test_button_shows_for_a_chat_written_just_now(workspace, monkeypatch):
+    """No liveness rule: a chat written a moment ago still offers Generate Task."""
     monkeypatch.setattr(
         history, "load_sessions", lambda keys, providers=None: {k: TRANSCRIPT for k in keys}
     )
-    monkeypatch.setattr(history, "session_mtime", lambda key: time.time())
     ws_id = _register(workspace)
 
     with _client() as client:
         html = client.get(f"/chat/opencode/ses_gen?ws={ws_id}").text
 
-    assert 'id="generate-task-form"' not in html
+    assert 'id="generate-task-form"' in html
 
 
 def test_dialog_states_the_rules_and_names_the_workspace_path(workspace, chat):
@@ -173,10 +172,13 @@ def test_dialog_states_the_rules_and_names_the_workspace_path(workspace, chat):
         html = client.get(f"/chat/opencode/ses_gen?ws={ws_id}").text
 
     message = _confirm_message(html)
-    assert "Task requirements will be generated automatically" in message
-    assert "Ensure the idea is thoroughly fleshed out before you proceed." in message
+    assert "Task requirements will be automatically generated from this conversation." in message
+    assert (
+        "Ensure the chat is finished and the ideas are thoroughly fleshed out before you proceed."
+        in message
+    )
     assert "a few minutes" not in message
-    assert f"Target workspace: {workspace.name} ({workspace.resolve()})" in message
+    assert f"Target workspace: {workspace.name}\nPath: {workspace.resolve()}" in message
 
 
 # --- the endpoint ---------------------------------------------------------------
@@ -272,18 +274,6 @@ def test_bad_session_id_is_404_and_spawns_nothing(workspace, chat, spawned, monk
     assert _gen_dirs(workspace) == []
 
 
-def test_live_chat_is_409_and_spawns_nothing(workspace, chat, spawned, monkeypatch):
-    monkeypatch.setattr(history, "session_mtime", lambda key: time.time())
-    ws_id = _register(workspace)
-
-    with _client() as client:
-        resp = _post(client, "opencode", "ses_gen", ws=ws_id, confirmed="yes")
-
-    assert resp.status_code == 409
-    assert spawned == []
-    assert _gen_dirs(workspace) == [], "a refused live chat must not claim a staging dir"
-
-
 def test_concurrent_submits_for_one_chat_spawn_exactly_once(workspace, chat, spawned, monkeypatch):
     """Double-submit race (4c note): six POSTs at once must spawn one generation.
 
@@ -348,7 +338,3 @@ def test_an_interrupted_generation_does_not_block_a_new_one(workspace, chat, spa
     assert len(spawned) == 1
 
 
-def test_session_mtime_is_none_for_a_malformed_or_unknown_key():
-    assert history.session_mtime("no-colon-here") is None
-    assert history.session_mtime("opencode:") is None
-    assert history.session_mtime("not_a_provider:ses_x") is None
