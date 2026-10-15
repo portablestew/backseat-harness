@@ -3576,14 +3576,14 @@ def test_search_results_fragment_interleaves_task_and_other_rows(
         f'<h4>search-lane</h4><a href="/ws/{ws_id}/tasks/search-lane">'
         "goal for search lane</a>"
     )
-    assert task_cells[1].strip() == "opencode"
+    assert task_cells[3].strip() == "opencode"
 
     # The other-chat row: parsed prompt, provider, plain N/A, chat link.
     assert 'data-href="/chat/opencode/ses_plain"' in html
     assert "a plain chat about refactors" in html
     assert "N/A" in html
     plain_row = next(r for r in _data_rows(html) if "ses_plain" in r)
-    assert _cells(plain_row)[1].strip() == "opencode"
+    assert _cells(plain_row)[3].strip() == "opencode"
 
     # Chat-search order is preserved: the task row precedes the other row.
     assert html.index("goal for search lane") < html.index("a plain chat about refactors")
@@ -3680,7 +3680,7 @@ def test_search_results_collapses_operator_chat_into_task_row(
     task_row = next(r for r in _data_rows(html) if "op-lane" in r)
     cells = re.findall(r"<td\b[^>]*>(.*?)</td>", task_row, re.S)
     assert cells[0].startswith("<h4>op-lane</h4>")
-    assert cells[1].strip() == "opencode"
+    assert cells[3].strip() == "opencode"
 
 
 def test_search_results_drops_operator_chat_without_a_task(monkeypatch):
@@ -3752,7 +3752,7 @@ def test_search_results_recovers_workspace_dir_from_the_provider_store(
     # The Provider column shows the chat's provider, not the lane name.
     row = next(r for r in _data_rows(resp.text) if "recovered-lane" in r)
     cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
-    assert cells[1].strip() == "claude_code"
+    assert cells[3].strip() == "claude_code"
 
 
 def test_search_plain_chat_in_a_registered_workspace_links_with_ws(
@@ -3788,7 +3788,7 @@ def test_search_plain_chat_in_an_unmapped_project_stays_bare(
 def test_search_results_workspace_column_names_the_registered_workspace(
     monkeypatch, workspace: Path, tmp_path: Path
 ):
-    """The Workspace column sits between Provider and Status and names the
+    """The Workspace column sits between Prompt and Status and names the
     registered workspace the hit's project maps to -- the full path rides the
     cell's tooltip. A project outside every registered workspace reads N/A,
     the same fallback the Status column uses for a plain chat."""
@@ -3811,15 +3811,15 @@ def test_search_results_workspace_column_names_the_registered_workspace(
     html = resp.text
     assert resp.status_code == 200
     assert (
-        "<th>Prompt</th><th>Provider</th><th>Workspace</th>"
-        "<th>Status</th><th>Updated</th>" in html
+        "<th>Prompt</th><th>Workspace</th><th>Status</th>"
+        "<th>Provider</th><th>Updated</th>" in html
     )
 
     def _workspace_cell(conversation_id: str) -> str:
         row = next(r for r in _data_rows(html) if conversation_id in r)
         cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
-        assert len(cells) == 5  # prompt, provider, workspace, status, updated
-        return cells[2].strip()
+        assert len(cells) == 5  # prompt, workspace, status, provider, updated
+        return cells[1].strip()
 
     resolved = str(workspace.resolve())
     assert _workspace_cell("ses_in_ws") == (
