@@ -58,6 +58,25 @@ def test_extract_text_prefers_terminal_result():
         '{"type":"result","result":"final answer","session_id":"s1"}\n'
     )
     assert p.extract_text(stdout) == "final answer"
+
+
+def test_extract_text_prefers_last_result_over_an_earlier_waiting_turn():
+    # A multi-turn headless run (a wakeup wait, a subagent hand-back) emits
+    # several result events; the earlier ones are status lines, and the final
+    # one is the answer. Taking the first parked a real generation whose
+    # envelope arrived on a later turn (see manager.py's envelope contract).
+    p = ClaudeProvider()
+    stdout = (
+        '{"type":"result","result_index":0,'
+        '"result":"Review is pending; waiting for the reviewer.",'
+        '"session_id":"s1"}\n'
+        '{"type":"result","result_index":1,'
+        '"result":"{\\"v\\": 1, \\"phase\\": \\"generate\\", \\"approved\\": true}",'
+        '"session_id":"s1"}\n'
+    )
+    assert p.extract_text(stdout) == '{"v": 1, "phase": "generate", "approved": true}'
+
+
 def test_extract_text_empty_result_falls_back_to_assistant_blocks():
     p = ClaudeProvider()
     stdout = (

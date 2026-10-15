@@ -130,8 +130,15 @@ class KiroProvider(Provider):
         ``agent_message_chunk`` text parts in order -- they are fragments of
         one message, so they join without a separator. Falls back to raw
         stdout so parse failures stay visible instead of silently empty.
+
+        Kiro can run subagents, so one invocation can end more than one
+        ``runFinished``: the earlier ones are intermediate turns, and the last
+        is the run's answer. The last non-empty ``finalText`` wins, matching
+        ``parse_result``'s last-wins session id; returning the first used to
+        hand an intermediate turn to the caller's verdict/envelope parser.
         """
         chunks: list[str] = []
+        terminal: str | None = None
         for event in _iter_events(stdout):
             data = event.get("data")
             if not isinstance(data, dict):
@@ -139,7 +146,8 @@ class KiroProvider(Provider):
             if event.get("type") == "runFinished":
                 final = data.get("finalText")
                 if isinstance(final, str) and final:
-                    return final
+                    terminal = final
+                continue
             update = data.get("update")
             if not isinstance(update, dict):
                 continue
@@ -151,6 +159,8 @@ class KiroProvider(Provider):
             text = content.get("text")
             if isinstance(text, str):
                 chunks.append(text)
+        if terminal is not None:
+            return terminal
         return "".join(chunks) if chunks else stdout
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:

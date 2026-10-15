@@ -195,6 +195,23 @@ def test_extract_text_full_stream_returns_run_finished_final_text():
     assert p.extract_text(_ONESHOT) == "OK-9. Marker: KIROMARK9X42."
 
 
+def test_extract_text_prefers_last_run_finished_across_subagent_turns():
+    # Kiro can run subagents, so one invocation can emit more than one
+    # runFinished. The earlier ones are intermediate turns and the answer is the
+    # last; returning the first handed an intermediate turn to the caller's
+    # verdict/envelope parser.
+    p = KiroProvider()
+    stdout = (
+        '{"type":"runFinished","data":{"sessionId":"' + _SESSION + '",'
+        '"status":"success","stopReason":"end_turn",'
+        '"finalText":"Waiting for the reviewer."}}\n'
+        '{"type":"runFinished","data":{"sessionId":"' + _SESSION + '",'
+        '"status":"success","stopReason":"end_turn",'
+        '"finalText":"{\\"v\\": 1, \\"phase\\": \\"generate\\", \\"approved\\": true}"}}\n'
+    )
+    assert p.extract_text(stdout) == '{"v": 1, "phase": "generate", "approved": true}'
+
+
 def test_resume_stream_parses_to_same_session_and_final_text():
     p = KiroProvider()
     assert p.parse_result(0, _RESUME, "") == _SESSION

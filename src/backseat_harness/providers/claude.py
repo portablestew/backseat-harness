@@ -65,14 +65,23 @@ class ClaudeProvider(Provider):
         Prefers the terminal ``result`` object's ``result`` field; otherwise
         concatenates assistant text blocks. Falls back to raw stdout so parse
         failures stay visible instead of silently empty.
+
+        A headless run is multi-turn when the agent waits on a wakeup or a
+        subagent hand-back, so the stream can carry several ``result`` events
+        and the earlier ones are intermediate status lines, not the answer. The
+        last non-empty ``result`` wins, matching ``parse_result``'s last-wins
+        session id. Returning the first one used to hand the manager's
+        "waiting" turn to the envelope parser and park the generation.
         """
         chunks: list[str] = []
+        terminal: str | None = None
         for event in _iter_events(stdout):
             value = event.get("result")
             # An empty ``result`` is not terminal: fall through to the
             # assistant blocks below, like kiro does with ``finalText``.
             if event.get("type") == "result" and isinstance(value, str) and value:
-                return value
+                terminal = value
+                continue
             message = event.get("message")
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
@@ -85,6 +94,8 @@ class ClaudeProvider(Provider):
                         text = block.get("text")
                         if isinstance(text, str):
                             chunks.append(text)
+        if terminal is not None:
+            return terminal
         return "\n".join(chunks) if chunks else stdout
 
     def interactive_command(self, native_session_id: str | None) -> list[str]:
