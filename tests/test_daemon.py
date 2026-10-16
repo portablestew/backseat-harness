@@ -298,7 +298,7 @@ def test_cmd_daemon_forwards_debug_to_the_instance(monkeypatch):
         def __init__(self, **kwargs):
             seen.append(bool(kwargs.get("debug")))
 
-        def run(self) -> None:
+        def run(self, on_claimed=None, on_release=None) -> None:
             return None
 
     monkeypatch.setattr(cli, "Daemon", FakeDaemon)
@@ -319,7 +319,7 @@ def test_cmd_daemon_without_web_never_starts_the_web_stack(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def run(self) -> None:
+        def run(self, on_claimed=None, on_release=None) -> None:
             return None
 
     started: list[tuple] = []
@@ -738,6 +738,332 @@ def test_daemon_run_web_refuses_when_port_busy(tmp_path: Path):
     assert rc == 2, "a busy port is a pre-run refusal, not a half-started daemon"
     with db.open_db() as conn:
         assert db._daemon_record(conn) is None, "no guard may be claimed on refusal"
+
+
+@pytest.mark.parametrize(
+    "flag, expected",
+    [
+        ([], None),
+        (["--web"], "auto"),
+        (["--web=none"], "none"),
+        (["--web=auto"], "auto"),
+        (["--web=direct"], "direct"),
+        (["--web=caddy"], "caddy"),
+    ],
+)
+def test_daemon_run_web_flag_forms(flag, expected):
+    """Bare --web is auto, =MODE picks the mode, and absence leaves args without it."""
+    import backseat_harness.cli as cli
+
+    args = cli._build_parser().parse_args(["daemon", "run", *flag])
+    assert getattr(args, "web", None) == expected
+
+
+@pytest.mark.parametrize("flag", [["--web=bogus"], ["--web", "bogus"], ["--web=true"]])
+def test_daemon_run_web_invalid_forms_exit_2(flag):
+    import backseat_harness.cli as cli
+
+    with pytest.raises(SystemExit) as info:
+        cli._build_parser().parse_args(["daemon", "run", *flag])
+    assert info.value.code == 2
+
+
+def _web_workspace(tmp_path: Path, web_port: int) -> Path:
+    ws = tmp_path / "ws"
+    (ws / ".backseat").mkdir(parents=True)
+    (ws / ".backseat" / "config.toml").write_text(f"[web]\nport = {web_port}\n", encoding="utf-8")
+    return ws
+
+
+def _write_caddyfile(site_port: int, web_port: int) -> Path:
+    from backseat_harness.web import caddy as caddy_mod
+
+    path = caddy_mod.caddyfile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"site.lan:{site_port} {{\n\treverse_proxy 127.0.0.1:{web_port}\n}}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _spy_web(monkeypatch, events: list[str]) -> list[tuple[str, ...]]:
+    """Replace the embedded web server with a recorder; returns the extra_hosts it saw."""
+    from backseat_harness.web import cli as web_cli
+
+    seen: list[tuple[str, ...]] = []
+
+    class _Handle:
+        def stop(self) -> None:
+            events.append("web-stop")
+
+    def start(host="127.0.0.1", port=8090, extra_hosts=()):
+        events.append("web-start")
+        seen.append(tuple(extra_hosts))
+        return _Handle()
+
+    monkeypatch.setattr(web_cli, "start_web_in_thread", start)
+    return seen
+
+
+def _stop_once_caddy_runs(fake_caddy):
+    """on_turn that stops the daemon only after the stub has recorded ``caddy run``.
+
+    The stub logs its argv once Python has started, which is after the spawn
+    returns; stopping sooner races the child and can leave no record at all.
+    """
+    deadline = time.monotonic() + 20.0
+
+    def on_turn(d: Daemon) -> None:
+        started = any(argv[0] == "run" for argv in fake_caddy.calls())
+        if not started and time.monotonic() < deadline:
+            time.sleep(0.05)
+            return
+        d.stop()
+
+    return on_turn
+
+
+def _daemon_factory(on_turn):
+    """A real Daemon (fixed pid and start, so no psutil) whose pump calls on_turn once per turn."""
+
+    def make(debug: bool = False) -> Daemon:
+        holder: dict[str, Daemon] = {}
+
+        def wait(timeout):
+            on_turn(holder["d"])
+            return True
+
+        holder["d"] = Daemon(sched=Scheduler(wait=wait), pid=777, start=5000.0, debug=debug)
+        return holder["d"]
+
+    return make
+
+
+@pytest.mark.parametrize(
+    "case, web_flag, expected",
+    [
+        ("no-binary", ["--web"], "not on PATH"),
+        ("validate-fail", ["--web"], "rejected"),
+        ("busy-site-port", ["--web"], "already in use"),
+        ("no-caddyfile", ["--web=caddy"], "needs a caddyfile"),
+    ],
+)
+def test_daemon_caddy_refusals_exit_2_without_guard(
+    case, web_flag, expected, fake_caddy, monkeypatch, tmp_path, capsys
+):
+    """Every caddy pre-claim refusal exits 2, names its cause, and leaves the guard alone."""
+    import socket
+
+    import backseat_harness.cli as cli
+
+    site_port, web_port = _free_port(), _free_port()
+    ws = _web_workspace(tmp_path, web_port)
+    if case != "no-caddyfile":
+        _write_caddyfile(site_port, web_port)
+    if case == "no-binary":
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    if case == "validate-fail":
+        fake_caddy.mode("validate_fail")
+    blocker = None
+    if case == "busy-site-port":
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", site_port))
+        blocker.listen(1)
+
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", *web_flag])
+    try:
+        rc = args.func(args)
+    finally:
+        if blocker is not None:
+            blocker.close()
+
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert expected in (out + err)
+    with db.open_db() as conn:
+        assert db._daemon_record(conn) is None, "no guard may be claimed on refusal"
+    assert not any(argv[0] == "run" for argv in fake_caddy.calls()), "no caddy may start"
+
+
+def test_daemon_run_web_auto_without_caddyfile_stays_direct(monkeypatch, tmp_path):
+    """Bare --web with no caddyfile is direct mode: no extra hosts, no caddy child."""
+    import backseat_harness.cli as cli
+    from backseat_harness.web import caddy as caddy_mod
+
+    events: list[str] = []
+    web_seen = _spy_web(monkeypatch, events)
+    monkeypatch.setattr(caddy_mod, "start", _boom_caddy_start)
+    monkeypatch.setattr(cli, "Daemon", _daemon_factory(lambda d: d.stop()))
+
+    ws = _web_workspace(tmp_path, _free_port())
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+    assert args.func(args) == 0
+    assert web_seen == [()]
+    assert events == ["web-start", "web-stop"]
+
+
+def _boom_caddy_start(*args, **kwargs):
+    raise AssertionError("caddy must not start in direct mode")
+
+
+def test_daemon_caddy_starts_after_claim_and_stops_before_web(fake_caddy, monkeypatch, tmp_path):
+    """Order: web up pre-claim, claim, caddy after the claim, caddy stopped before web."""
+    import backseat_harness.cli as cli
+    from backseat_harness.web import caddy as caddy_mod
+
+    site_port, web_port = _free_port(), _free_port()
+    ws = _web_workspace(tmp_path, web_port)
+    _write_caddyfile(site_port, web_port)
+    events: list[str] = []
+    web_seen = _spy_web(monkeypatch, events)
+
+    real_claim = Daemon.claim
+
+    def claim(self):
+        events.append("claim")
+        real_claim(self)
+
+    real_start = caddy_mod.start
+
+    def start(*args, **kwargs):
+        events.append("caddy-start")
+        handle = real_start(*args, **kwargs)
+        real_stop = handle.stop
+
+        def stop(timeout=caddy_mod._STOP_GRACE_S):
+            events.append("caddy-stop")
+            real_stop(timeout)
+
+        handle.stop = stop
+        return handle
+
+    monkeypatch.setattr(Daemon, "claim", claim)
+    monkeypatch.setattr(caddy_mod, "start", start)
+    monkeypatch.setattr(cli, "Daemon", _daemon_factory(_stop_once_caddy_runs(fake_caddy)))
+
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+    assert args.func(args) == 0
+    assert events == ["web-start", "claim", "caddy-start", "caddy-stop", "web-stop"]
+    assert web_seen == [(f"site.lan:{site_port}",)]
+    assert [argv[0] for argv in fake_caddy.calls()] == ["validate", "run"]
+
+
+def test_daemon_survives_caddy_death(fake_caddy, monkeypatch, tmp_path, fake_home):
+    """A caddy that dies under the daemon is logged; the daemon keeps its guard and pumps on."""
+    import backseat_harness.cli as cli
+
+    fake_caddy.mode("die_after")
+    site_port, web_port = _free_port(), _free_port()
+    ws = _web_workspace(tmp_path, web_port)
+    _write_caddyfile(site_port, web_port)
+    _spy_web(monkeypatch, [])
+    daemon_log = fake_home / ".backseat" / "daemon.log"
+    guards: list[object] = []
+    deadline = time.monotonic() + 20.0
+
+    def on_turn(d: Daemon) -> None:
+        logged = daemon_log.exists() and "caddy exited" in daemon_log.read_text(encoding="utf-8")
+        if not logged and time.monotonic() < deadline:
+            time.sleep(0.05)
+            return
+        with db.open_db() as conn:
+            guards.append(db.kv_get(conn, db.DAEMON_KEY))
+        d.stop()
+
+    monkeypatch.setattr(cli, "Daemon", _daemon_factory(on_turn))
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+    assert args.func(args) == 0
+
+    assert "caddy exited rc=3" in daemon_log.read_text(encoding="utf-8")
+    assert guards and guards[0] is not None, "the daemon must still hold its guard after caddy died"
+
+
+def test_daemon_stops_caddy_before_guard_release(fake_caddy, monkeypatch, tmp_path, fake_home):
+    """caddy is stopped, and its process gone, before the guard is cleared."""
+    import psutil
+
+    import backseat_harness.cli as cli
+    from backseat_harness.web import caddy as caddy_mod
+
+    site_port, web_port = _free_port(), _free_port()
+    ws = _web_workspace(tmp_path, web_port)
+    _write_caddyfile(site_port, web_port)
+    events: list[str] = []
+    web_seen = _spy_web(monkeypatch, events)
+    caddy_pids: list[int] = []
+    alive_at_release: list[bool] = []
+
+    real_start = caddy_mod.start
+
+    def start(*args, **kwargs):
+        events.append("caddy-start")
+        handle = real_start(*args, **kwargs)
+        caddy_pids.append(handle.pid)
+        real_stop = handle.stop
+
+        def stop(timeout=caddy_mod._STOP_GRACE_S):
+            events.append("caddy-stop")
+            real_stop(timeout)
+
+        handle.stop = stop
+        return handle
+
+    real_clear = db.clear_daemon
+
+    def clear(conn, pid, start_time):
+        events.append("guard-release")
+        alive_at_release.append(psutil.pid_exists(caddy_pids[0]))
+        real_clear(conn, pid, start_time)
+
+    monkeypatch.setattr(caddy_mod, "start", start)
+    monkeypatch.setattr(db, "clear_daemon", clear)
+    monkeypatch.setattr(cli, "Daemon", _daemon_factory(_stop_once_caddy_runs(fake_caddy)))
+
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+    assert args.func(args) == 0
+
+    assert events == ["web-start", "caddy-start", "caddy-stop", "guard-release", "web-stop"]
+    assert alive_at_release == [False], "caddy must be gone before the guard is released"
+    assert web_seen == [(f"site.lan:{site_port}",)]
+
+
+def test_daemon_caddy_spawn_failure_exits_2_and_releases_guard(
+    fake_caddy, monkeypatch, tmp_path, fake_home, capsys
+):
+    """A caddy that validates but cannot spawn is a refusal: exit 2, message, guard released."""
+    import subprocess
+
+    import backseat_harness.cli as cli
+    from backseat_harness.web import caddy as caddy_mod
+
+    site_port, web_port = _free_port(), _free_port()
+    ws = _web_workspace(tmp_path, web_port)
+    _write_caddyfile(site_port, web_port)
+    events: list[str] = []
+    _spy_web(monkeypatch, events)
+
+    real_popen = subprocess.Popen
+
+    def popen(argv, *args, **kwargs):
+        # Only the spawn of `caddy run` fails; validate still runs the stub.
+        if len(argv) > 1 and argv[1] == "run":
+            raise PermissionError(13, "Permission denied")
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(caddy_mod.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli, "Daemon", _daemon_factory(lambda d: d.stop()))
+
+    args = cli._build_parser().parse_args(["-C", str(ws), "daemon", "run", "--web"])
+    rc = args.func(args)
+
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert "caddy could not start" in (out + err)
+    assert "Permission denied" in (out + err)
+    assert events == ["web-start", "web-stop"], "uvicorn still stops after the refusal"
+    with db.open_db() as conn:
+        assert db._daemon_record(conn) is None, "the guard must be released after the refusal"
 
 
 def test_daemon_module_does_not_import_web():

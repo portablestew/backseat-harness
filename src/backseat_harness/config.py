@@ -75,7 +75,7 @@ DEFAULT_OPERATOR_RETRY_BUDGET = 3
 
 # Web interface defaults (task web-interface §3): localhost-only.
 DEFAULT_WEB_HOST = "127.0.0.1"
-DEFAULT_WEB_PORT = 8080
+DEFAULT_WEB_PORT = 8090
 _ALLOWED_WEB_HOSTS = {"127.0.0.1", "localhost"}
 
 

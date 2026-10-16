@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import socket
 import threading
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Protocol
 
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
 _STOP_JOIN_S = 5.0
+
+#: How often run_web's foreground loop re-checks the sidecar and the server thread.
+_WAIT_S = 0.2
 
 #: Thread name of the embedded server; the one identifiable seam a probe or
 #: test can look for.
@@ -34,6 +39,9 @@ class WebHandle:
     def __init__(self, server: object, thread: threading.Thread) -> None:
         self._server = server
         self._thread = thread
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def stop(self, timeout: float = _STOP_JOIN_S) -> None:
         """Ask the server to exit and wait for the thread."""
@@ -60,7 +68,9 @@ def _ensure_port_free(host: str, port: int) -> None:
         raise OSError(f"web: {host}:{port} is already in use ({exc})") from exc
 
 
-def start_web_in_thread(host: str = "127.0.0.1", port: int = 8080) -> WebHandle:
+def start_web_in_thread(
+    host: str = "127.0.0.1", port: int = 8090, extra_hosts: Iterable[str] = ()
+) -> WebHandle:
     """Serve the web app on a daemon thread; return the handle that stops it.
 
     Same localhost-only contract as :func:`run_web` (never a non-loopback
@@ -80,7 +90,7 @@ def start_web_in_thread(host: str = "127.0.0.1", port: int = 8080) -> WebHandle:
 
     from backseat_harness.web.main import create_app
 
-    app = create_app(port=port)
+    app = create_app(port=port, extra_hosts=extra_hosts)
     server = uvicorn.Config(app, host=host, port=port, log_config=None)
     _ensure_port_free(host, port)
     uvicorn_server = uvicorn.Server(server)
@@ -89,13 +99,51 @@ def start_web_in_thread(host: str = "127.0.0.1", port: int = 8080) -> WebHandle:
     return WebHandle(uvicorn_server, thread)
 
 
-def run_web(host: str = "127.0.0.1", port: int = 8080, workspace: str | Path = ".") -> None:
-    """Run the web app with localhost-only binding (never 0.0.0.0)."""
-    if host not in _ALLOWED_HOSTS:
-        raise ValueError(f"refusing non-localhost bind: {host!r}")
-    import uvicorn
+class Sidecar(Protocol):
+    """A child process run beside the web server (caddy in caddy mode)."""
 
-    from backseat_harness.web.main import create_app
+    def stop(self) -> None: ...
 
-    app = create_app(port=port)
-    uvicorn.run(app, host=host, port=port)
+
+def run_web(
+    host: str = "127.0.0.1",
+    port: int = 8090,
+    workspace: str | Path = ".",
+    extra_hosts: Iterable[str] = (),
+    sidecar: Callable[[Callable[[int], None]], Sidecar] | None = None,
+) -> int:
+    """Serve the web app in this process until Ctrl-C; return the exit code.
+
+    Localhost-only binding (never 0.0.0.0). uvicorn runs on the web thread, so
+    this thread stays free for Ctrl-C and for watching the sidecar. ``sidecar``
+    (caddy mode) is called with an ``on_exit`` callback once the server is up,
+    and returns a handle with ``stop()``. A sidecar that dies stops the server
+    and makes the result 1. Shutdown stops the sidecar first, then uvicorn.
+
+    Returns 0 on Ctrl-C, or 1 when the sidecar died or the server thread ended
+    on its own.
+    """
+    web = start_web_in_thread(host=host, port=port, extra_hosts=extra_hosts)
+    sidecar_died: list[int] = []
+    done = threading.Event()
+
+    def on_exit(rc: int) -> None:
+        sidecar_died.append(rc)
+        done.set()
+
+    child = None
+    unexpected = False
+    try:
+        if sidecar is not None:
+            child = sidecar(on_exit)
+        while not done.wait(_WAIT_S):
+            if not web.is_alive():
+                unexpected = True
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if child is not None:
+            child.stop()
+        web.stop()
+    return 1 if sidecar_died or unexpected else 0

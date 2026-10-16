@@ -81,6 +81,116 @@ def test_foreign_origin_on_post_is_rejected():
     assert "forbidden origin" in resp.text
 
 
+# --- extra Host/Origin strings (caddy mode site addresses) ---------------------
+
+_EXTRA_HOST = "site.lan:8443"
+
+
+def test_extra_host_accepted_for_http_and_origin():
+    with TestClient(
+        create_app(port=_PORT, extra_hosts=(_EXTRA_HOST,)),
+        base_url=f"http://{_EXTRA_HOST}",
+    ) as client:
+        assert client.get("/").status_code == 200
+        resp = client.post(
+            "/workspaces",
+            data={"path": "/nowhere"},
+            headers={"Origin": f"https://{_EXTRA_HOST}"},
+        )
+        assert resp.status_code != 403
+        assert "forbidden origin" not in resp.text
+
+        foreign = client.get("/", headers={"Host": "evil.com"})
+    assert foreign.status_code == 403
+    assert "forbidden host" in foreign.text
+
+
+def test_extra_hosts_default_keeps_localhost_only():
+    with TestClient(create_app(port=_PORT), base_url=f"http://{_EXTRA_HOST}") as client:
+        resp = client.get("/")
+    assert resp.status_code == 403
+    assert "forbidden host" in resp.text
+
+
+def test_extra_hosts_still_reject_foreign_origin_on_http():
+    with TestClient(
+        create_app(port=_PORT, extra_hosts=(_EXTRA_HOST,)),
+        base_url=f"http://{_EXTRA_HOST}",
+    ) as client:
+        resp = client.post(
+            "/workspaces",
+            data={"path": "/nowhere"},
+            headers={"Origin": "http://evil.com"},
+        )
+    assert resp.status_code == 403
+    assert "forbidden origin" in resp.text
+
+
+def test_portless_extra_host_forms_are_accepted():
+    """Browsers leave :443 out of Host and Origin, so both forms of an https site pass."""
+    hosts = ("site.lan", "site.lan:443")
+    with TestClient(
+        create_app(port=_PORT, extra_hosts=hosts), base_url="https://site.lan"
+    ) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/", headers={"Origin": "https://site.lan"}).status_code == 200
+        assert client.get("/", headers={"Origin": "https://site.lan:443"}).status_code == 200
+
+
+def test_shell_websocket_accepts_extra_host_rejects_foreign(tmp_path: Path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with TestClient(
+        create_app(port=_PORT, extra_hosts=(_EXTRA_HOST,)),
+        base_url=f"http://{_EXTRA_HOST}",
+    ) as client:
+        session_id = _start_session(client, cmd, tmp_path)
+        url = f"ws://{_EXTRA_HOST}/ws/shell/{session_id}"
+        try:
+            # Positive control: the extra Origin connects.
+            with client.websocket_connect(url, headers={"origin": f"https://{_EXTRA_HOST}"}):
+                pass
+
+            with pytest.raises(WebSocketDisconnect):
+                with client.websocket_connect(url, headers={"origin": "http://evil.com"}):
+                    pass
+
+            with pytest.raises(WebSocketDisconnect):
+                with client.websocket_connect(url, headers={"host": "evil.com"}):
+                    pass
+        finally:
+            _kill_session(session_id)
+
+
+def test_runners_pass_extra_hosts_to_create_app(monkeypatch):
+    """run_web and start_web_in_thread both hand extra_hosts to create_app."""
+    import uvicorn
+
+    from backseat_harness.web import cli as web_cli
+    from backseat_harness.web import main as web_main
+
+    seen: list[tuple[str, ...]] = []
+    real_create_app = web_main.create_app
+
+    def spy(port: int = 8090, extra_hosts=()):
+        seen.append(tuple(extra_hosts))
+        return real_create_app(port=port, extra_hosts=extra_hosts)
+
+    class _StubServer:
+        def __init__(self, config):
+            self.should_exit = False
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(web_main, "create_app", spy)
+    monkeypatch.setattr(uvicorn, "Server", _StubServer)
+
+    web_cli.run_web(port=0, extra_hosts=[_EXTRA_HOST])
+    web_cli.start_web_in_thread(port=0, extra_hosts=[_EXTRA_HOST]).stop()
+
+    assert seen == [(_EXTRA_HOST,), (_EXTRA_HOST,)]
+
+
 # --- homepage workspace list (step 4.3, V4) ------------------------------------
 
 

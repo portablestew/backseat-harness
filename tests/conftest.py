@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -99,3 +101,93 @@ def task(config: Config):
     paths.goal.write_text("Build a thing.\n", encoding="utf-8")
     paths.checklist.write_text(json.dumps({"steps": {}, "remarks": []}), encoding="utf-8")
     return slug, paths
+
+
+# --- fake caddy ----------------------------------------------------------------
+
+#: The stub caddy. It records every invocation (argv and pid) in
+#: ``$CADDY_STUB_OUT/calls.jsonl`` and behaves by ``$CADDY_STUB_MODE``:
+#: ``exit_on_stop`` exits on the graceful signal, ``hang`` ignores it,
+#: ``spawn_child`` hangs and also starts a long-lived child (pid in child.pid),
+#: ``die_after`` exits 3 after a second, ``validate_fail`` makes ``validate`` fail.
+_CADDY_STUB = r"""
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+
+out = Path(os.environ["CADDY_STUB_OUT"])
+mode = os.environ.get("CADDY_STUB_MODE", "exit_on_stop")
+argv = sys.argv[1:]
+with (out / "calls.jsonl").open("a") as calls:
+    calls.write(json.dumps({"argv": argv, "pid": os.getpid()}) + "\n")
+
+if argv[:1] == ["validate"]:
+    if mode == "validate_fail":
+        print("Error: unrecognized directive: bogus", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+graceful = signal.SIGBREAK if os.name == "nt" else signal.SIGTERM
+hang = mode in ("hang", "spawn_child")
+
+
+def on_graceful(signum, frame):
+    if not hang:
+        sys.exit(0)
+
+
+signal.signal(graceful, on_graceful)
+if mode == "die_after":
+    time.sleep(1.0)
+    sys.exit(3)
+if mode == "spawn_child":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    (out / "child.pid").write_text(str(child.pid))
+(out / "run.pid").write_text(str(os.getpid()))
+while True:
+    time.sleep(0.2)
+"""
+
+
+class FakeCaddy:
+    """Handle on the stub on PATH: switch its mode, read its recorded calls and pids."""
+
+    def __init__(self, out: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.out = out
+        self._monkeypatch = monkeypatch
+
+    def mode(self, name: str) -> None:
+        self._monkeypatch.setenv("CADDY_STUB_MODE", name)
+
+    def calls(self) -> list[list[str]]:
+        log = self.out / "calls.jsonl"
+        if not log.exists():
+            return []
+        return [json.loads(line)["argv"] for line in log.read_text(encoding="utf-8").splitlines()]
+
+    def pid(self, name: str) -> int:
+        """Pid the stub wrote for ``run`` (``run.pid``) or its child (``child.pid``)."""
+        return int((self.out / f"{name}.pid").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def fake_caddy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeCaddy:
+    """A ``caddy`` executable on PATH that runs the stub under this interpreter."""
+    bin_dir = tmp_path / "caddy_bin"
+    bin_dir.mkdir()
+    out = tmp_path / "caddy_out"
+    out.mkdir()
+    stub = bin_dir / "caddy_stub.py"
+    stub.write_text(_CADDY_STUB, encoding="utf-8")
+    python = sys.executable
+    if os.name == "nt":
+        (bin_dir / "caddy.bat").write_text(
+            f'@echo off\r\n"{python}" "{stub}" %*\r\n', encoding="utf-8"
+        )
+    else:
+        exe = bin_dir / "caddy"
+        exe.write_text(f'#!/bin/sh\nexec "{python}" "{stub}" "$@"\n', encoding="utf-8")
+        exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("CADDY_STUB_OUT", str(out))
+    monkeypatch.setenv("CADDY_STUB_MODE", "exit_on_stop")
+    return FakeCaddy(out, monkeypatch)

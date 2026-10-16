@@ -331,11 +331,20 @@ class Daemon:
             db.claim_daemon(conn, self._pid, self._start)
         _logger.info("guard claimed pid=%s start=%s", self._pid, self._start)
 
-    def run(self) -> None:
+    def run(
+        self,
+        on_claimed: Callable[[], None] | None = None,
+        on_release: Callable[[], None] | None = None,
+    ) -> None:
         """Claim the guard, then pump until :meth:`stop`; release it on the way out.
 
         The claim sits outside the ``try``: a refusal (or a Ctrl-C during the
-        claim) must not clear a guard this instance never took.
+        claim) must not clear a guard this instance never took. ``on_claimed``
+        runs inside the ``try`` right after the claim, so a callback that raises
+        still releases the guard (caddy mode starts its child here).
+        ``on_release`` runs in the ``finally`` just before the guard is cleared,
+        so whatever it stops (caddy holding the site port) is down before a
+        successor can claim the guard. It runs even if ``on_claimed`` raised.
         """
         self.claim()
         _setup_daemon_logging()
@@ -357,6 +366,8 @@ class Daemon:
             signal.signal(signal.SIGTERM, _shutdown)
 
         try:
+            if on_claimed is not None:
+                on_claimed()
             # Startup discovery: goal:48 sets its timestamp to now, so the
             # first pump pass adopts the workspace set before sleeping.
             self._sched.schedule(DISCOVERY_JOB, self._sched.now(), self.discover)
@@ -366,8 +377,12 @@ class Daemon:
             self._sched.run()
         finally:
             self._sched.stop()
-            with db.open_db() as conn:
-                db.clear_daemon(conn, self._pid, self._start)
+            try:
+                if on_release is not None:
+                    on_release()
+            finally:
+                with db.open_db() as conn:
+                    db.clear_daemon(conn, self._pid, self._start)
             _logger.info("guard released pid=%s start=%s", self._pid, self._start)
             _logger.info("shutdown")
             restore_exitwatch()

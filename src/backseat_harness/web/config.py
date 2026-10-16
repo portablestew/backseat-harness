@@ -11,5 +11,5 @@ class WebConfig:
     """Resolved web server settings."""
 
     host: str = "127.0.0.1"
-    port: int = 8080
+    port: int = 8090
     workspace: Path = Path(".")

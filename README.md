@@ -59,19 +59,93 @@ On Windows, `daemon install` registers a Task Scheduler task named `backseat-dae
 
 On Linux, `daemon install` registers a systemd user unit, and on macOS a LaunchAgent. _TODO: testing on these platforms_
 
-The installed daemon also serves the web interface on the configured port (default 8080), so a separate `backseat-harness web` on that port will not start.
+The installed daemon also serves the web interface on the configured port (default 8090), so a separate `backseat-harness web` on that port will not start.
 
 ## Web interface
 
 ```bash
-backseat-harness web          # http://127.0.0.1:8080, localhost only; --host and --port change it
+backseat-harness web          # http://127.0.0.1:8090, localhost only; --host and --port change it
 ```
+
+For HTTPS and a login prompt in front of it, see [Caddy mode](#caddy-mode-https--login).
 
 - **Workspaces:** register a folder and see its tasks.
 - **Tasks:** create a task from a name and goal, then review its status, checklist, and transcript.
 - **Runs:** start a task run from its page, with an optional brief.
 - **Chats:** browse and search provider sessions, and fork one.
 - **Shell:** open a terminal in the browser at a workspace.
+
+### Caddy mode (HTTPS + login)
+
+Caddy mode puts [Caddy](https://caddyserver.com) in front of the web interface. Caddy serves the site over HTTPS and asks for a username and password. The web app keeps listening only on `127.0.0.1`. Caddy must be installed and on `PATH`.
+
+With the default `auto` mode, caddy is used when `~/.backseat/caddyfile` exists. A minimal file:
+
+<!-- caddyfile-example:start -->
+```
+site.lan:8443 {
+	tls internal
+	basic_auth {
+		alice <bcrypt hash>
+	}
+	reverse_proxy 127.0.0.1:8090
+}
+```
+<!-- caddyfile-example:end -->
+
+Replace `<bcrypt hash>` with the output of `caddy hash-password`, and keep `alice` or change it to the user name you want.
+
+Two things the example does that you may not expect:
+
+- **Port 80.** Caddy also opens a listener on TCP 80 that redirects plain-HTTP requests to HTTPS, even though the site is on another port. If something else holds port 80, caddy exits at start with `listen tcp :80: ... Only one usage of each socket address`, and the daemon or `web` logs `caddy exited rc=1`. The pre-start check does not look at port 80, so this shows up after start. If you cannot bind 80, or do not want the redirect listener, add a global options block at the top of the caddyfile:
+
+  ```
+  {
+  	auto_https disable_redirects
+  }
+  ```
+
+  The site is then served over HTTPS on its own port only. Do not use `auto_https off` for this: it turns HTTPS off for the site.
+
+- **Trust prompt on Windows.** `tls internal` makes caddy install its local root certificate into the OS trust store the first time it runs. On Windows that shows a "Security Warning" dialog, and caddy waits for it. Trusting the root lets every program on this machine trust caddy's certificates. To keep caddy from installing it, add `skip_install_trust` to the same global block:
+
+  ```
+  {
+  	auto_https disable_redirects
+  	skip_install_trust
+  }
+  ```
+
+  With this, the browser shows the certificate warning described under [Certificate](#caddy-mode-https--login) instead, and nothing is trusted. The two options above are the ones this setup uses when you do not want to bind 80 or trust the root. Both were checked with `caddy validate` against the example.
+
+On Windows, `scripts\setup-caddy-windows.ps1` does these steps interactively from an elevated PowerShell: it installs caddy if needed, adds a firewall rule for TCP 8443, asks for the user name and password, writes the caddyfile, and validates it. It is opt-in, and it refuses to run unless elevated. The daemon itself never writes a caddyfile.
+
+- **Port:** the `reverse_proxy` port must equal `[web] port` in your config (default 8090). Nothing checks this. A mismatch shows as 502 errors in the browser.
+- **Site address:** write `host:port`, `https://host`, bare `host` (port 443), `http://host` (port 80), or `:port` (answers as `localhost` and `127.0.0.1`). Separate several addresses with spaces or commas. Wildcards, IPv6 literals, paths, and other schemes are refused with exit 2. The host name must resolve to this machine from the browser, for example through a hosts-file entry.
+- **Checks before start:** the daemon or `web` runs `caddy validate` on the file and checks that the site ports are free. Any failure exits 2 with the reason.
+- **Certificate:** `tls internal` signs with caddy's local certificate authority, so the browser shows a certificate warning. Trusting that authority is optional and not part of the setup steps. If you want to trust it, run `caddy trust` yourself while caddy is running. Without `skip_install_trust`, caddy also tries to install that root on first run (see the trust prompt above).
+
+Choose the mode with the `--web` flag on the daemon or with `--mode` on `web`:
+
+```bash
+backseat-harness daemon run --web            # same as --web=auto
+backseat-harness daemon run --web=direct     # plain uvicorn on the web port, no caddy
+backseat-harness daemon run --web=caddy      # caddy is required; exit 2 without the caddyfile
+backseat-harness daemon run --web=none       # no web interface, same as omitting --web
+backseat-harness web --mode auto|direct|caddy   # default auto
+```
+
+- **`auto`** (bare `--web`, and the default for `web`) uses caddy when the caddyfile exists and direct mode when it does not. If the caddyfile exists but caddy is not on `PATH`, `auto` exits 2 and does not fall back to direct mode. A missing caddy never serves without the login.
+- **If caddy dies:** under the daemon, the daemon logs `caddy exited rc=N` to `~/.backseat/daemon.log` and keeps running. The web app stays on `127.0.0.1:8090`, but the HTTPS site is gone until the next restart. Standalone `web` stops the server and exits 1.
+- **Caddy's output:** under the daemon it goes to `~/.backseat/caddy.log`. Standalone `web` shows it on the terminal.
+
+**Happy path:**
+
+1. Install caddy and check that `caddy version` works in a new terminal.
+2. Run `backseat-harness daemon install`. The installed daemon uses the `PATH` in effect at install time, so if you install caddy later, run `daemon install` again to pick it up.
+3. Write `~/.backseat/caddyfile` as above.
+4. Run `backseat-harness daemon restart`. The daemon checks for the caddyfile each time it starts, so it picks up the new file.
+5. Open `https://site.lan:8443` (or your site address). The browser will show a certificate warning until you trust caddy's local CA, which is optional.
 
 ## Configuration
 

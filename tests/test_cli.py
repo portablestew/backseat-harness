@@ -1399,3 +1399,164 @@ def test_daemon_install_idempotent(monkeypatch, capsys):
     # Payloads should be equivalent (same keys/values)
     assert payload1["installed"] == payload2["installed"]
     assert payload1.get("warn") == payload2.get("warn")
+
+
+# --- web --mode (3e): standalone web, direct or behind caddy ---------------
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _write_web_caddyfile(site_port: int, web_port: int) -> None:
+    from backseat_harness.web import caddy as caddy_mod
+
+    path = caddy_mod.caddyfile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"site.lan:{site_port} {{\n\treverse_proxy 127.0.0.1:{web_port}\n}}\n",
+        encoding="utf-8",
+    )
+
+
+def _fake_uvicorn(monkeypatch, events: list[str]):
+    """Replace uvicorn.Server with one that serves until should_exit; returns a started flag."""
+    import threading
+    import time
+
+    started = threading.Event()
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            events.append("uvicorn-start")
+            started.set()
+            deadline = time.monotonic() + 20.0
+            while not self.should_exit and time.monotonic() < deadline:
+                time.sleep(0.005)
+            events.append("uvicorn-stop")
+
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    return started
+
+
+def _interrupt_main_when(predicate) -> None:
+    """Send Ctrl-C to the main thread once ``predicate`` holds (or after 20 s)."""
+    import _thread
+    import threading
+    import time
+
+    def go() -> None:
+        deadline = time.monotonic() + 20.0
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        _thread.interrupt_main()
+
+    threading.Thread(target=go, daemon=True).start()
+
+
+def test_web_mode_parses():
+    from backseat_harness.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["web"]).mode == "auto"
+    assert parser.parse_args(["web", "--mode", "direct"]).mode == "direct"
+    assert parser.parse_args(["web", "--mode=caddy"]).mode == "caddy"
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["web", "--mode", "bogus"])
+    assert exc.value.code == 2
+
+
+def test_web_auto_resolves_to_caddy_when_caddyfile_exists(fake_caddy, monkeypatch, tmp_path):
+    """auto with a caddyfile runs caddy beside uvicorn and stops caddy before uvicorn."""
+    from backseat_harness.cli import _build_parser
+    from backseat_harness.web import caddy as caddy_mod
+
+    events: list[str] = []
+    real_start = caddy_mod.start
+
+    def start(*args, **kwargs):
+        events.append("caddy-start")
+        handle = real_start(*args, **kwargs)
+        real_stop = handle.stop
+
+        def stop(timeout=caddy_mod._STOP_GRACE_S):
+            events.append("caddy-stop")
+            real_stop(timeout)
+
+        handle.stop = stop
+        return handle
+
+    monkeypatch.setattr(caddy_mod, "start", start)
+    _fake_uvicorn(monkeypatch, events)
+    _write_web_caddyfile(_free_port(), _free_port())
+    _interrupt_main_when(lambda: any(argv[0] == "run" for argv in fake_caddy.calls()))
+
+    args = _build_parser().parse_args(["-C", str(tmp_path), "web", "--port", str(_free_port())])
+    assert args.func(args) == 0
+
+    assert [argv[0] for argv in fake_caddy.calls()] == ["validate", "run"]
+    # uvicorn starts on its own thread, so only the stop order is fixed.
+    assert "caddy-start" in events
+    assert events[-2:] == ["caddy-stop", "uvicorn-stop"]
+
+
+def test_web_direct_unchanged_without_caddyfile(fake_caddy, monkeypatch, tmp_path):
+    """Direct mode serves uvicorn alone and never touches caddy."""
+    from backseat_harness.cli import _build_parser
+
+    events: list[str] = []
+    started = _fake_uvicorn(monkeypatch, events)
+    _interrupt_main_when(started.is_set)
+
+    args = _build_parser().parse_args(["-C", str(tmp_path), "web", "--port", str(_free_port())])
+    assert args.func(args) == 0
+
+    assert fake_caddy.calls() == []
+    assert events == ["uvicorn-start", "uvicorn-stop"]
+
+
+def test_web_caddy_missing_is_exit_2_before_serving(fake_home, monkeypatch, tmp_path, capsys):
+    """A caddyfile with no caddy on PATH is refused before uvicorn is created."""
+    from backseat_harness.cli import _build_parser
+
+    events: list[str] = []
+    _fake_uvicorn(monkeypatch, events)
+    _write_web_caddyfile(_free_port(), _free_port())
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+
+    args = _build_parser().parse_args(["-C", str(tmp_path), "web", "--port", str(_free_port())])
+    rc = args.func(args)
+
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert "not on PATH" in (out + err)
+    assert events == []
+
+
+def test_web_caddy_death_exits_nonzero(fake_caddy, monkeypatch, tmp_path, capsys):
+    """Standalone web in caddy mode: caddy dies, the server stops, the exit is 1."""
+    from backseat_harness.cli import _build_parser
+
+    fake_caddy.mode("die_after")
+    events: list[str] = []
+    _fake_uvicorn(monkeypatch, events)
+    _write_web_caddyfile(_free_port(), _free_port())
+
+    port = _free_port()
+    args = _build_parser().parse_args(
+        ["-C", str(tmp_path), "web", "--mode", "caddy", "--port", str(port)]
+    )
+    rc = args.func(args)
+
+    _out, err = capsys.readouterr()
+    assert rc == 1
+    assert "caddy exited rc=3" in err
+    assert events == ["uvicorn-start", "uvicorn-stop"]

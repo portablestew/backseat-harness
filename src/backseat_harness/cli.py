@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -49,6 +50,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     return args.func(args)
+
+
+#: Values ``daemon run --web`` accepts; ``none`` is decided here, before any web import.
+_WEB_MODES = ("none", "auto", "direct", "caddy")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -152,10 +157,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # so the root-level value is never clobbered by a subparser default.
     daemon_run.add_argument(
         "--web",
-        action="store_true",
+        nargs="?",
+        const="auto",
+        choices=_WEB_MODES,
         default=argparse.SUPPRESS,
-        help="also serve the web interface in this process (host/port from "
-        "the [web] table; a busy port is refused before the daemon starts)",
+        help="also serve the web interface in this process (host/port from the [web] "
+        "table; a refused start exits 2 before the daemon starts). MODE: auto (caddy "
+        "when ~/.backseat/caddyfile exists, else direct; bare --web), direct, caddy "
+        "(needs the caddyfile), or none (same as no --web)",
     )
     daemon_run.set_defaults(func=_cmd_daemon)
 
@@ -198,12 +207,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host", default=None, help="bind host (localhost only, default: config or 127.0.0.1)"
     )
     web.add_argument(
-        "--port", type=int, default=None, help="bind port (default: config or 8080)"
+        "--port", type=int, default=None, help="bind port (default: config or 8090)"
     )
     web.add_argument(
         "--workspace",
         default=argparse.SUPPRESS,
         help="workspace root containing .backseat/ (default: cwd, or -C value)",
+    )
+    web.add_argument(
+        "--mode",
+        choices=("auto", "direct", "caddy"),
+        default="auto",
+        help="auto serves through caddy when ~/.backseat/caddyfile exists, "
+        "direct serves plain uvicorn, caddy requires the caddyfile (default: auto)",
     )
     web.set_defaults(func=_cmd_web)
 
@@ -553,25 +569,67 @@ def _cmd_daemon(args) -> int:
     """
     instance = Daemon(debug=getattr(args, "debug", False))
     web_handle = None
-    if getattr(args, "web", False):
+    caddy_handle = None
+    requested = getattr(args, "web", "none")
+    mode = "none"
+    # What the post-claim try turns into exit 2; CaddyRefusal joins it once the
+    # lazy web import below has run (only --web can raise it).
+    refusals: tuple[type[Exception], ...] = (db.DaemonAlreadyRunning,)
+    if requested != "none":
         # Lazily: the daemon process without --web never loads the web stack.
         from backseat_harness import config as config_mod
+        from backseat_harness.web import caddy
         from backseat_harness.web.cli import start_web_in_thread
 
+        refusals = (db.DaemonAlreadyRunning, caddy.CaddyRefusal)
         config = config_mod.load_config(args.workspace)
+        caddyfile = caddy.caddyfile_path()
+        extra_hosts: tuple[str, ...] = ()
+        # Every check that can refuse runs here, before the guard is claimed.
         try:
-            web_handle = start_web_in_thread(host=config.web.host, port=config.web.port)
+            mode = caddy.resolve_mode(requested, caddyfile)
+            if mode == "caddy":
+                exe, extra_hosts = _caddy_checks(caddyfile)
+            web_handle = start_web_in_thread(
+                host=config.web.host, port=config.web.port, extra_hosts=extra_hosts
+            )
         except (OSError, ValueError) as exc:
             _emit(args, {"error": str(exc)}, f"web: refused to start: {exc}")
             return 2
+
+    def start_caddy() -> None:
+        # Runs after the claim (Daemon.run's on_claimed), so a refused second
+        # daemon never spawns a caddy that fights the live one.
+        nonlocal caddy_handle
+        caddy_handle = caddy.start(
+            exe, caddyfile, log_path=caddyfile.parent / "caddy.log", on_exit=_caddy_exited
+        )
+
+    def _caddy_exited(rc: int) -> None:
+        # Keep the daemon up: uvicorn is loopback-only, so losing caddy costs
+        # remote access, not safety. The warning is the operator's signal.
+        logging.getLogger("daemon").warning(
+            "caddy exited rc=%s; the web interface keeps running without it", rc
+        )
+
+    def stop_caddy() -> None:
+        # Runs in Daemon.run's finally, before the guard is cleared, so the site
+        # port is free by the time a successor can claim the guard.
+        if caddy_handle is not None:
+            caddy_handle.stop()
+
     try:
-        instance.run()
-    except db.DaemonAlreadyRunning as exc:
+        instance.run(
+            on_claimed=start_caddy if mode == "caddy" else None,
+            on_release=stop_caddy,
+        )
+    except refusals as exc:
         _emit(args, {"error": str(exc)}, str(exc))
         return 2
     except KeyboardInterrupt:
         pass
     finally:
+        # uvicorn stops after caddy, as before.
         if web_handle is not None:
             web_handle.stop()
     _emit(args, {"daemon": "stopped"}, "daemon stopped")
@@ -963,15 +1021,55 @@ def _cmd_register_workspace(args) -> int:
     return 0
 
 
+def _caddy_checks(caddyfile: Path) -> tuple[str, tuple[str, ...]]:
+    """Run every caddy pre-run check; return (caddy executable, extra Host/Origin strings).
+
+    Shared by ``daemon run --web`` (before the guard is claimed) and ``web``.
+    Raises CaddyRefusal, OSError or ValueError; each caller exits 2 with it.
+    """
+    from backseat_harness.web import caddy
+
+    exe = caddy.find_caddy()
+    hosts, ports = caddy.site_hosts(caddyfile.read_text(encoding="utf-8"))
+    caddy.validate(exe, caddyfile)
+    caddy.probe_ports(ports)
+    return exe, tuple(sorted(hosts))
+
+
 def _cmd_web(args) -> int:
+    """Serve the web app in this process (3e): direct, or behind caddy.
+
+    Caddy mode gets the same pre-run checks as ``daemon run --web``, and caddy
+    is stopped before uvicorn. There is no guard here, so a dead caddy stops
+    the server and exits 1 rather than leaving a daemon running without it.
+    """
+    from backseat_harness.web import caddy
     from backseat_harness.web.cli import run_web
 
     workspace = getattr(args, "workspace", ".")
     config = load_config(workspace)
     host = args.host if args.host is not None else config.web.host
     port = args.port if args.port is not None else config.web.port
-    run_web(host=host, port=port, workspace=workspace)
-    return 0
+    caddyfile = caddy.caddyfile_path()
+    try:
+        mode = caddy.resolve_mode(args.mode, caddyfile)
+        exe, extra_hosts, sidecar = "", (), None
+        if mode == "caddy":
+            exe, extra_hosts = _caddy_checks(caddyfile)
+
+            def sidecar(on_exit):
+                def report(rc: int) -> None:
+                    print(f"web: caddy exited rc={rc}; stopping the web server", file=sys.stderr)
+                    on_exit(rc)
+
+                return caddy.start(exe, caddyfile, log_path=None, on_exit=report)
+
+        return run_web(
+            host=host, port=port, workspace=workspace, extra_hosts=extra_hosts, sidecar=sidecar
+        )
+    except (caddy.CaddyRefusal, OSError, ValueError) as exc:
+        _emit(args, {"error": str(exc)}, f"web: refused to start: {exc}")
+        return 2
 
 
 def _cmd_generate_task(args) -> int:

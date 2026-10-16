@@ -9,6 +9,7 @@ cross-site WebSocket hijacking of a PTY shell (goal.md:3).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from urllib.parse import urlparse
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -29,15 +30,17 @@ def _header(scope: Scope, name: bytes) -> str:
 class HostOriginAllowlistMiddleware:
     """Reject non-localhost Host/Origin with 403 (DNS rebinding defense).
 
-    Strict allowlist: ``127.0.0.1:<port>`` + ``localhost:<port>`` only.
-    Both headers are checked when present, on HTTP requests and WebSocket
-    handshakes alike — a WebSocket is refused before ``websocket.accept``.
+    Strict allowlist: ``127.0.0.1:<port>`` + ``localhost:<port>`` only, plus
+    any ``extra_hosts`` (the Caddy site addresses in caddy mode). Both headers
+    are checked when present, on HTTP requests and WebSocket handshakes alike —
+    a WebSocket is refused before ``websocket.accept``.
     """
 
-    def __init__(self, app: ASGIApp, port: int = 8080) -> None:
+    def __init__(self, app: ASGIApp, port: int = 8090, extra_hosts: Iterable[str] = ()) -> None:
         self.app = app
         self.port = port
         self.allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        self.allowed.update(host.lower() for host in extra_hosts)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in ("http", "websocket"):

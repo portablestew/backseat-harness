@@ -96,5 +96,5 @@ timeout_s = 1800
 review_rounds = 3
 
 [web]
-# Port for the web UI (default: 8080)
-port = 8080
+# Port for the web UI (default: 8090)
+port = 8090
