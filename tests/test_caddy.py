@@ -7,10 +7,12 @@ no real caddy is needed.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -273,6 +275,49 @@ def test_unexpected_exit_calls_on_exit_once(fake_caddy, tmp_path):
     finally:
         handle.stop()
     assert exits == [3]
+
+
+#: A parent that starts caddy the way the harness does, then waits to be killed.
+_HARD_KILL_PARENT = """
+import sys, time
+from pathlib import Path
+from backseat_harness.web import caddy
+caddy.start(caddy.find_caddy(), Path(sys.argv[1]), log_path=None, on_exit=lambda rc: None)
+print("started", flush=True)
+time.sleep(120)
+"""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the job object is Windows-only")
+def test_hard_killed_parent_takes_caddy_with_it(fake_caddy, tmp_path, monkeypatch):
+    """No cleanup runs in a hard-killed process (``taskkill /F``, no ``/T``), so
+    only the kill-on-close job can end the caddy child. Checked with a real
+    parent process, since the test process itself must survive."""
+    src = str(Path(caddy_mod.__file__).resolve().parents[2])
+    monkeypatch.setenv("PYTHONPATH", src + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _HARD_KILL_PARENT, str(_caddyfile(tmp_path))],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    run_pid = None
+    try:
+        assert parent.stdout is not None
+        assert parent.stdout.readline().strip() == "started"
+        _wait_until(lambda: (fake_caddy.out / "run.pid").exists())
+        run_pid = fake_caddy.pid("run")
+        parent.kill()
+        parent.wait(timeout=10)
+        deadline = time.monotonic() + 10.0
+        while not _gone(run_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert _gone(run_pid), "caddy outlived the hard-killed parent"
+    finally:
+        parent.kill()
+        if run_pid is not None and not _gone(run_pid):
+            psutil.Process(run_pid).kill()
 
 
 # --- real caddy (skipped when the binary is absent) ----------------------------

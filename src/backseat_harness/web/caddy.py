@@ -8,6 +8,7 @@ the caller in ``cli.py`` owns the lazy import.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import shutil
@@ -230,6 +231,113 @@ def probe_ports(ports: Iterable[int]) -> None:
                     raise CaddyRefusal(f"site port {port} is already in use ({exc})") from exc
 
 
+# --- Windows job object: caddy dies with this process ---------------------------
+#
+# A graceful stop cannot cover a hard kill of the harness (``taskkill /F`` or a
+# crash runs no Python cleanup), so on Windows the caddy child is put in a job
+# with KILL_ON_JOB_CLOSE. The OS closes this process's handles on exit by any
+# means, and closing the last handle kills every member. The job handle is not
+# inheritable and Popen closes inherited handles, so caddy cannot hold it open.
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
+
+
+class _BasicLimitInfo(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _ExtendedLimitInfo(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimitInfo),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _kernel32() -> ctypes.CDLL:
+    """The kernel32 entry points the job object needs, typed so handles stay 64-bit."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle, uint, int_ = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int
+    signatures = {
+        "CreateJobObjectW": (handle, [ctypes.c_void_p, ctypes.c_void_p]),
+        "SetInformationJobObject": (int_, [handle, int_, ctypes.c_void_p, uint]),
+        "OpenProcess": (handle, [uint, int_, uint]),
+        "AssignProcessToJobObject": (int_, [handle, handle]),
+        "CloseHandle": (int_, [handle]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        fn = getattr(k32, name)
+        fn.restype, fn.argtypes = restype, argtypes
+    return k32
+
+
+class _KillOnCloseJob:
+    """A job object whose members die when its handle closes. Windows only."""
+
+    def __init__(self) -> None:
+        self._k32 = _kernel32()
+        self._job: int | None = self._k32.CreateJobObjectW(None, None)
+        if not self._job:
+            raise CaddyRefusal(f"caddy could not get a job object ({ctypes.get_last_error()})")
+        info = _ExtendedLimitInfo()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        size = ctypes.sizeof(info)
+        if not self._k32.SetInformationJobObject(
+            self._job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), size
+        ):
+            err = ctypes.get_last_error()
+            self.close()
+            raise CaddyRefusal(f"caddy job object could not be configured ({err})")
+
+    def attach(self, pid: int) -> None:
+        """Put ``pid`` in the job. Raises ``OSError`` when the process cannot be opened or added."""
+        assert self._job is not None
+        proc = self._k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, 0, pid)
+        if not proc:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self._k32.AssignProcessToJobObject(self._job, proc):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self._k32.CloseHandle(proc)
+
+    def close(self) -> None:
+        """Close the handle. Any member still running is killed by the OS."""
+        if self._job:
+            self._k32.CloseHandle(self._job)
+            self._job = None
+
+
 def _send_graceful(proc: subprocess.Popen) -> None:
     """Ask caddy to exit cleanly: CTRL_BREAK to its own group on Windows, SIGTERM elsewhere."""
     try:
@@ -261,11 +369,16 @@ class CaddyHandle:
     """
 
     def __init__(
-        self, proc: subprocess.Popen, watcher: threading.Thread, stopping: threading.Event
+        self,
+        proc: subprocess.Popen,
+        watcher: threading.Thread,
+        stopping: threading.Event,
+        job: _KillOnCloseJob | None,
     ) -> None:
         self._proc: subprocess.Popen | None = proc
         self._watcher = watcher
         self._stopping = stopping
+        self._job = job
 
     @property
     def pid(self) -> int:
@@ -289,6 +402,8 @@ class CaddyHandle:
                 except subprocess.TimeoutExpired:
                     pass
         self._watcher.join(timeout=_POLL_S + 1.0)
+        if self._job is not None:
+            self._job.close()
 
 
 def start(
@@ -299,6 +414,9 @@ def start(
     on_exit: Callable[[int], None],
 ) -> CaddyHandle:
     """Start ``caddy run`` on the caddyfile in its own process group.
+
+    On Windows the child is also tied to a kill-on-close job object, so it dies
+    with this process even when the process is killed without cleanup.
 
     Output is appended to ``log_path`` (the daemon's case) or inherited when it
     is ``None`` (standalone ``web``). ``on_exit(rc)`` runs once, from the watch
@@ -313,6 +431,7 @@ def start(
         else {"start_new_session": True}
     )
     argv = [exe, "run", "--config", str(path), "--adapter", "caddyfile"]
+    job = _KillOnCloseJob() if os.name == "nt" else None
     try:
         if log_path is None:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **group_kwargs)
@@ -327,8 +446,19 @@ def start(
                     **group_kwargs,
                 )
     except OSError as exc:
+        if job is not None:
+            job.close()
         # Same refusal type as the pre-run checks, so the caller reports it the same way.
         raise CaddyRefusal(f"caddy could not start: {exc}") from exc
+    if job is not None:
+        try:
+            job.attach(proc.pid)
+        except OSError as exc:
+            # A child that has already exited needs no confining; the watch thread reports it.
+            if proc.poll() is None:
+                proc.kill()
+                job.close()
+                raise CaddyRefusal(f"caddy could not be tied to this process: {exc}") from exc
     stopping = threading.Event()
     watcher = threading.Thread(
         target=_watch,
@@ -337,4 +467,4 @@ def start(
         daemon=True,
     )
     watcher.start()
-    return CaddyHandle(proc, watcher, stopping)
+    return CaddyHandle(proc, watcher, stopping, job)

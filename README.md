@@ -118,7 +118,7 @@ Two things the example does that you may not expect:
 
   With this, the browser shows the certificate warning described under [Certificate](#caddy-mode-https--login) instead, and nothing is trusted. The two options above are the ones this setup uses when you do not want to bind 80 or trust the root. Both were checked with `caddy validate` against the example.
 
-On Windows, `scripts\setup-caddy-windows.ps1` does these steps interactively from an elevated PowerShell: it installs caddy if needed, adds a firewall rule for TCP 8443, asks for the user name and password, writes the caddyfile, and validates it. It is opt-in, and it refuses to run unless elevated. The daemon itself never writes a caddyfile.
+On Windows, `scripts\setup-caddy-windows.ps1` does these steps interactively from an elevated PowerShell: it installs caddy if needed, adds a firewall rule for TCP 8443, asks for the user name and password, writes the caddyfile, and validates it. The site answers as the host you give, `localhost`, `127.0.0.1`, and this machine's private IPv4 address, which the script detects, so re-run it if that address changes. It is opt-in, and it refuses to run unless elevated. The daemon itself never writes a caddyfile.
 
 - **Port:** the `reverse_proxy` port must equal `[web] port` in your config (default 8090). Nothing checks this. A mismatch shows as 502 errors in the browser.
 - **Site address:** write `host:port`, `https://host`, bare `host` (port 443), `http://host` (port 80), or `:port` (answers as `localhost` and `127.0.0.1`). Separate several addresses with spaces or commas. Wildcards, IPv6 literals, paths, and other schemes are refused with exit 2. The host name must resolve to this machine from the browser, for example through a hosts-file entry.
