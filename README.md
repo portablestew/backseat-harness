@@ -11,75 +11,73 @@ The managed agent keeps the long-horizon context across the whole task, instead 
 ## Requirements
 
 - Python 3.11 or newer.
-- One provider CLI on your PATH, installed and signed in: `claude`, `kiro-cli`, or `opencode`. Each CLI uses its own login.
+- At least one provider CLI on your PATH, installed and signed in: `claude`, `kiro-cli`, or `opencode`. Each CLI uses its own login.
 - Managed runs are auto-approved, since a non-interactive run has nobody to answer a prompt.
-
-## Install
-
-```bash
-pip install -e .   # or: uv sync, for a dev environment
-```
 
 ## Quick start
 
+The quick start sets up [Caddy](https://caddyserver.com) in front of the web interface (HTTPS + a login prompt).
+
+1. Install the tool:
+
+   ```bash
+   uv tool install backseat-harness
+   ```
+
+2. Install caddy and write the caddyfile (caddy is installed with `winget` if it is missing; on Windows this must run from an elevated, Administrator shell):
+
+   ```bash
+   backseat-harness setup-caddy   # installs caddy, opens the site port, writes ~/.backseat/caddyfile
+   ```
+
+   <!-- TODO: the Linux branch (apt/dnf/pacman + ufw/firewalld) and the LaunchAgent daemon install are untested -->
+
+3. Install and start the daemon (caddy is expected on `PATH`):
+
+   ```bash
+   backseat-harness daemon install
+   ```
+
+4. Open the local web page and sign in — `https://localhost:8443` (or the hostname you configured for Caddy).
+
+## Upgrading
+
 ```bash
-# start a task: creates .backseat/tasks/<slug>/, and the operator plans the first step
-backseat-harness run hello-endpoint "Add a GET /hello endpoint returning JSON."
-
-# resume later: the operator picks the next step
-backseat-harness run hello-endpoint
-
-# answer a blocked lane: your words ride every operator prompt of this run
-backseat-harness run hello-endpoint "Use SQLite; no external service."
-
-# drive the managed session yourself, then the loop resumes when you quit
-backseat-harness takeover hello-endpoint
-
-# check progress (--format goes before the subcommand)
-backseat-harness --format json status hello-endpoint
-backseat-harness list
+uv tool upgrade backseat-harness
+backseat-harness daemon restart   # restart the daemon on the new version
 ```
-
-A blocked or complete lane refuses a bare `run` and prints the pending question. `init <slug> [goal]` scaffolds a lane without running it.
-
-## Daemon install
-
-The daemon runs lanes in the background, so you don't start each one by hand. Once installed, it starts any lane that has a goal and is not blocked or finished, unattended and auto-approved, one lane at a time per workspace.
-
-```bash
-backseat-harness register-workspace /path/to/workspace   # the daemon scans registered workspaces (must contain .backseat/, e.g. from init)
-backseat-harness daemon install                          # register and start the daemon
-backseat-harness daemon status                           # show the daemon's status
-backseat-harness daemon restart                          # restart the registered daemon
-backseat-harness daemon stop                             # stop it
-backseat-harness daemon install --uninstall              # remove it (stop the daemon first)
-```
-
-On Windows, `daemon install` registers a Task Scheduler task named `backseat-daemon`. It runs as your account and starts at logon. Its output goes to `~/.backseat/daemon.log`. `daemon install` does not stop a daemon that is already running, and on Windows uninstall does not stop one either, so run `daemon stop` first. To run it in the foreground instead, use `backseat-harness daemon run`, adding `--web` to serve the web interface from the same process.
-
-On Linux, `daemon install` registers a systemd user unit, and on macOS a LaunchAgent. _TODO: testing on these platforms_
-
-The installed daemon also serves the web interface on the configured port (default 8090), so a separate `backseat-harness web` on that port will not start.
 
 ## Web interface
 
-```bash
-backseat-harness web          # http://127.0.0.1:8090, localhost only; --host and --port change it
-```
+The main workflow, in brief:
 
-For HTTPS and a login prompt in front of it, see [Caddy mode](#caddy-mode-https--login).
+1. **Register a workspace** — add a folder (it gets a `.backseat/` marker) and open it.
 
-- **Workspaces:** register a folder and see its tasks.
-- **Tasks:** create a task from a name and goal, then review its status, checklist, and transcript.
-- **Runs:** start a task run from its page, with an optional brief.
-- **Chats:** browse and search provider sessions, and fork one.
-- **Shell:** open a terminal in the browser at a workspace.
+   ![backseat-harness web interface: sign-in and workspaces page](https://raw.githubusercontent.com/portablestew/backseat-harness/main/docs/media/web-mainpage-example.png)
 
-### Caddy mode (HTTPS + login)
+2. **Start a chat** — from the workspace web UI (New chat), your IDE, or the CLI of your choice. Discuss a plan for your idea interactively with the agent.
 
-Caddy mode puts [Caddy](https://caddyserver.com) in front of the web interface. Caddy serves the site over HTTPS and asks for a username and password. The web app keeps listening only on `127.0.0.1`. Caddy must be installed and on `PATH`.
+   ![Workspace page](https://raw.githubusercontent.com/portablestew/backseat-harness/main/docs/media/web-workspace-example.png)
 
-With the default `auto` mode, caddy is used when `~/.backseat/caddyfile` exists. A minimal file:
+3. **Generate a task from the chat** — the ✨ Task button distils the finished chat into task requirements (`goal.md`).
+
+   ![Generate a task from the chat](https://raw.githubusercontent.com/portablestew/backseat-harness/main/docs/media/web-chat-generate-task.png)
+
+4. **The task completes autonomously** — the daemon runs it to the goal: managed agent step, operator review, next step.
+
+5. **Amend or takeover** — after a run, add a brief to guide/redirect it, or Takeover to drive the managed session yourself. On exit the task continues autonomously.
+
+   ![Task page: checklist, Run and Takeover](https://raw.githubusercontent.com/portablestew/backseat-harness/main/docs/media/web-task-example.png)
+
+For simpler requests, skip the chat: **add a task directly** with a name and goal, and let it run (fire-and-forget).
+
+## Configuration
+
+Two optional files under `~/.backseat/`:
+
+**`config.toml`** — providers, models, timeouts, loop budgets, web port. Layered: `~/.backseat/config.toml`, then `.backseat/config.toml` in the workspace, then `.backseat/tasks/<slug>/config.toml`; higher layers win. See [`examples/.backseat/config.toml`](examples/.backseat/config.toml).
+
+**`caddyfile`** — when present, the web interface is served over HTTPS with a login prompt (`auto` mode). A minimal file:
 
 <!-- caddyfile-example:start -->
 ```
@@ -93,67 +91,39 @@ site.lan:8443 {
 ```
 <!-- caddyfile-example:end -->
 
-Replace `<bcrypt hash>` with the output of `caddy hash-password`, and keep `alice` or change it to the user name you want.
+Replace `<bcrypt hash>` with `caddy hash-password`; the `reverse_proxy` port must match `[web] port` (default 8090). `backseat-harness setup-caddy` writes this file for you. The web app itself listens on `127.0.0.1` only.
 
-Two things the example does that you may not expect:
+Choose the serving mode with `--mode` on `web`, or `--web` on the daemon: `auto` (caddy when the caddyfile exists), `direct` (plain http only), `caddy` (caddyfile required), `none` (CLI only).
 
-- **Port 80.** Caddy also opens a listener on TCP 80 that redirects plain-HTTP requests to HTTPS, even though the site is on another port. If something else holds port 80, caddy exits at start with `listen tcp :80: ... Only one usage of each socket address`, and the daemon or `web` logs `caddy exited rc=1`. The pre-start check does not look at port 80, so this shows up after start. If you cannot bind 80, or do not want the redirect listener, add a global options block at the top of the caddyfile:
+## CLI
 
-  ```
-  {
-  	auto_https disable_redirects
-  }
-  ```
-
-  The site is then served over HTTPS on its own port only. Do not use `auto_https off` for this: it turns HTTPS off for the site.
-
-- **Trust prompt on Windows.** `tls internal` makes caddy install its local root certificate into the OS trust store the first time it runs. On Windows that shows a "Security Warning" dialog, and caddy waits for it. Trusting the root lets every program on this machine trust caddy's certificates. To keep caddy from installing it, add `skip_install_trust` to the same global block:
-
-  ```
-  {
-  	auto_https disable_redirects
-  	skip_install_trust
-  }
-  ```
-
-  With this, the browser shows the certificate warning described under [Certificate](#caddy-mode-https--login) instead, and nothing is trusted. The two options above are the ones this setup uses when you do not want to bind 80 or trust the root. Both were checked with `caddy validate` against the example.
-
-On Windows, `scripts\setup-caddy-windows.ps1` does these steps interactively from an elevated PowerShell: it installs caddy if needed, adds a firewall rule for TCP 8443, asks for the user name and password, writes the caddyfile, and validates it. The site answers as the host you give, `localhost`, `127.0.0.1`, and this machine's private IPv4 address, which the script detects, so re-run it if that address changes. It is opt-in, and it refuses to run unless elevated. The daemon itself never writes a caddyfile.
-
-- **Port:** the `reverse_proxy` port must equal `[web] port` in your config (default 8090). Nothing checks this. A mismatch shows as 502 errors in the browser.
-- **Site address:** write `host:port`, `https://host`, bare `host` (port 443), `http://host` (port 80), or `:port` (answers as `localhost` and `127.0.0.1`). Separate several addresses with spaces or commas. Wildcards, IPv6 literals, paths, and other schemes are refused with exit 2. The host name must resolve to this machine from the browser, for example through a hosts-file entry.
-- **Checks before start:** the daemon or `web` runs `caddy validate` on the file and checks that the site ports are free. Any failure exits 2 with the reason.
-- **Certificate:** `tls internal` signs with caddy's local certificate authority, so the browser shows a certificate warning. Trusting that authority is optional and not part of the setup steps. If you want to trust it, run `caddy trust` yourself while caddy is running. Without `skip_install_trust`, caddy also tries to install that root on first run (see the trust prompt above).
-
-Choose the mode with the `--web` flag on the daemon or with `--mode` on `web`:
+Everything the web does is also a subcommand:
 
 ```bash
-backseat-harness daemon run --web            # same as --web=auto
-backseat-harness daemon run --web=direct     # plain uvicorn on the web port, no caddy
-backseat-harness daemon run --web=caddy      # caddy is required; exit 2 without the caddyfile
-backseat-harness daemon run --web=none       # no web interface, same as omitting --web
-backseat-harness web --mode auto|direct|caddy   # default auto
+backseat-harness init <slug> [goal]        # scaffold a task lane
+backseat-harness run <slug> "goal"         # create and drive a task
+backseat-harness run <slug> "brief"        # resume with an instruction for this run
+backseat-harness takeover <slug>           # drive the managed session yourself, then resume
+backseat-harness generate-task <provider>:<conversation_id>   # task from a chat
+backseat-harness status <slug>
+backseat-harness list
 ```
 
-- **`auto`** (bare `--web`, and the default for `web`) uses caddy when the caddyfile exists and direct mode when it does not. If the caddyfile exists but caddy is not on `PATH`, `auto` exits 2 and does not fall back to direct mode. A missing caddy never serves without the login.
-- **If caddy dies:** under the daemon, the daemon logs `caddy exited rc=N` to `~/.backseat/daemon.log` and keeps running. The web app stays on `127.0.0.1:8090`, but the HTTPS site is gone until the next restart. Standalone `web` stops the server and exits 1.
-- **Caddy's output:** under the daemon it goes to `~/.backseat/caddy.log`. Standalone `web` shows it on the terminal.
+The daemon runs ready lanes unattended, one at a time per workspace:
 
-**Happy path:**
+```bash
+backseat-harness register-workspace /path/to/workspace
+backseat-harness daemon install            # register and start (Task Scheduler / systemd / LaunchAgent)
+backseat-harness daemon status|restart|stop
+backseat-harness daemon install --uninstall
+```
 
-1. Install caddy and check that `caddy version` works in a new terminal.
-2. Run `backseat-harness daemon install`. The installed daemon uses the `PATH` in effect at install time, so if you install caddy later, run `daemon install` again to pick it up.
-3. Write `~/.backseat/caddyfile` as above.
-4. Run `backseat-harness daemon restart`. The daemon checks for the caddyfile each time it starts, so it picks up the new file.
-5. Open `https://site.lan:8443` (or your site address). The browser will show a certificate warning until you trust caddy's local CA, which is optional.
-
-## Configuration
-
-Config is layered: `~/.backseat/config.toml`, then `.backseat/config.toml` in the workspace, then `.backseat/tasks/<slug>/config.toml` for a task. Higher layers win. See [`examples/.backseat/config.toml`](examples/.backseat/config.toml).
+Daemon output goes to `~/.backseat/daemon.log`; `daemon run --web` serves the web interface from the same process.
 
 ## Development
 
 ```bash
+uv sync
 uv run ruff check .
 uv run pytest
 ```
