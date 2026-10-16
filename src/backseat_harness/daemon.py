@@ -285,6 +285,18 @@ def _run_argv(workspace: str, slug: str, *, debug: bool = False) -> list[str]:
     return [*base, "-C", workspace, *flags, "run", slug]
 
 
+def _detach_kwargs() -> dict:
+    """Popen kwargs that give a run its own session (POSIX) or process group (Windows).
+
+    The same split the other launch sites inline (spawn.py, web/caddy.py,
+    web/services/task.py). A takeover kills a lane's pids by group, so a run
+    left in the daemon's group could take the daemon down with it.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 class Daemon:
     """One daemon instance: guard ownership plus the jobs it schedules."""
 
@@ -770,6 +782,7 @@ class Daemon:
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                **_detach_kwargs(),
             )
             _logger.info(
                 "spawned run workspace=%s slug=%s child_pid=%s", workspace, slug, proc.pid

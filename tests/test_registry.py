@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from backseat_harness import db, spawn
@@ -138,6 +141,31 @@ def test_claim_auto_adds_the_workspace_then_never_bumps_again(conn, workspace: P
     db.claim_task(conn, workspace, "tasks/y", 101, 1001.0)
     assert db.workspaces_version(conn) == 1
     assert len(db.list_tasks(conn)) == 2
+
+
+def test_claim_stamps_the_harness_process_start_not_the_wall_clock(
+    conn, workspace: Path, monkeypatch
+):
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
+    db.claim_task(conn, workspace, "tasks/x", 100)
+    assert db.get_task(conn, workspace, "tasks/x")["harness_start"] == 1000.0
+
+
+def test_a_harness_that_worked_before_claiming_still_reads_live(
+    conn, workspace: Path, monkeypatch
+):
+    """Q1: a wall-clock stamp taken after 2.5s of pre-claim work reads the live
+    harness as dead (START_TOLERANCE_S is 2.0s). The process start does not."""
+    monkeypatch.setattr(db, "_process", lambda pid: psutil.Process(int(pid)))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        time.sleep(2.5)
+        db.claim_task(conn, workspace, "tasks/x", child.pid)
+        row = db.get_task(conn, workspace, "tasks/x")
+        assert db.pid_live(row["harness_pid"], row["harness_start"]) is True
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_claim_conflicts_while_the_existing_harness_is_live(
@@ -302,6 +330,9 @@ def test_run_claims_before_run_task_releases_after_and_leaves_no_row(
 ):
     import backseat_harness.cli as cli
     from backseat_harness.cli import main
+    # Our own claim reads our start; stub it so these run-level tests
+    # never ask the real OS about this process.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
 
     assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
     seen = {}
@@ -351,6 +382,134 @@ def test_run_conflict_with_a_live_claim_exits_2_and_claims_nothing(
     assert row["provider_pids"] is None
 
 
+# --- run --interrupt (2-plan §3d, Q10) ---------------------------------------
+#
+# A brief on a live lane stops that lane first, then claims it. The stop itself
+# is faked (its killer and grace are covered in test_cli.py); what is under test
+# here is the wiring: one stop, the claim taken after it, and a refusal that
+# runs nothing.
+
+
+def _live_lane_fakes(monkeypatch, alive: dict[int, float]):
+    """Make ``alive`` (pid -> start) the only live processes for ``pid_live``."""
+    import backseat_harness.cli as cli
+
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
+
+    def _process(pid):
+        if pid not in alive:
+            raise db.psutil.NoSuchProcess(pid)
+        return FakeProc(alive[pid])
+
+    monkeypatch.setattr(db, "_process", _process)
+    return cli
+
+
+def test_interrupt_stops_the_live_lane_once_then_claims_and_runs(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    alive = {100: 1000.0}
+    cli = _live_lane_fakes(monkeypatch, alive)
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, REL, 100, 1000.0)
+    stops = []
+
+    def fake_stop(conn, workspace_path, relpath, **kwargs):
+        stops.append(relpath)
+        alive.pop(100)  # the stop took the holder down
+        return None
+
+    monkeypatch.setattr(cli, "_stop_lane", fake_stop)
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen["brief"] = kwargs["owner_brief"]
+        with db.open_db() as conn:
+            seen["row"] = db.get_task(conn, workspace, REL)
+        return _complete()
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    assert main(["-C", str(workspace), "run", "t", "brief", "--interrupt"]) == 0
+    assert stops == [REL]
+    assert seen["brief"] == "brief"
+    assert seen["row"]["harness_pid"] == os.getpid()
+
+
+def test_a_brief_without_interrupt_on_a_live_lane_refuses_and_stops_nothing(
+    workspace, monkeypatch, capsys
+):
+    from backseat_harness.cli import main
+
+    alive = {100: 1000.0}
+    cli = _live_lane_fakes(monkeypatch, alive)
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, REL, 100, 1000.0)
+
+    def _no_stop(*args, **kwargs):
+        raise AssertionError("no --interrupt means no stop")
+
+    def _no_run(**kwargs):
+        raise AssertionError("run_task must not start after a ClaimConflict")
+
+    monkeypatch.setattr(cli, "_stop_lane", _no_stop)
+    monkeypatch.setattr(cli, "run_task", _no_run)
+    assert main(["-C", str(workspace), "run", "t", "brief"]) == 2
+    assert "already running" in capsys.readouterr().out
+    with db.open_db() as conn:
+        assert db.get_task(conn, workspace, REL)["harness_pid"] == 100
+
+
+def test_interrupt_refused_by_the_stop_exits_2_and_runs_nothing(
+    workspace, monkeypatch, capsys
+):
+    from backseat_harness.cli import main
+
+    alive = {100: 1000.0}
+    cli = _live_lane_fakes(monkeypatch, alive)
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, REL, 100, 1000.0)
+    refusal = "lane t still running after 5s; not taking over"
+    monkeypatch.setattr(cli, "_stop_lane", lambda *a, **kw: refusal)
+
+    def _no_run(**kwargs):
+        raise AssertionError("run_task must not start after a refused stop")
+
+    monkeypatch.setattr(cli, "run_task", _no_run)
+    assert main(["-C", str(workspace), "run", "t", "brief", "--interrupt"]) == 2
+    assert refusal in capsys.readouterr().out
+    with db.open_db() as conn:
+        assert db.get_task(conn, workspace, REL)["harness_pid"] == 100
+
+
+def test_a_second_claim_after_the_stop_still_refuses(workspace, monkeypatch, capsys):
+    from backseat_harness.cli import main
+
+    alive = {100: 1000.0}
+    cli = _live_lane_fakes(monkeypatch, alive)
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, REL, 100, 1000.0)
+
+    def fake_stop(conn, workspace_path, relpath, **kwargs):
+        # The holder dies, and another harness claims the lane in the gap.
+        alive.pop(100)
+        alive[200] = 2000.0
+        db.claim_task(conn, workspace_path, relpath, 200, 2000.0)
+        return None
+
+    monkeypatch.setattr(cli, "_stop_lane", fake_stop)
+
+    def _no_run(**kwargs):
+        raise AssertionError("run_task must not start after a second conflict")
+
+    monkeypatch.setattr(cli, "run_task", _no_run)
+    assert main(["-C", str(workspace), "run", "t", "brief", "--interrupt"]) == 2
+    assert "already running" in capsys.readouterr().out
+
+
 def test_validation_failure_before_the_hooks_never_touches_the_registry(
     workspace: Path,
 ):
@@ -370,13 +529,23 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
     """The amendment (2-plan §2): the sweep is table-wide, not per-workspace."""
     import backseat_harness.cli as cli
     from backseat_harness.cli import main
+    # Our own claim reads our start; stub it so these run-level tests
+    # never ask the real OS about this process.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
 
     assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
     other = tmp_path / "elsewhere"
     with db.open_db() as conn:
-        # Orphaned harness, provider still alive -> confirm and kill (goal:12).
+        # Orphaned harness, provider still alive at its recorded start ->
+        # confirm and kill (goal:12).
         db.claim_task(conn, other, ".backseat/tasks/a", 111, 111.0)
-        db.record_provider(conn, other, ".backseat/tasks/a", [999])
+        db.record_provider(conn, other, ".backseat/tasks/a", [999], [999.0])
+        # Orphaned harness, provider alive but with no recorded start -> the
+        # row is deleted and the provider is spared. Its pid cannot be told
+        # from a recycled stranger, and the sweep never kills an unconfirmed
+        # pid (3a Q4a). This expectation used to be killed; it changed then.
+        db.claim_task(conn, other, ".backseat/tasks/e", 600, 600.0)
+        db.record_provider(conn, other, ".backseat/tasks/e", [555])
         # Orphaned harness, no provider ever spawned -> row deleted only.
         db.claim_task(conn, other, ".backseat/tasks/b", 300, 300.0)
         # Orphaned harness, provider also dead -> row deleted, nothing killed.
@@ -388,7 +557,12 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
 
     # Absent from the map = NoSuchProcess = dead; a FakeProc = live at its
     # recorded start. Exactly the pids above and no others are consulted.
-    procs = {400: FakeProc(4000.0), 888: FakeProc(888.0), 999: FakeProc(999.0)}
+    procs = {
+        400: FakeProc(4000.0),
+        888: FakeProc(888.0),
+        999: FakeProc(999.0),
+        555: FakeProc(555.0),
+    }
 
     def _process(pid):
         if pid in procs:
@@ -397,7 +571,9 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
 
     monkeypatch.setattr(db, "_process", _process)
     killed: list[int] = []
-    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+    monkeypatch.setattr(
+        db.spawn, "kill_pid_tree", lambda pid, *, protect=frozenset(): killed.append(pid)
+    )
     monkeypatch.setattr(cli, "run_task", _complete)
 
     assert main(["-C", str(workspace), "run", "t"]) == 0
@@ -406,10 +582,13 @@ def test_sweep_scans_every_workspace_kills_live_orphans_and_spares_live_tasks(
         assert db.get_task(conn, other, ".backseat/tasks/a") is None
         assert db.get_task(conn, other, ".backseat/tasks/b") is None
         assert db.get_task(conn, other, ".backseat/tasks/c") is None
+        assert db.get_task(conn, other, ".backseat/tasks/e") is None
         alive = db.get_task(conn, other, ".backseat/tasks/d")
     assert alive is not None
     assert alive["harness_pid"] == 400
     assert alive["provider_pids"] == "[888]"
+    # 999 is killed because its start is confirmed. 555 is live but has no
+    # recorded start, so it is not killed even though it is running.
     assert killed == [999]
 
 
@@ -420,6 +599,9 @@ def test_the_sweep_spares_a_recycled_provider_pid(
     process reads dead, so the row is deleted without killing the stranger."""
     import backseat_harness.cli as cli
     from backseat_harness.cli import main
+    # Our own claim reads our start; stub it so these run-level tests
+    # never ask the real OS about this process.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
 
     assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
     other = tmp_path / "elsewhere"
@@ -440,7 +622,9 @@ def test_the_sweep_spares_a_recycled_provider_pid(
 
     monkeypatch.setattr(db, "_process", _process)
     killed: list[int] = []
-    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+    monkeypatch.setattr(
+        db.spawn, "kill_pid_tree", lambda pid, *, protect=frozenset(): killed.append(pid)
+    )
     monkeypatch.setattr(cli, "run_task", _complete)
 
     assert main(["-C", str(workspace), "run", "t"]) == 0
@@ -472,6 +656,12 @@ def test_provider_spawn_during_the_run_lands_in_the_claimed_row(
     """The spawn.py hook: a real Popen during run_task records pid+start."""
     import backseat_harness.cli as cli
     from backseat_harness.cli import main
+    # Our own claim reads our start; stub it so these run-level tests
+    # never ask the real OS about this process.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
+    # A real child: its survivor check reads its real pid, so the psutil guard
+    # steps aside here. Not a fake pid, so the real seam is the right one.
+    monkeypatch.setattr(db, "_process", db.psutil.Process)
 
     assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
     seen = {}
@@ -508,6 +698,9 @@ def test_provider_spawn_during_the_run_lands_in_the_claimed_row(
 def test_release_runs_even_when_run_task_raises(workspace: Path, monkeypatch):
     import backseat_harness.cli as cli
     from backseat_harness.cli import main
+    # Our own claim reads our start; stub it so these run-level tests
+    # never ask the real OS about this process.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
 
     assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
     seen = {}
@@ -526,6 +719,69 @@ def test_release_runs_even_when_run_task_raises(workspace: Path, monkeypatch):
     with db.open_db() as conn:
         assert db.get_task(conn, workspace, REL) is None
     assert spawn._provider_recorder.get() is None
+
+
+# --- lane kills (3a) -----------------------------------------------------------
+
+
+def test_lane_protect_names_the_daemon_while_its_guard_is_live(conn, monkeypatch):
+    db.claim_daemon(conn, 111, 1000.0)
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
+    assert db.lane_protect(conn) == frozenset({111})
+
+
+def test_lane_protect_is_empty_for_a_dead_daemon(conn, monkeypatch):
+    db.claim_daemon(conn, 111, 1000.0)
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0, running=False))
+    assert db.lane_protect(conn) == frozenset()
+
+
+def test_lane_protect_is_empty_when_the_daemon_pid_was_recycled(conn, monkeypatch):
+    db.claim_daemon(conn, 111, 1000.0)
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(9999.0))
+    assert db.lane_protect(conn) == frozenset()
+
+
+def test_lane_protect_is_empty_with_no_daemon_record(conn):
+    assert db.lane_protect(conn) == frozenset()
+
+
+def test_kill_lane_entry_refuses_a_none_start_even_for_a_live_pid(conn, monkeypatch):
+    # The pid is live (existence would pass), but its start is unknown, so it
+    # could be a recycled stranger. Refused before any liveness is asked.
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
+    killed: list[int] = []
+    assert db.kill_lane_entry(conn, 4242, None, killer=killed.append) is False
+    assert killed == []
+
+
+def test_kill_lane_entry_refuses_a_dead_or_recycled_pid(conn, monkeypatch):
+    killed: list[int] = []
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(9999.0))
+    assert db.kill_lane_entry(conn, 4242, 1000.0, killer=killed.append) is False
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0, running=False))
+    assert db.kill_lane_entry(conn, 4242, 1000.0, killer=killed.append) is False
+    assert killed == []
+
+
+def test_kill_lane_entry_kills_a_confirmed_pid_with_the_pid_alone(conn, monkeypatch):
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
+    killed: list[int] = []
+    assert db.kill_lane_entry(conn, 4242, 1000.0, killer=killed.append) is True
+    assert killed == [4242]
+
+
+def test_kill_lane_entry_default_killer_protects_the_live_daemon(conn, monkeypatch):
+    db.claim_daemon(conn, 111, 1000.0)
+    monkeypatch.setattr(db, "_process", lambda pid: FakeProc(1000.0))
+    seen: list[tuple[int, frozenset[int]]] = []
+
+    def fake_kill(pid, *, budget_s=0.0, protect=frozenset()):
+        seen.append((pid, protect))
+
+    monkeypatch.setattr(db.spawn, "kill_pid_tree", fake_kill)
+    assert db.kill_lane_entry(conn, 4242, 1000.0) is True
+    assert seen == [(4242, frozenset({111}))]
 
 
 # --- register-workspace (cli.py) ---------------------------------------------

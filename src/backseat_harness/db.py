@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -404,9 +403,13 @@ def claim_task(
     a given task — while a dead harness's stale row is overwritten in place,
     its provider columns cleared (the new run starts with no provider yet).
 
-    ``harness_start`` defaults to now; pass it explicitly in tests.
+    ``harness_start`` defaults to the harness pid's process start, read from
+    the OS, so the stored pid+start pair confirms the same process that
+    :func:`pid_live` later checks. A wall-clock stamp taken after any pre-claim
+    work reads as a different process once that work exceeds the tolerance.
+    Pass it explicitly in tests.
     """
-    start = time.time() if harness_start is None else harness_start
+    start = process_start(harness_pid) if harness_start is None else harness_start
     with _txn(conn):
         # Insert-or-nothing, then re-read: the id is needed either way, and
         # the bump happens only when the insert landed (set-change invariant).
@@ -551,6 +554,47 @@ def list_tasks(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+# --- lane kills ------------------------------------------------------------
+
+
+def lane_protect(conn: sqlite3.Connection) -> frozenset[int]:
+    """Pids a lane kill must never signal: the daemon, but only while its guard
+    row confirms live at the recorded start. A stale guard protects nothing,
+    so a dead daemon's pid can be reused without the lane kill refusing it.
+    """
+    record = _daemon_record(conn)
+    if record is not None and pid_live(record["pid"], record["start"]):
+        return frozenset({record["pid"]})
+    return frozenset()
+
+
+def _default_lane_killer(conn: sqlite3.Connection) -> Callable[[int], object]:
+    protect = lane_protect(conn)
+    return lambda pid: spawn.kill_pid_tree(pid, protect=protect)
+
+
+def kill_lane_entry(
+    conn: sqlite3.Connection,
+    pid: int,
+    start: float | None,
+    *,
+    killer: Callable[[int], object] | None = None,
+) -> bool:
+    """The single lane-kill entry point. True iff ``killer`` was called.
+
+    Refuses a ``None`` start (the pid cannot be told from a recycled stranger)
+    and a pid that is not live at its recorded start. ``killer`` is called with
+    the pid alone, so the fakes in the tests keep their one-argument shape; the
+    default killer is the real tree kill with the daemon protected.
+    """
+    if start is None or not pid_live(pid, start):
+        return False
+    if killer is None:
+        killer = _default_lane_killer(conn)
+    killer(int(pid))
+    return True
+
+
 # --- orphan sweep ----------------------------------------------------------
 
 
@@ -579,7 +623,8 @@ def sweep_orphans(
     Returns ``{"scanned", "removed", "killed"}``. ``kill`` overrides the
     killer; tests pass a fake so nothing real is ever signalled.
     """
-    killer = spawn.kill_pid_tree if kill is None else kill
+    # Protect set computed once per sweep, not per kill (3a item 5).
+    killer = _default_lane_killer(conn) if kill is None else kill
     scanned = removed = killed = 0
     for row in list_tasks(conn):
         scanned += 1
@@ -587,13 +632,13 @@ def sweep_orphans(
             continue
         if row["provider_pids"] is not None:
             for pid, start in provider_entries(row):
-                if pid_live(pid, start):
-                    try:
-                        killer(int(pid))
-                    except Exception:  # noqa: BLE001 - a dead sweep must not kill the run
-                        pass
-                    else:
+                try:
+                    # Refuses a None start and a pid that is not live at its
+                    # start, so an unrecorded provider is never signalled.
+                    if kill_lane_entry(conn, pid, start, killer=killer):
                         killed += 1
+                except Exception:  # noqa: BLE001 - a dead sweep must not kill the run
+                    pass
         cur = conn.execute(
             "DELETE FROM tasks WHERE id = ? AND harness_pid IS ?",
             (row["id"], row["harness_pid"]),

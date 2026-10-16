@@ -72,13 +72,27 @@ def resolve_argv(cmd: list[str]) -> list[str]:
     return [found, *cmd[1:]]
 
 
-def kill_pid_tree(pid: int, *, budget_s: float = DEFAULT_KILL_GRACE_S) -> None:
+def _group_of(pid: int) -> int | None:
+    """POSIX process group of ``pid``, or None when it cannot be read (dead, or Windows)."""
+    try:
+        return os.getpgid(pid)
+    except (OSError, AttributeError):
+        return None
+
+
+def kill_pid_tree(
+    pid: int,
+    *,
+    budget_s: float = DEFAULT_KILL_GRACE_S,
+    protect: frozenset[int] = frozenset(),
+) -> None:
     """Terminate ``pid`` and everything it spawned, inside the grace budget.
 
-    The pid-level half of the teardown, shared by two callers: the timeout
-    path (``_kill_tree``, which adds a direct-child ``kill()`` race fallback
-    on top) and the pre-run orphan sweep, which kills a provider whose
-    harness died (db.sweep_orphans).
+    The pid-level half of the teardown, shared by its callers: the timeout path
+    (``_kill_tree``, which adds a direct-child ``kill()`` race fallback on top),
+    survivor cleanup (``_kill_survivors``), the lane kills and the orphan sweep
+    (``db.kill_lane_entry``, ``db.sweep_orphans``), and the caddy stop
+    (``web/caddy.py``).
 
     ``Popen.kill`` is ``TerminateProcess`` on the direct child alone, and npm
     CLIs reach us through a ``.cmd`` shim -- so the direct child is ``cmd.exe``
@@ -99,8 +113,14 @@ def kill_pid_tree(pid: int, *, budget_s: float = DEFAULT_KILL_GRACE_S) -> None:
     can resolve to the caller itself, and a sweep that kills the daemon or
     harness mid-check-in leaves no finally behind -- the pid-level twin of
     the own-group guard below, refused on both platforms.
+
+    ``protect`` holds pids that must never be signalled (the daemon, for lane
+    kills). A protected pid is refused outright. On POSIX, a target whose
+    process group is also a protected pid's group is killed alone rather than
+    as a group, so the daemon's group never receives the signal. Callers that
+    stop a daemon on purpose (``daemon stop``/``restart``) pass no ``protect``.
     """
-    if pid == os.getpid():
+    if pid == os.getpid() or pid in protect:
         return
     if os.name == "nt":
         if budget_s > 0:
@@ -116,7 +136,8 @@ def kill_pid_tree(pid: int, *, budget_s: float = DEFAULT_KILL_GRACE_S) -> None:
     else:
         try:
             pgid = os.getpgid(pid)
-            if pgid != os.getpgid(0):
+            protected_groups = {_group_of(p) for p in protect}
+            if pgid != os.getpgid(0) and pgid not in protected_groups:
                 os.killpg(pgid, signal.SIGKILL)
             else:
                 os.kill(pid, signal.SIGKILL)
@@ -166,6 +187,26 @@ def _close_pipes(proc: subprocess.Popen, budget_s: float) -> None:
     worker = threading.Thread(target=close_all, daemon=True)
     worker.start()
     worker.join(timeout=max(budget_s, 0.0))
+
+
+def _kill_survivors(entries: list[tuple[int, float | None]]) -> None:
+    """Tree-kill each recorded ``(pid, start)`` that is still the same process.
+
+    A ``None`` start was never recorded, so the pid cannot be told from a
+    recycled stranger and is skipped; a recorded start that no longer matches
+    is a recycled pid and is skipped too. This is the same rule as
+    :func:`db.kill_lane_entry`, which this path cannot call: it has no
+    connection, and ``db`` imports this module.
+    """
+    from backseat_harness.db import pid_live  # local: db imports spawn at top
+
+    for pid, start in entries:
+        if start is None or not pid_live(pid, start):
+            continue
+        try:
+            kill_pid_tree(pid)
+        except Exception:  # noqa: BLE001 - cleanup must not break the return
+            pass
 
 
 def run_with_timeout(
@@ -292,11 +333,7 @@ def run_with_timeout(
                 stdout, stderr = partial_out, partial_err
             return CompletedCall(-1, _as_text(stdout), _as_text(stderr), True)
         # Kill any survivors of the process tree (Windows shim case).
-        for pid, _start in entries:
-            try:
-                kill_pid_tree(pid)
-            except Exception:  # noqa: BLE001 - cleanup must not break the return
-                pass
+        _kill_survivors(entries)
         # Normalized: with a log file there are no pipes, so communicate returns
         # None, and CompletedCall promises str. One shape for every consumer --
         # a caller must not have to know whether this call was logged.

@@ -1,10 +1,11 @@
 """CLI lane creation: `run`'s second argument is the goal, or a brief."""
 
 import json
+import os
 
 import pytest
 
-from backseat_harness import spawn
+from backseat_harness import db, spawn
 from backseat_harness.cli import _ensure_goal, main
 from backseat_harness.config import load_config
 
@@ -267,6 +268,207 @@ def test_takeover_no_resume_skips_loop(tmp_path, monkeypatch, capsys):
     rc = main(["-C", str(tmp_path), "takeover", "t", "--no-resume"])
     assert rc == 0
     assert "not resuming" in capsys.readouterr().out.lower()
+
+
+# --- takeover stops only the target lane (3c: Q6-Q9) ------------------------
+#
+# Real temp registry; the pid seam and the tree kill are faked over one live
+# set, so no test asks the OS about a pid or kills anything real.
+
+LANE_A = ".backseat/tasks/a"
+LANE_B = ".backseat/tasks/b"
+
+
+class _Live:
+    """The registry's pid seam over a fixed live set (pid -> recorded start)."""
+
+    def __init__(self, live: dict[int, float]):
+        self.live = live
+
+    def __call__(self, pid):
+        if pid not in self.live:
+            raise db.psutil.NoSuchProcess(pid)
+        return _Proc(self.live[pid])
+
+
+class _Proc:
+    def __init__(self, create_time: float):
+        self._create_time = create_time
+
+    def is_running(self) -> bool:
+        return True
+
+    def create_time(self) -> float:
+        return self._create_time
+
+
+def _seat(monkeypatch, live: dict[int, float], events: list[str], *, spare=frozenset()):
+    """Fake the pid seam and the tree kill. A kill logs ``kill(pid)`` and drops
+    the pid from ``live``; a pid in ``spare`` survives its kill."""
+    monkeypatch.setattr(db, "_process", _Live(live))
+
+    def fake_kill(pid, *, budget_s=0, protect=frozenset()):
+        if pid in protect:
+            return
+        events.append(f"kill({pid})")
+        if pid not in spare:
+            live.pop(pid, None)
+
+    monkeypatch.setattr(spawn, "kill_pid_tree", fake_kill)
+
+
+def test_takeover_stops_only_the_target_lane(tmp_path, monkeypatch):
+    """Q6: lane A's harness and providers die; lane B and the daemon are untouched."""
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    assert main(["-C", str(tmp_path), "init", "b", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, tmp_path, LANE_A, 101, 1000.0)
+        db.record_provider(conn, tmp_path, LANE_A, [201, 202], [2001.0, 2002.0])
+        db.claim_task(conn, tmp_path, LANE_B, 301, 3000.0)
+        db.record_provider(conn, tmp_path, LANE_B, [401], [4001.0])
+        db.claim_daemon(conn, 900, 9000.0)
+        before_b = db.get_task(conn, tmp_path, LANE_B)
+
+    live = {101: 1000.0, 201: 2001.0, 202: 2002.0, 301: 3000.0, 401: 4001.0, 900: 9000.0}
+    live[os.getpid()] = 5000.0  # the takeover's own claim stamps this pid
+    events: list[str] = []
+    _seat(monkeypatch, live, events)
+    monkeypatch.setattr(spawn, "run_interactive", lambda provider, native_id, cwd: 0)
+
+    assert main(["-C", str(tmp_path), "takeover", "a", "--no-resume"]) == 0
+    assert events == ["kill(101)", "kill(201)", "kill(202)"]
+    assert {301, 401, 900} <= set(live)
+    with db.open_db() as conn:
+        assert db.get_task(conn, tmp_path, LANE_B) == before_b
+        assert db.get_task(conn, tmp_path, LANE_A) is None
+
+
+def test_takeover_never_kills_a_none_start_provider(tmp_path, monkeypatch):
+    """Q4(b): a provider recorded with no start (legacy row or failed create_time)
+    is never signalled, yet the harness still stops and the takeover proceeds."""
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, tmp_path, LANE_A, 101, 1000.0)
+        db.record_provider(conn, tmp_path, LANE_A, [201, 202], [2001.0, None])
+
+    # 202 is live, so existence alone would pass: only the None guard spares it.
+    live = {101: 1000.0, 201: 2001.0, 202: 2002.0, os.getpid(): 5000.0}
+    events: list[str] = []
+    _seat(monkeypatch, live, events)
+
+    def fake_run_interactive(provider, native_id, cwd):
+        events.append("run_interactive")
+        return 0
+
+    monkeypatch.setattr(spawn, "run_interactive", fake_run_interactive)
+    assert main(["-C", str(tmp_path), "takeover", "a", "--no-resume"]) == 0
+    assert events == ["kill(101)", "kill(201)", "run_interactive"]
+    assert 202 in live
+    with db.open_db() as conn:
+        assert db.get_task(conn, tmp_path, LANE_A) is None
+
+
+def test_takeover_waits_for_the_lane_dead_before_the_handover(tmp_path, monkeypatch):
+    """Q7: kill(harness), kill(providers), then the claim and the handover."""
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, tmp_path, LANE_A, 101, 1000.0)
+        db.record_provider(conn, tmp_path, LANE_A, [201, 202], [2001.0, 2002.0])
+
+    live = {101: 1000.0, 201: 2001.0, 202: 2002.0, os.getpid(): 5000.0}
+    events: list[str] = []
+    _seat(monkeypatch, live, events)
+
+    def fake_run_interactive(provider, native_id, cwd):
+        events.append("run_interactive")
+        with db.open_db() as conn:
+            row = db.get_task(conn, tmp_path, LANE_A)
+        # The claim is ours by the time the terminal is handed over.
+        assert row["harness_pid"] == os.getpid()
+        return 0
+
+    monkeypatch.setattr(spawn, "run_interactive", fake_run_interactive)
+    assert main(["-C", str(tmp_path), "takeover", "a", "--no-resume"]) == 0
+    assert events == ["kill(101)", "kill(201)", "kill(202)", "run_interactive"]
+
+
+def test_takeover_refuses_when_the_harness_survives_the_grace(
+    tmp_path, monkeypatch, capsys
+):
+    """Q7 variant: a harness that outlives its kill refuses, and nothing is handed over."""
+    import backseat_harness.cli as cli
+
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, tmp_path, LANE_A, 101, 1000.0)
+        db.record_provider(conn, tmp_path, LANE_A, [201], [2001.0])
+
+    live = {101: 1000.0, 201: 2001.0, os.getpid(): 5000.0}
+    events: list[str] = []
+    _seat(monkeypatch, live, events, spare={101})
+    monkeypatch.setattr(cli, "_KILL_GRACE_S", 0.0)
+
+    def no_handover(provider, native_id, cwd):  # pragma: no cover - must not run
+        raise AssertionError("terminal must not be handed over while the harness lives")
+
+    monkeypatch.setattr(spawn, "run_interactive", no_handover)
+    assert main(["-C", str(tmp_path), "takeover", "a"]) == 2
+    assert "lane a still running after 0s; not taking over" in capsys.readouterr().out
+    assert events == ["kill(101)", "kill(201)"]
+    # No claim was taken, so the row still names the harness that survived.
+    with db.open_db() as conn:
+        assert db.get_task(conn, tmp_path, LANE_A)["harness_pid"] == 101
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["resumed", "no-resume", "interactive-exit", "interactive-raises", "resume-interrupted"],
+)
+def test_takeover_releases_the_claim_on_every_path(tmp_path, monkeypatch, case):
+    """Q9: no row survives any exit; a resumed run sees the recorder installed."""
+    import backseat_harness.cli as cli
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    _seat(monkeypatch, {os.getpid(): 5000.0}, [])
+    seen: dict = {}
+
+    def fake_run_interactive(provider, native_id, cwd):
+        if case == "interactive-raises":
+            raise RuntimeError("boom")
+        return 3 if case == "interactive-exit" else 0
+
+    def fake_run_task(**kwargs):
+        if case not in {"resumed", "resume-interrupted"}:
+            raise AssertionError("the resume must not run")
+        if case == "resume-interrupted":
+            raise KeyboardInterrupt
+        spawn._provider_recorder.get()([(777, 7770.0)])
+        with db.open_db() as conn:
+            row = db.get_task(conn, tmp_path, LANE_A)
+            seen["providers"] = [pid for pid, _ in db.provider_entries(row)]
+        return TaskResult(slug="a", status=TaskStatus.COMPLETE, iterations=1)
+
+    monkeypatch.setattr(spawn, "run_interactive", fake_run_interactive)
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    monkeypatch.setattr(cli, "_make_operator_invoker", lambda c, s: lambda p: "")
+
+    argv = ["-C", str(tmp_path), "takeover", "a"]
+    if case == "no-resume":
+        argv.append("--no-resume")
+    if case == "interactive-raises":
+        with pytest.raises(RuntimeError, match="boom"):
+            main(argv)
+    elif case == "resume-interrupted":
+        with pytest.raises(KeyboardInterrupt):
+            main(argv)
+    else:
+        rc = main(argv)
+        assert rc == {"resumed": 0, "no-resume": 0, "interactive-exit": 3}[case]
+    if case == "resumed":
+        assert seen["providers"] == [777]
+    with db.open_db() as conn:
+        assert db.get_task(conn, tmp_path, LANE_A) is None
 
 
 def test_resolve_argv_uses_path_lookup(monkeypatch):

@@ -79,6 +79,15 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
+  .run-notice {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.5rem 0.7rem;
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
 </style>
 
 <header class="chat-header task-header">
@@ -158,6 +167,9 @@
 
   <section>
     <h4>Run</h4>
+    {% if notice %}
+    <p class="run-notice" role="status">{{ notice }}</p>
+    {% endif %}
     <form class="run-form" method="post" action="/ws/{{ ws_id }}/tasks/{{ task.slug }}/run">
       <label for="brief">
         {{ task.run_action }} this task with an added instruction

@@ -19,6 +19,7 @@ resume.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -26,7 +27,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -99,6 +101,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "-p",
         "--prompt",
         help="override the first managed prompt (default: the operator plans first)",
+    )
+    run.add_argument(
+        "--interrupt",
+        action="store_true",
+        help="if this lane is already running, stop it (its harness and providers "
+        "only) and run with the brief instead of refusing",
     )
     run.set_defaults(func=_cmd_run)
 
@@ -337,22 +345,72 @@ def _cmd_run(args) -> int:
     operator_invoker = _make_operator_invoker(config, config.operator)
 
     # Registry hooks (2-plan §2), all *after* the rc-2 validation gates above
-    # so a refused run claims nothing: sweep orphans, claim this lane, record
-    # every provider spawn into the claimed row, and delete the row before
-    # leaving -- on every path, exceptions and Ctrl-C included.
+    # so a refused run claims nothing: sweep orphans, then hold this lane's
+    # claim for the run (see _lane_claim).
     task_relpath = paths.root.relative_to(config.workspace_root).as_posix()
     with db.open_db() as conn:
         db.sweep_orphans(conn)
-        try:
-            db.claim_task(
-                conn,
-                config.workspace_root,
-                task_relpath,
-                os.getpid(),
-            )
-        except db.ClaimConflict as exc:
-            _emit(args, {"slug": args.slug, "error": str(exc)}, str(exc))
+    with contextlib.ExitStack() as stack:
+        refusal = _claim_or_interrupt(stack, config, task_relpath, args.interrupt)
+        if refusal:
+            _emit(args, {"slug": args.slug, "error": refusal}, refusal)
             return 2
+        result = run_task(
+            slug=args.slug,
+            config=config,
+            provider=provider,
+            managed_runner=managed_runner,
+            operator_invoker=operator_invoker,
+            first_prompt=args.prompt,
+            owner_brief=brief,
+        )
+    _emit(args, result.to_dict(), _result_line(result))
+    return 0 if result.status.value in {"complete", "blocked"} else 1
+
+
+def _claim_or_interrupt(
+    stack: contextlib.ExitStack, config: Config, task_relpath: str, interrupt: bool
+) -> str | None:
+    """Enter this lane's claim on ``stack``; with ``interrupt``, stop a live holder first.
+
+    Returns None once the claim is held, else the refusal to print. A live
+    claim without ``interrupt`` refuses at once and stops nothing. With it, the
+    holder is stopped through :func:`_stop_lane` and the claim is taken again, so
+    a second conflict (someone else claimed in the gap) is still a refusal.
+    """
+    try:
+        stack.enter_context(_lane_claim(config, task_relpath))
+        return None
+    except db.ClaimConflict as exc:
+        if not interrupt:
+            return str(exc)
+    with db.open_db() as conn:
+        refusal = _stop_lane(conn, config.workspace_root, task_relpath)
+    if refusal:
+        return refusal
+    try:
+        stack.enter_context(_lane_claim(config, task_relpath))
+    except db.ClaimConflict as exc:
+        return str(exc)
+    return None
+
+
+@contextmanager
+def _lane_claim(config: Config, task_relpath: str) -> Iterator[None]:
+    """Hold this lane's registry claim for the body of the ``with``.
+
+    Claims the row first, so a :class:`db.ClaimConflict` surfaces on entry before
+    anything is installed. Then every provider spawn is recorded into the row,
+    the heartbeat and exitwatch run, and the row is deleted on every exit path,
+    exceptions and Ctrl-C included.
+    """
+    with db.open_db() as conn:
+        db.claim_task(
+            conn,
+            config.workspace_root,
+            task_relpath,
+            os.getpid(),
+        )
 
         def _note(line: str) -> None:
             print(f"[run] {line}", file=sys.stderr, flush=True)
@@ -377,15 +435,7 @@ def _cmd_run(args) -> int:
                     [start for _, start in entries],
                 )
             )
-            result = run_task(
-                slug=args.slug,
-                config=config,
-                provider=provider,
-                managed_runner=managed_runner,
-                operator_invoker=operator_invoker,
-                first_prompt=args.prompt,
-                owner_brief=brief,
-            )
+            yield
         finally:
             stop_heartbeat()
             # Clear first: a spawn during teardown must not write through a
@@ -395,8 +445,6 @@ def _cmd_run(args) -> int:
             db.release_task(conn, config.workspace_root, task_relpath)
             _note("teardown: row released")
             restore_exitwatch()
-    _emit(args, result.to_dict(), _result_line(result))
-    return 0 if result.status.value in {"complete", "blocked"} else 1
 
 
 def _start_run_heartbeat(
@@ -475,6 +523,42 @@ def _result_line(result) -> str:
     return line
 
 
+def _stop_lane(conn, workspace: Path, task_relpath: str) -> str | None:
+    """Stop this lane's harness and providers, then wait until they are dead.
+
+    Returns None once the lane is stopped or was never running, else the refusal
+    to print. The harness goes first so it cannot spawn another provider. The
+    providers are the ones known before the harness kill, plus any the harness
+    recorded before it died, re-read from the row. Only confirmed pid+start
+    pairs are killed or waited on; :func:`db.kill_lane_entry` refuses the rest.
+    A harness with no recorded start that still answers to its pid is waited on
+    too, so an unidentifiable live harness refuses here rather than being taken
+    over under.
+    """
+    grace = _KILL_GRACE_S
+    row = db.get_task(conn, workspace, task_relpath)
+    if row is None or not db.pid_live(row["harness_pid"], row["harness_start"]):
+        return None
+    harness = (row["harness_pid"], row["harness_start"])
+    providers = db.provider_entries(row)
+    db.kill_lane_entry(conn, *harness)
+    after = db.get_task(conn, workspace, task_relpath)
+    if after is not None:
+        providers += [e for e in db.provider_entries(after) if e not in providers]
+    for pid, start in providers:
+        db.kill_lane_entry(conn, pid, start)
+
+    def _stopped() -> bool:
+        if db.pid_live(*harness):
+            return False
+        return not any(db.pid_live(pid, start) for pid, start in providers if start is not None)
+
+    if _wait_for(_stopped, grace):
+        return None
+    slug = task_relpath.rsplit("/", 1)[-1]
+    return f"lane {slug} still running after {grace:g}s; not taking over"
+
+
 def _cmd_takeover(args) -> int:
     """Human takeover: drive the managed session by hand, then resume the loop.
 
@@ -502,39 +586,50 @@ def _cmd_takeover(args) -> int:
         if state.status is TaskStatus.BLOCKED and state.reason:
             print(f"This lane is blocked on a question from the operator:\n  {state.reason}")
 
+    task_relpath = paths.root.relative_to(config.workspace_root).as_posix()
     with db.open_db() as conn:
-        for row in db.list_tasks(conn):
-            for pid, start in db.provider_entries(row):
-                if db.pid_live(pid, start):
-                    spawn.kill_pid_tree(pid)
+        msg = _stop_lane(conn, config.workspace_root, task_relpath)
+    if msg:
+        _emit(args, {"slug": args.slug, "error": msg}, msg)
+        return 2
 
-    binding = storage.load_binding(paths)
-    provider = _managed_provider(config, binding)
-    native_id = binding.current.native_id if binding and binding.current else None
+    # Hold the claim from here through the handover and the resume, so a daemon
+    # check-in or a bare run sees a live lane and cannot start a second harness.
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_lane_claim(config, task_relpath))
+        except db.ClaimConflict:
+            msg = "lane was restarted; retry"
+            _emit(args, {"slug": args.slug, "error": msg}, msg)
+            return 2
 
-    where = f"session {native_id}" if native_id else "a fresh session"
-    print(f"Handing you {provider.name} ({where}). Advance it, then quit to resume.")
-    code = spawn.run_interactive(provider, native_id, config.workspace_root)
-    if code != 0:
-        _emit(
-            args,
-            {"slug": args.slug, "interactive_exit_code": code},
-            f"Interactive session exited with code {code}; not resuming.",
+        binding = storage.load_binding(paths)
+        provider = _managed_provider(config, binding)
+        native_id = binding.current.native_id if binding and binding.current else None
+
+        where = f"session {native_id}" if native_id else "a fresh session"
+        print(f"Handing you {provider.name} ({where}). Advance it, then quit to resume.")
+        code = spawn.run_interactive(provider, native_id, config.workspace_root)
+        if code != 0:
+            _emit(
+                args,
+                {"slug": args.slug, "interactive_exit_code": code},
+                f"Interactive session exited with code {code}; not resuming.",
+            )
+            return code
+        if args.no_resume:
+            _emit(args, {"slug": args.slug, "resumed": False}, "Handed off; not resuming.")
+            return 0
+
+        # Resume: no first_prompt, so the operator re-plans from the advanced session.
+        result = run_task(
+            slug=args.slug,
+            config=config,
+            provider=provider,
+            managed_runner=run_turn,
+            operator_invoker=_make_operator_invoker(config, config.operator),
+            first_prompt=None,
         )
-        return code
-    if args.no_resume:
-        _emit(args, {"slug": args.slug, "resumed": False}, "Handed off; not resuming.")
-        return 0
-
-    # Resume: no first_prompt, so the operator re-plans from the advanced session.
-    result = run_task(
-        slug=args.slug,
-        config=config,
-        provider=provider,
-        managed_runner=run_turn,
-        operator_invoker=_make_operator_invoker(config, config.operator),
-        first_prompt=None,
-    )
     _emit(args, result.to_dict(), _result_line(result))
     return 0 if result.status.value in {"complete", "blocked"} else 1
 

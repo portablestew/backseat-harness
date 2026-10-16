@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from backseat_harness import spawn
+from backseat_harness import db, spawn
 from backseat_harness.providers.base import ProviderError, SpawnSpec, TurnResult
 
 
@@ -62,6 +62,63 @@ def test_kill_pid_tree_refuses_to_target_this_process(monkeypatch):
     if hasattr(spawn.os, "killpg"):
         monkeypatch.setattr(spawn.os, "killpg", _boom)
     spawn.kill_pid_tree(os.getpid())
+
+
+def _fake_posix(monkeypatch, groups: dict[int, int]) -> list[tuple[str, int]]:
+    """Pretend to be POSIX so the killpg branch runs on Windows.
+
+    ``groups`` maps pid -> pgid; key ``0`` is the caller's own group. Every
+    signal is recorded as ``(name, target)`` instead of sent.
+    """
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(spawn.os, "name", "posix")
+    monkeypatch.setattr(spawn.os, "getpgid", lambda pid: groups[pid], raising=False)
+    monkeypatch.setattr(
+        spawn.os, "killpg", lambda pgid, sig: calls.append(("killpg", pgid)), raising=False
+    )
+    monkeypatch.setattr(spawn.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
+    monkeypatch.setattr(spawn.signal, "SIGKILL", 9, raising=False)
+    return calls
+
+
+def test_kill_pid_tree_never_killpgs_a_group_a_protected_pid_shares(monkeypatch):
+    """Q2: a harness spawned without its own session inherits the daemon's group.
+    Killing its group would signal the daemon, so only the harness pid dies."""
+    calls = _fake_posix(monkeypatch, {0: 100, 4242: 200, 7000: 200})
+    spawn.kill_pid_tree(4242, protect=frozenset({7000}))
+    assert not any(name == "killpg" for name, _ in calls)
+    assert calls == [("kill", 4242)]
+
+
+def test_kill_pid_tree_still_killpgs_an_unrelated_group(monkeypatch):
+    """Q2 control: with a different group, the existing group kill is unchanged."""
+    calls = _fake_posix(monkeypatch, {0: 100, 4242: 300, 7000: 200})
+    spawn.kill_pid_tree(4242, protect=frozenset({7000}))
+    assert calls == [("killpg", 300)]
+
+
+def test_kill_pid_tree_keeps_the_own_group_guard(monkeypatch):
+    """Q3: the caller's-own-group guard still takes the plain kill, not killpg."""
+    calls = _fake_posix(monkeypatch, {0: 100, 4242: 100})
+    spawn.kill_pid_tree(4242)
+    assert calls == [("kill", 4242)]
+
+
+def test_kill_pid_tree_refuses_a_protected_pid_before_taskkill(monkeypatch):
+    """Q3: a protected pid gets no taskkill at all (the native branch)."""
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("kill_pid_tree signalled a protected pid")
+
+    monkeypatch.setattr(spawn.subprocess, "run", _boom)
+    spawn.kill_pid_tree(7000, protect=frozenset({7000}))
+
+
+def test_kill_pid_tree_refuses_a_protected_pid_on_posix(monkeypatch):
+    """Q3: the same refusal on the POSIX branch: no kill, no killpg."""
+    calls = _fake_posix(monkeypatch, {0: 100, 7000: 200})
+    spawn.kill_pid_tree(7000, protect=frozenset({7000}))
+    assert calls == []
 
 
 def test_prompt_arrives_on_stdin_not_argv(tmp_path):
@@ -305,3 +362,49 @@ def test_run_interactive_still_defers_to_the_human(monkeypatch):
     assert spawn.run_interactive(_Provider(), "ses_1", ".") == 0
     assert seen["cmd"] == ["fake-cli", "session", "ses_1"]
     assert seen["timeout"] is None  # no deadline is imposed on the human
+
+
+# --- survivor cleanup (spawn._kill_survivors) ---------------------------------
+#
+# Pid+start on the survivor side: the same rule as db.kill_lane_entry. The
+# helper has no connection, so it asks db.pid_live directly.
+
+
+def _survivor_fakes(monkeypatch, live: dict[int, float]) -> list[int]:
+    class _Proc:
+        def __init__(self, create_time: float):
+            self._create_time = create_time
+
+        def is_running(self) -> bool:
+            return True
+
+        def create_time(self) -> float:
+            return self._create_time
+
+    def _process(pid):
+        if pid not in live:
+            raise db.psutil.NoSuchProcess(pid)
+        return _Proc(live[pid])
+
+    killed: list[int] = []
+    monkeypatch.setattr(db, "_process", _process)
+    monkeypatch.setattr(spawn, "kill_pid_tree", lambda pid: killed.append(pid))
+    return killed
+
+
+def test_survivor_cleanup_skips_a_none_start_even_when_the_pid_is_live(monkeypatch):
+    killed = _survivor_fakes(monkeypatch, live={4242: 1000.0})
+    spawn._kill_survivors([(4242, None)])
+    assert killed == []
+
+
+def test_survivor_cleanup_skips_a_recycled_pid(monkeypatch):
+    killed = _survivor_fakes(monkeypatch, live={4242: 9999.0})
+    spawn._kill_survivors([(4242, 1000.0)])
+    assert killed == []
+
+
+def test_survivor_cleanup_kills_a_pid_confirmed_at_its_start(monkeypatch):
+    killed = _survivor_fakes(monkeypatch, live={4242: 1000.0})
+    spawn._kill_survivors([(4242, 1000.0)])
+    assert killed == [4242]

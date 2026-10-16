@@ -22,10 +22,12 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from backseat_harness import manager, storage
+from backseat_harness import db, manager, storage
 from backseat_harness.config import (
     DEFAULT_MANAGER_PROVIDER,
     STAGING_PREFIX,
@@ -86,11 +88,13 @@ def badge_for(status: TaskStatus | str) -> str:
 def run_action_for(task_dir: Path, status: str) -> str:
     """Verb for the Run block, from the lane's state (goal.md:35).
 
-    A lane with no ``state.json`` has never run, so the control starts it
-    ("Run"). ``continue`` means it is still in flight, so running again
-    interrupts it with the new brief ("Interrupt"). Anything else is restarted
-    ("Restart"). One rule feeds both the label and the button so they cannot
-    drift.
+    The label is chosen from the stored status alone, not from whether a
+    harness is live right now. A lane with no ``state.json`` has never run, so
+    the control starts it ("Run"). A ``continue`` lane is in flight ("Interrupt").
+    Any other status is run again from the top ("Restart"). A run from this form
+    with a brief passes ``--interrupt``, so a live harness is stopped first
+    whichever verb is shown. One rule feeds both the label and the button so they
+    cannot drift.
     """
     if not (task_dir / "state.json").exists():
         return "Run"
@@ -383,19 +387,25 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
     )
 
 
-def run_task_detached(workspace: Path | str, slug: str, brief: str | None = None) -> None:
+def run_task_detached(
+    workspace: Path | str, slug: str, brief: str | None = None, *, interrupt: bool = False
+) -> tuple[subprocess.Popen, Path, int]:
     """Launch ``backseat-harness run <slug> [brief]`` as a detached subprocess.
 
-    The subprocess is started with the workspace as its cwd and its output
-    discarded (or could be piped to a log file). The call returns immediately
-    without waiting for the run to complete.
+    The child's stdout and stderr are appended to the lane's ``daemon.log``, the
+    same file the daemon's spawns write to, so a refusal or a crash is readable
+    afterwards. ``interrupt`` adds ``--interrupt``, so a live lane is stopped
+    before the run claims it. The call does not wait for the run.
+
+    Returns ``(proc, log_path, offset)``: the child, its log, and the log size
+    before the launch, so the caller can read only what this run wrote.
 
     Args:
         workspace: Workspace root path (containing .backseat/)
         slug: Task slug to run
         brief: Optional brief text to pass to the run command
+        interrupt: Stop a live lane and run with the brief (``run --interrupt``)
     """
-    import subprocess
     import sys
 
     ws_path = Path(workspace).expanduser().resolve()
@@ -403,26 +413,73 @@ def run_task_detached(workspace: Path | str, slug: str, brief: str | None = None
     # Build the command: python -m backseat_harness.cli run <slug> [brief]
     # Using -m so it uses the same interpreter as the web server
     cmd = [sys.executable, "-m", "backseat_harness.cli", "-C", str(ws_path), "run", slug]
+    if interrupt:
+        cmd.append("--interrupt")
     if brief:
         cmd.append(brief)
 
+    log_path = ws_path / ".backseat" / "tasks" / slug / "daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    offset = log_path.stat().st_size if log_path.exists() else 0
+
     # Start detached - on Windows use CREATE_NEW_PROCESS_GROUP, on Unix use start_new_session
-    if sys.platform == "win32":
-        subprocess.Popen(
+    detach = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
+    log = log_path.open("ab")
+    try:
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ws_path),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            **detach,
         )
-    else:
-        subprocess.Popen(
-            cmd,
-            cwd=str(ws_path),
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    finally:
+        # The child holds its own inherited copy; ours closes either way.
+        log.close()
+    return proc, log_path, offset
+
+
+def run_start_notice(
+    workspace: Path | str,
+    slug: str,
+    proc: subprocess.Popen,
+    log_path: Path,
+    offset: int,
+    *,
+    timeout_s: float,
+) -> str | None:
+    """Wait for a detached run to take the lane, and return what to tell the owner.
+
+    Returns None when the run holds the lane (its harness is ``proc``), or when
+    it exits 0. A nonzero exit returns its log text since ``offset``, trimmed to
+    the last 500 characters, or ``run exited <rc>`` when that is empty. A run
+    still neither claiming nor exiting after ``timeout_s`` returns a
+    "still starting" notice.
+    """
+    ws_path = Path(workspace).expanduser().resolve()
+    relpath = f".backseat/tasks/{slug}"
+    deadline = time.monotonic() + timeout_s
+    while True:
+        with db.open_db() as conn:
+            row = db.get_task(conn, ws_path, relpath)
+        if row is not None and row["harness_pid"] == proc.pid:
+            return None
+        rc = proc.poll()
+        if rc is not None:
+            if rc == 0:
+                return None
+            with log_path.open("rb") as fh:
+                fh.seek(offset)
+                text = fh.read().decode("utf-8", errors="replace").strip()
+            return text[-500:] if text else f"run exited {rc}"
+        if time.monotonic() >= deadline:
+            return "still starting; see daemon.log"
+        time.sleep(0.1)
 
 
 def generate_task_detached(workspace: Path | str, source_key: str, staging_name: str):

@@ -2435,6 +2435,17 @@ def _wait_exit(session_id: str, timeout: float = 30.0) -> None:
     raise AssertionError("the shell's child process never exited")
 
 
+class _FakeChild:
+    """A detached run as the Run route sees it: a pid, and a poll that reads ``rc``."""
+
+    def __init__(self, pid: int = 4242, rc: int | None = None):
+        self.pid = pid
+        self.rc = rc
+
+    def poll(self):
+        return self.rc
+
+
 def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: Path):
     ws_id = _register_workspace(workspace)
     assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
@@ -2442,11 +2453,12 @@ def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: P
     ws_arg = str(workspace.resolve())
 
     # Process-boundary stub: record the exact argv the CLI would be spawned with.
+    # rc 0 reads as a run that finished cleanly, so the route redirects plainly.
     spawned: list[tuple[list[str], dict]] = []
 
     def _record_popen(cmd, **kwargs):  # noqa: ANN001
         spawned.append((cmd, kwargs))
-        return object()
+        return _FakeChild(rc=0)
 
     monkeypatch.setattr(subprocess, "Popen", _record_popen)
 
@@ -2471,6 +2483,7 @@ def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: P
 
     assert len(spawned) == 2
     cmd, kwargs = spawned[0]
+    # A brief redirects the lane, so it carries --interrupt ahead of the brief.
     assert cmd == [
         sys.executable,
         "-m",
@@ -2479,13 +2492,97 @@ def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: P
         ws_arg,
         "run",
         slug,
+        "--interrupt",
         "also fix the flaky test",
     ]
     assert kwargs["cwd"] == ws_arg
-    # Without a brief the argv stops at the slug.
+    # Without a brief the argv stops at the slug: no --interrupt, no stop.
     assert spawned[1][0] == [
         sys.executable, "-m", "backseat_harness.cli", "-C", ws_arg, "run", slug
     ]
+    # Output goes to the lane's daemon.log, not to DEVNULL, for both runs.
+    log = workspace.resolve() / ".backseat" / "tasks" / slug / "daemon.log"
+    for _, kw in spawned:
+        assert kw["stdin"] == subprocess.DEVNULL
+        assert kw["stderr"] == subprocess.STDOUT
+        assert kw["stdout"].name == str(log)
+
+
+def test_run_that_cannot_take_the_lane_redirects_with_its_log_as_an_escaped_notice(
+    monkeypatch, workspace: Path
+):
+    ws_id = _register_workspace(workspace)
+    assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
+    slug = "viewer-task"
+    reason = "lane viewer-task still running after 5s; <b>not</b> taking over"
+
+    def _refusing_popen(cmd, **kwargs):  # noqa: ANN001
+        # The child's own refusal lands in the log the route reads from.
+        kwargs["stdout"].write(f"noise\n{reason}\n".encode())
+        return _FakeChild(rc=2)
+
+    monkeypatch.setattr(subprocess, "Popen", _refusing_popen)
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/tasks/{slug}/run",
+            data={"brief": "redirect"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        location = resp.headers["location"]
+        assert location.startswith(f"/ws/{ws_id}/tasks/{slug}?notice=")
+        page = client.get(location)
+
+    assert page.status_code == 200
+    assert 'class="run-notice"' in page.text
+    assert "lane viewer-task still running after 5s;" in page.text
+    # Escaped, so the markup in the log shows as text and does not render.
+    assert "&lt;b&gt;not&lt;/b&gt;" in page.text
+    assert "<b>not</b>" not in page.text
+
+
+def test_run_that_takes_the_lane_redirects_plainly(monkeypatch, workspace: Path):
+    ws_id = _register_workspace(workspace)
+    assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
+    slug = "viewer-task"
+
+    def _claiming_popen(cmd, **kwargs):  # noqa: ANN001
+        # The child's claim is the success signal: its harness is the proc's pid.
+        with db.open_db() as conn:
+            db.claim_task(conn, workspace, f".backseat/tasks/{slug}", 4242, 1000.0)
+        return _FakeChild(pid=4242)
+
+    monkeypatch.setattr(subprocess, "Popen", _claiming_popen)
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/tasks/{slug}/run",
+            data={"brief": "redirect"},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/ws/{ws_id}/tasks/{slug}"
+
+
+def test_run_slow_to_take_the_lane_says_still_starting(monkeypatch, workspace: Path):
+    from backseat_harness.web.routes import task as task_route
+
+    ws_id = _register_workspace(workspace)
+    assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
+    slug = "viewer-task"
+    monkeypatch.setattr(task_route, "_START_WAIT_S", 0.2)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeChild(rc=None))
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/tasks/{slug}/run",
+            data={"brief": "redirect"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert resp.headers["location"].endswith("?notice=still+starting%3B+see+daemon.log")
+        page = client.get(resp.headers["location"])
+
+    assert "still starting; see daemon.log" in page.text
 
 
 def test_task_viewer_takeover_starts_shell_running_takeover_cli(

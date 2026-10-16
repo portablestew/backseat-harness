@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -493,16 +494,20 @@ def test_an_orphaned_provider_is_swept_so_the_lane_can_start(
     )
     with db.open_db() as conn:
         db.claim_task(conn, workspace, ".backseat/tasks/resume", 4242, 1000.0)
-        db.record_provider(conn, workspace, ".backseat/tasks/resume", [9999])
+        # A recorded start lets the sweep confirm 9999 before killing it. An
+        # unrecorded start is spared (3a Q4a; see the registry sweep test).
+        db.record_provider(conn, workspace, ".backseat/tasks/resume", [9999], [9999.0])
 
     def _process(pid):
         if pid == 4242:
             raise db.psutil.NoSuchProcess(pid)
-        return FakeProc(1000.0)
+        return FakeProc(9999.0 if pid == 9999 else 1000.0)
 
     monkeypatch.setattr(db, "_process", _process)
     killed: list[int] = []
-    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+    monkeypatch.setattr(
+        db.spawn, "kill_pid_tree", lambda pid, *, protect=frozenset(): killed.append(pid)
+    )
 
     daemon.discover()
     daemon.check_in(ws)
@@ -539,7 +544,9 @@ def test_a_recycled_provider_pid_is_swept_without_killing(
 
     monkeypatch.setattr(db, "_process", _process)
     killed: list[int] = []
-    monkeypatch.setattr(db.spawn, "kill_pid_tree", killed.append)
+    monkeypatch.setattr(
+        db.spawn, "kill_pid_tree", lambda pid, *, protect=frozenset(): killed.append(pid)
+    )
 
     daemon.discover()
     daemon.check_in(ws)
@@ -1129,3 +1136,72 @@ def test_a_staging_dir_holding_a_goal_md_is_never_picked(workspace):
 
     assert daemon_mod._pick_lane(tasks) is None
     assert daemon_mod._lane_stamp(staging) is None
+
+
+# --- run isolation (3b, plan Q5) -----------------------------------------------
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_a_spawned_run_gets_its_own_session_or_process_group(
+    workspace: Path, daemon: Daemon, spawns, monkeypatch, platform
+):
+    """Q5: a run never shares the daemon's group, on either platform."""
+    # Both branches run on any host: the Windows flag is faked, since
+    # subprocess only defines it on win32, and sys.platform picks the branch.
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    monkeypatch.setattr(sys, "platform", platform)
+    ws = _register(workspace)
+
+    daemon._spawn(ws, "resume")
+
+    assert len(spawns) == 1
+    kwargs = spawns[0][1]
+    if platform == "win32":
+        assert kwargs["creationflags"] == 0x200
+        assert "start_new_session" not in kwargs
+    else:
+        assert kwargs["start_new_session"] is True
+        assert "creationflags" not in kwargs
+
+
+def test_a_takeover_holds_the_lane_so_no_respawn_and_no_second_run(
+    workspace: Path, daemon: Daemon, spawns, monkeypatch, capsys
+):
+    """Q8: while takeover's session is open, the daemon sees the lane busy and
+    spawns nothing, and a bare run of the same lane is refused with rc 2."""
+    import backseat_harness.cli as cli
+
+    me = os.getpid()
+    ws = _register(workspace)
+    tasks = workspace / ".backseat" / "tasks"
+    _lane(tasks, "resume", state={"slug": "resume", "status": "continue"}, mtime=time.time() - 500)
+
+    def _process(pid):
+        if pid != me:
+            raise db.psutil.NoSuchProcess(pid)
+        return FakeProc(5000.0)
+
+    monkeypatch.setattr(db, "_process", _process)
+    seen: dict = {}
+
+    def fake_run_interactive(provider, native_id, cwd):
+        with db.open_db() as conn:
+            row = db.get_task(conn, workspace, ".backseat/tasks/resume")
+        seen["claim"] = (row["harness_pid"], row["harness_start"])
+        daemon.discover()
+        daemon.check_in(ws)
+        seen["watchers"] = list(daemon._sched._pid_watchers)
+        seen["run_rc"] = cli.main(["-C", str(workspace), "run", "resume"])
+        return 0
+
+    monkeypatch.setattr(cli.spawn, "run_interactive", fake_run_interactive)
+    assert cli.main(["-C", str(workspace), "takeover", "resume", "--no-resume"]) == 0
+
+    # (a) the claim names this harness, live at its start.
+    assert seen["claim"] == (me, 5000.0)
+    # (b) the daemon saw a live busy lane: it watches that pid and spawns nothing.
+    assert seen["watchers"] == [(me, 5000.0)]
+    assert spawns == []
+    # (c) a bare run of the same lane is refused as already running.
+    assert seen["run_rc"] == 2
+    assert "already running" in capsys.readouterr().out
