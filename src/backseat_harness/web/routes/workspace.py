@@ -62,7 +62,7 @@ def workspace_page(request: Request, ws_id: int):
     name = ws_path.name
     generating = task_service.list_generating(ws_path)
     incomplete = task_service.list_incomplete(ws_path)
-    complete = task_service.list_complete(ws_path)
+    complete = task_service.list_complete(ws_path, limit=10)
     chats = chat_search_service.list_recent_chats(ws_path, limit=10)
     new_chat_providers = [
         {"name": p, "label": binary_for(p)} for p in on_path_providers()

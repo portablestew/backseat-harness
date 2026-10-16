@@ -2069,6 +2069,31 @@ def test_workspace_page_sections_tasks_status_and_chat_filtering(
     assert "<th>Session</th>" not in resp.text
 
 
+def test_workspace_page_completed_tasks_capped_at_ten(workspace: Path):
+    """12 complete lanes: the "Completed tasks" table shows only the ten most
+    recent, newest first, and the two oldest fall off the 10-cap."""
+    ws_id = _register_workspace(workspace)
+    for i in range(12):
+        _write_lane(
+            workspace,
+            f"done-{i:02d}",
+            status="complete",
+            updated_at=1_700_000_000.0 + i,
+        )
+
+    with _client() as client:
+        resp = client.get(f"/ws/{ws_id}")
+
+    assert resp.status_code == 200
+    completed = _section(resp.text, "<h4>Completed tasks</h4>")
+    rows = _data_rows(completed)
+    assert len(rows) == 10
+    assert ">done-11<" in rows[0]
+    assert ">done-02<" in rows[-1]
+    assert "done-01" not in completed
+    assert "done-00" not in completed
+
+
 def test_workspace_page_other_chats_is_one_capped_list(
     monkeypatch, workspace: Path
 ):

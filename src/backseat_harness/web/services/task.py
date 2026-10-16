@@ -168,10 +168,16 @@ def list_incomplete(workspace: Path | str) -> list[TaskInfo]:
     return [i for i in list_tasks(workspace) if i.status != TaskStatus.COMPLETE.value]
 
 
-def list_complete(workspace: Path | str) -> list[TaskInfo]:
-    """Completed lanes: the analogue of ``list_incomplete`` for the
-    "Completed tasks" section (goal G6)."""
-    return [i for i in list_tasks(workspace) if i.status == TaskStatus.COMPLETE.value]
+def list_complete(workspace: Path | str, limit: int | None = None) -> list[TaskInfo]:
+    """Completed lanes, newest ``updated_at`` first: the analogue of
+    ``list_incomplete`` for the "Completed tasks" section (goal G6).
+
+    ``limit`` caps the listing to the most recent lanes; the workspace page
+    shows only the latest ten completed tasks (``limit=10``). ``None`` keeps
+    every completed lane.
+    """
+    complete = [i for i in list_tasks(workspace) if i.status == TaskStatus.COMPLETE.value]
+    return complete if limit is None else complete[:limit]
 
 
 def list_recent(workspace: Path | str, limit: int = 10) -> list[TaskInfo]:
