@@ -42,6 +42,23 @@ path = "src/backseat_harness/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/backseat_harness"]
 
+# The sdist is for building the wheel, so it carries pyproject.toml, README,
+# LICENSE and src/ -- not the repo's dev tooling (trunk), agent config, caches,
+# or local harness state.
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.backseat",
+    "/.kilo",
+    "/.kiro",
+    "/.opencode",
+    "/.playwright-mcp",
+    "/.pyddock",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.trunk",
+    "/test_workspace",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",

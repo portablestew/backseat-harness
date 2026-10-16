@@ -1,7 +1,8 @@
 """Thin CLI wrapper over the loop library.
 
 Subcommands: init (scaffold a task lane), run (drive a task), takeover, status,
-list, register-workspace, daemon. Every command supports ``--format json`` so a
+list, register-workspace, daemon, setup-caddy (write ~/.backseat/caddyfile).
+Every command supports ``--format json`` so a
 parent workflow can wait on the process and parse machine-readable output. The
 CLI wires real subprocess runners for the managed and operator agents; the loop
 itself stays injectable.
@@ -222,6 +223,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "direct serves plain uvicorn, caddy requires the caddyfile (default: auto)",
     )
     web.set_defaults(func=_cmd_web)
+
+    setup = sub.add_parser(
+        "setup-caddy",
+        help="install caddy, open the site port, and write ~/.backseat/caddyfile",
+    )
+    setup.add_argument(
+        "--host", default=None, help="site host name (skip the prompt)"
+    )
+    setup.add_argument(
+        "--web-port",
+        type=int,
+        default=None,
+        help="web app port reverse_proxy targets (skip the prompt; matches [web] port)",
+    )
+    setup.add_argument(
+        "--user", default=None, help="basic-auth username (skip the prompt)"
+    )
+    setup.set_defaults(func=_cmd_setup_caddy)
 
     gen = sub.add_parser(
         "generate-task",
@@ -1070,6 +1089,45 @@ def _cmd_web(args) -> int:
     except (caddy.CaddyRefusal, OSError, ValueError) as exc:
         _emit(args, {"error": str(exc)}, f"web: refused to start: {exc}")
         return 2
+
+
+def _cmd_setup_caddy(args) -> int:
+    """Interactive caddy setup: install, open the port, write ~/.backseat/caddyfile.
+
+    Lazily imported so the web stack stays out of every other subcommand, and so
+    an existing wheel without this module still runs the rest of the CLI. A
+    refusal (unelevated Windows, no caddy/winget, a validation failure) exits 2
+    with the message, like the other pre-run refusals.
+    """
+    from backseat_harness.web.caddy_setup import ConsolePrompter, SetupRefusal, run_setup
+
+    try:
+        result = run_setup(
+            prompter=ConsolePrompter(),
+            site_host=args.host,
+            web_port=args.web_port,
+            username=args.user,
+        )
+    except SetupRefusal as exc:
+        _emit(args, {"error": str(exc)}, str(exc))
+        return 2
+    payload = {
+        "caddyfile": str(result.caddyfile),
+        "site_hosts": list(result.site_hosts),
+        "url": result.url,
+        "username": result.username,
+        "caddy_installed": result.caddy_installed,
+        "firewall_updated": result.firewall_updated,
+    }
+    text = (
+        f"Caddy setup complete ({result.caddyfile}).\n"
+        "Next:\n"
+        "  backseat-harness daemon install\n"
+        "  backseat-harness daemon restart\n"
+        f"Then open {result.url} and sign in as {result.username}."
+    )
+    _emit(args, payload, text)
+    return 0
 
 
 def _cmd_generate_task(args) -> int:
