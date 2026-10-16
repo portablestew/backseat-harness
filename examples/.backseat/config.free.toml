@@ -1,0 +1,7 @@
+[manager]
+provider = "opencode"
+model = "opencode/cat-jam-free"
+
+[models]
+default = "opencode/deepseek-v4.1-flash-free"
+planning = "opencode/space-bunny-free"

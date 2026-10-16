@@ -1,0 +1,7 @@
+[manager]
+provider = "claude"
+model = "sonnet"
+
+[models]
+default = "haiku"
+planning = "opus"

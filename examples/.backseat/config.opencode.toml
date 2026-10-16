@@ -1,0 +1,8 @@
+[manager]
+provider = "opencode"
+model = "opencode-go/mimo-v2.6-pro"
+
+[models]
+default = "opencode-go/deepseek-4.1-flash"
+planning = "opencode-go/glm-5.3"
+coding = "opencode-go/claude-haiku-5-5"
