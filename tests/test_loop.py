@@ -473,31 +473,26 @@ def test_resume_compacts_on_a_session_the_human_advanced(config, task, _history)
     assert storage.load_binding(paths).current.n == 2
 
 
-def test_managed_model_flag_is_passed(config, task):
-    """A dedicated [harness] model is forwarded to the managed turn as --model."""
-    from dataclasses import replace
-
-    slug, paths = task
-    config = replace(config, model="anthropic/claude-opus-4")
-    seen = {}
-
-    def runner(prov, spec):
-        seen["extra_args"] = spec.extra_args
-        return _managed_runner_ok(prov, spec)
-
-    run_task(
-        slug, config, FakeProvider(), runner,
-        lambda p: '{"verdict":"done"}', first_prompt="go",
-    )
-    assert seen["extra_args"] == ("--model", "anthropic/claude-opus-4")
-
-
-def test_managed_agent_flag_is_passed(config, task):
-    """A dedicated [harness] agent is forwarded to the managed turn as --agent."""
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        # A dedicated [harness] model is forwarded to the managed turn as --model.
+        ({"model": "anthropic/claude-opus-4"}, ("--model", "anthropic/claude-opus-4")),
+        # A dedicated [harness] agent is forwarded to the managed turn as --agent.
+        ({"agent": "my-builder"}, ("--agent", "my-builder")),
+        # extra_args first, then --model, then --agent (last wins in the CLI).
+        (
+            {"extra_args": ("--flag", "x"), "model": "m", "agent": "a"},
+            ("--flag", "x", "--model", "m", "--agent", "a"),
+        ),
+    ],
+    ids=["model", "agent", "declared-order"],
+)
+def test_managed_flags_are_forwarded_in_declared_order(config, task, overrides, expected):
     from dataclasses import replace
 
     slug, _ = task
-    config = replace(config, agent="my-builder")
+    config = replace(config, **overrides)
     seen = {}
 
     def runner(prov, spec):
@@ -508,26 +503,7 @@ def test_managed_agent_flag_is_passed(config, task):
         slug, config, FakeProvider(), runner,
         lambda p: '{"verdict":"done"}', first_prompt="go",
     )
-    assert seen["extra_args"] == ("--agent", "my-builder")
-
-
-def test_managed_flags_keep_declared_order(config, task):
-    """extra_args first, then --model, then --agent (last wins in the CLI)."""
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, extra_args=("--flag", "x"), model="m", agent="a")
-    seen = {}
-
-    def runner(prov, spec):
-        seen["extra_args"] = spec.extra_args
-        return _managed_runner_ok(prov, spec)
-
-    run_task(
-        slug, config, FakeProvider(), runner,
-        lambda p: '{"verdict":"done"}', first_prompt="go",
-    )
-    assert seen["extra_args"] == ("--flag", "x", "--model", "m", "--agent", "a")
+    assert seen["extra_args"] == expected
 
 
 # --- Per-turn model-slot resolution (docs 2-plan §3) ---
@@ -992,47 +968,25 @@ def test_bad_slot_and_disagreement_both_reach_the_prompt(config, task, capsys):
 # --- [models].default that binds no model id: never silent (both return sites)
 
 
-def test_unusable_default_binding_composes_harness_model_with_no_active_step(
-    config, task, capsys
+@pytest.mark.parametrize(
+    "steps",
+    [{}, {"s1": {"status": "active"}}],
+    ids=["no-active-step", "active-step-without-slot"],
+)
+def test_unusable_default_binding_composes_harness_model_at_both_return_sites(
+    config, task, capsys, steps
 ):
-    """The no-active-step return site. An empty [models].default used to hand
-    back '' and compose no --model at all, on a run whose [harness].model was
-    set, with nothing on any channel. Now that model is composed and the
-    deviation is named. load_config already drops such a pair, so this is a
-    Config built directly -- the same door the empty named slot had."""
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, model="cfg-model", models={"default": ""})
-    prompts: list[str] = []
-    seen: list[tuple] = []
-
-    run_task(
-        slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    assert seen == [("--model", "cfg-model")]
-    warning = (
-        "[models] default is '', not a model id; using [harness].model "
-        "('cfg-model') instead"
-    )
-    assert f"[warn] config: {warning}" in capsys.readouterr().err
-    assert f"Slot warning: {warning}" in prompts[-1]
-
-
-def test_unusable_default_binding_composes_harness_model_on_the_slot_fallback(
-    config, task, capsys
-):
-    """The same fix on the other return site: an active step naming no slot
-    falls through to the default binding, so the empty [models].default has to
-    be corrected there too, not only where nothing is active."""
+    """An empty [models].default used to hand back '' and compose no --model at
+    all, on a run whose [harness].model was set, with nothing on any channel.
+    Now that model is composed and the deviation is named, at both places the
+    default binding is read: with no active step, and with an active step naming
+    no slot, which falls through to the default. load_config already drops such
+    a pair, so this is a Config built directly -- the same door the empty named
+    slot had."""
     from dataclasses import replace
 
     slug, paths = task
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active"}}, "remarks": [],
-    }), encoding="utf-8")
+    paths.checklist.write_text(json.dumps({"steps": steps, "remarks": []}), encoding="utf-8")
     config = replace(config, model="cfg-model", models={"default": ""})
     prompts: list[str] = []
     seen: list[tuple] = []
@@ -1047,17 +1001,19 @@ def test_unusable_default_binding_composes_harness_model_on_the_slot_fallback(
         "[models] default is '', not a model id; using [harness].model "
         "('cfg-model') instead"
     )
-    assert f"Slot warning: {warning}" in prompts[-1]
     assert f"[warn] config: {warning}" in capsys.readouterr().err
+    assert f"Slot warning: {warning}" in prompts[-1]
 
 
 def test_usable_default_binding_is_composed_and_quiet(config, task, capsys):
     """The bar for this fix: nothing that came through load_config changes. A
     real [models].default is composed and silent; a Config with no `default`
-    key falls back to [harness].model and stays silent, exactly as before."""
+    key falls back to [harness].model and stays silent, exactly as before. A
+    valid named slot on a live step is quiet too, and its Model slots section
+    still renders."""
     from dataclasses import replace
 
-    slug, _ = task
+    slug, paths = task
     seen: list[tuple] = []
     prompts: list[str] = []
 
@@ -1075,6 +1031,15 @@ def test_usable_default_binding_is_composed_and_quiet(config, task, capsys):
 
     one(replace(config, model="cfg-model", models={"fast": "fast-model"}))
     assert seen[-1] == ("--model", "cfg-model")
+    assert "Slot warning:" not in prompts[-1]
+    assert "[warn]" not in capsys.readouterr().err
+
+    paths.checklist.write_text(json.dumps({
+        "steps": {"s1": {"status": "active", "model": "fast"}}, "remarks": [],
+    }), encoding="utf-8")
+    one(replace(config, model="cfg-model", models={"fast": "fast-model"}))
+    assert seen[-1] == ("--model", "fast-model")
+    assert "## Model slots" in prompts[-1]
     assert "Slot warning:" not in prompts[-1]
     assert "[warn]" not in capsys.readouterr().err
 
@@ -1096,27 +1061,6 @@ def test_non_string_model_treated_as_absent_with_warning(config, task, capsys):
     )
     assert seen == [("--model", "cfg-model")]  # default binding, slot ignored
     assert "'s1'" in capsys.readouterr().err
-
-
-def test_unknown_on_disk_slot_falls_back_with_warning(config, task, capsys):
-    """§5b disposition: default binding + stderr warn; prompt channel is step 6."""
-    from dataclasses import replace
-
-    slug, paths = task
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "ghost"}},
-        "remarks": [],
-    }), encoding="utf-8")
-    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
-    seen: list[tuple] = []
-
-    run_task(
-        slug, config, FakeProvider(), _spec_logger(seen),
-        lambda p: '{"verdict":"done"}', first_prompt="go",
-    )
-    assert seen == [("--model", "cfg-model")]
-    err = capsys.readouterr().err
-    assert "'ghost'" in err and "'s1'" in err
 
 
 def test_slot_with_empty_binding_warns_instead_of_silently_dropping_the_flag(
@@ -1215,22 +1159,33 @@ def test_empty_slot_binding_never_reaches_the_prompt_as_usable(config, task, cap
 # the harness has to name on both channels.
 
 
-def test_kiro_rejected_id_is_loud_naming_slot_and_id(config, task, capsys):
+@pytest.mark.parametrize(
+    "models, steps, source",
+    [
+        # A named slot: the complaint names the step and the slot it came from.
+        (
+            {"fast": "no-such-model-xyz"},
+            {"s1": {"status": "active", "model": "fast"}},
+            "(step 's1' slot 'fast')",
+        ),
+        # The default binding: no slot exists to blame, so the complaint names it.
+        ({"default": "no-such-model-xyz"}, {}, "([models] default)"),
+    ],
+    ids=["named-slot", "default-binding"],
+)
+def test_kiro_rejected_id_is_loud_naming_its_binding(
+    config, task, capsys, models, steps, source
+):
     """Refused-id branch, fresh turn. A [models] binding naming an id kiro does
     not have must be unmistakable: kiro quotes the id back in its runError, and
-    the harness names slot and id on stderr and in the operator prompt rather
-    than letting the turn end as an unnamed nonzero exit."""
+    the harness names the binding on stderr and in the operator prompt rather
+    than letting the turn end as an unnamed nonzero exit. The remedy ships with
+    the complaint, and no retired claim survives on either channel."""
     from dataclasses import replace
 
     slug, paths = task
-    config = replace(
-        config, provider="kiro", model="cfg-model",
-        models={"fast": "no-such-model-xyz"},
-    )
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "fast"}},
-        "remarks": [],
-    }), encoding="utf-8")
+    config = replace(config, provider="kiro", model="cfg-model", models=models)
+    paths.checklist.write_text(json.dumps({"steps": steps, "remarks": []}), encoding="utf-8")
     prompts: list[str] = []
     specs: list[SpawnSpec] = []
 
@@ -1249,10 +1204,7 @@ def test_kiro_rejected_id_is_loud_naming_slot_and_id(config, task, capsys):
     # Fresh turn: the id was still composed onto the argv.
     assert specs[0].resume_native_id is None
     assert specs[0].extra_args[-2:] == ("--model", "no-such-model-xyz")
-    loud = (
-        "kiro rejected model id 'no-such-model-xyz' (step 's1' slot 'fast'); "
-        "the turn produced no reply"
-    )
+    loud = f"kiro rejected model id 'no-such-model-xyz' {source}; the turn produced no reply"
     err = capsys.readouterr().err
     assert f"[warn] {loud}" in err
     # The remedy ships with the complaint: where valid ids come from.
@@ -1322,44 +1274,6 @@ def test_kiro_rejected_id_is_loud_on_the_resumed_turn(config, task, capsys):
     assert prompts[1].count("Slot warning:") == 1
 
 
-def test_kiro_rejected_id_names_the_default_binding_when_no_slot_supplied(
-    config, task, capsys
-):
-    """The default binding is a [models] binding too. With no active step the
-    id comes from [models].default, and that is what the complaint names -- no
-    slot exists to blame."""
-    from dataclasses import replace
-
-    slug, paths = task
-    config = replace(
-        config, provider="kiro", model="cfg-model",
-        models={"default": "no-such-model-xyz"},
-    )
-    prompts: list[str] = []
-    specs: list[SpawnSpec] = []
-
-    def runner(prov, spec):
-        specs.append(spec)
-        return TurnResult(
-            exit_code=1, timed_out=False, duration_s=0.2,
-            native_session_id="sess-1", stdout=_KIRO_RUNERROR, stderr="",
-        )
-
-    run_task(
-        slug, config, KiroProvider(), runner,
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    assert specs[0].extra_args[-2:] == ("--model", "no-such-model-xyz")
-    loud = (
-        "kiro rejected model id 'no-such-model-xyz' ([models] default); "
-        "the turn produced no reply"
-    )
-    err = capsys.readouterr().err
-    assert f"[warn] {loud}" in err
-    assert loud in prompts[-1]
-
-
 def test_failed_turn_without_a_refusal_signal_prints_no_rejection(config, task, capsys):
     """Exit 1 alone names nothing. The loop asks the provider what the CLI's
     own words say; a provider with no refusal vocabulary (the base default)
@@ -1407,54 +1321,6 @@ def test_operator_prompt_lists_configured_slots(config, task):
     assert "- `thinker`" in prompts[-1]
     # The default binding bullet renders even though no 'default' key was set.
     assert "- `default`" in prompts[-1]
-
-
-def test_on_disk_bad_slot_reaches_the_operator_prompt(config, task, capsys):
-    """§5b: the unknown-slot warning goes to stderr AND the operator prompt."""
-    from dataclasses import replace
-
-    slug, paths = task
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "ghost"}},
-        "remarks": [],
-    }), encoding="utf-8")
-    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
-    prompts: list[str] = []
-
-    run_task(
-        slug, config, FakeProvider(), _managed_runner_ok,
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    review_prompt = prompts[-1]
-    assert "## Model slots" in review_prompt
-    assert (
-        "Slot warning: step 's1' names model slot 'ghost', which no [models] "
-        "config defines; running the default model instead"
-    ) in review_prompt
-    # Still warned on stderr, never silent.
-    assert "does not honor" not in capsys.readouterr().err
-
-
-def test_clean_turn_carries_no_slot_warning(config, task, capsys):
-    """No bad slot, no kiro: the Model slots section renders sans warning."""
-    from dataclasses import replace
-
-    slug, paths = task
-    config = replace(config, model="cfg-model", models={"fast": "fast-model"})
-    paths.checklist.write_text(json.dumps({
-        "steps": {"s1": {"status": "active", "model": "fast"}},
-        "remarks": [],
-    }), encoding="utf-8")
-    prompts: list[str] = []
-
-    run_task(
-        slug, config, FakeProvider(), _managed_runner_ok,
-        lambda p: (prompts.append(p), '{"verdict":"done"}')[1],
-        first_prompt="go",
-    )
-    assert "## Model slots" in prompts[-1]
-    assert "Slot warning:" not in prompts[-1]
 
 
 # --- Bad slot in the verdict: reject / re-ask once / strip (docs 2-plan §5a) ---
@@ -1678,19 +1544,50 @@ def test_a_nonsense_budget_still_makes_one_attempt(config, task):
     assert len(prompts) == 1
 
 
-def test_a_timed_out_empty_reply_reports_the_timeout_not_a_format_error(config, task):
-    """An empty reply and an unreadable one are different faults, and an empty
-    one earns the timeout story only when the call was actually killed -- the
-    flag rides the reply here. The operator that gets re-asked is a fresh
-    invocation with no memory of the last, so saying which one it was is the
-    whole difference between a correction and a repeat -- and only the timeout
-    is something it can act on by answering faster."""
+@pytest.mark.parametrize(
+    "first_reply, must_say, must_not_say",
+    [
+        # An empty reply from a call that was killed: the timeout story is the
+        # correction, and the ceiling it blew is named so the fix is actionable.
+        (
+            OperatorReply("", timed_out=True),
+            ["was empty", "TIMEOUTs timeout", "process tree was terminated"],
+            ["no parsable verdict JSON"],
+        ),
+        # An empty reply from a call that ran to its end: no kill claim, no
+        # timeout advice; the real fault (no text came back) is named instead.
+        (
+            "",
+            ["was empty", "so nothing was killed, but no text came back"],
+            [
+                "TIMEOUTs timeout",
+                "process tree was terminated",
+                "validation tool calls",
+                "no parsable verdict JSON",
+            ],
+        ),
+        # Text that is not JSON: the re-ask names the JSON problem only.
+        (
+            "I could not decide.",
+            ["contained no parsable verdict JSON"],
+            ["was empty"],
+        ),
+    ],
+    ids=["timed-out-empty", "completed-empty", "unreadable"],
+)
+def test_a_bad_operator_reply_is_re_asked_with_the_fault_it_actually_had(
+    config, task, first_reply, must_say, must_not_say
+):
+    """An empty reply and an unreadable one are different faults. The operator
+    that gets re-asked is a fresh invocation with no memory of the last, so the
+    re-ask has to say which fault it was, and only the true one."""
     from dataclasses import replace
 
     slug, _ = task
     config = replace(config, models={"fast": "fast-model"})
+    timeout = str(config.operator.timeout_s)
     prompts: list[str] = []
-    responses = iter([OperatorReply("", timed_out=True), '{"verdict":"done"}'])
+    responses = iter([first_reply, '{"verdict":"done"}'])
 
     def operator_invoker(prompt: str) -> str:
         prompts.append(prompt)
@@ -1703,66 +1600,10 @@ def test_a_timed_out_empty_reply_reports_the_timeout_not_a_format_error(config, 
 
     assert len(prompts) == 2
     retried = prompts[1]
-    assert "was empty" in retried
-    assert "no parsable verdict JSON" not in retried
-    # The ceiling it blew is named, so the correction is actionable.
-    assert f"{config.operator.timeout_s}s timeout" in retried
-    assert "process tree was terminated" in retried
-
-
-def test_a_completed_empty_reply_reports_no_kill(config, task):
-    """An empty reply from a call that ran to its end was not killed, so the
-    re-ask must not claim a timeout never hit or a kill never done -- it names
-    the real fault (no text came back) and the correction that follows."""
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, models={"fast": "fast-model"})
-    prompts: list[str] = []
-    responses = iter(["", '{"verdict":"done"}'])
-
-    def operator_invoker(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(responses)
-
-    run_task(
-        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
-        first_prompt="go",
-    )
-
-    assert len(prompts) == 2
-    retried = prompts[1]
-    assert "was empty" in retried
-    # No kill claim and no timeout-budget advice: nothing timed out.
-    assert f"{config.operator.timeout_s}s timeout" not in retried
-    assert "process tree was terminated" not in retried
-    assert "validation tool calls" not in retried
-    # The real fault is named instead.
-    assert "so nothing was killed, but no text came back" in retried
-    # Still an empty-reply complaint, not a format one.
-    assert "no parsable verdict JSON" not in retried
-
-
-def test_an_unreadable_reply_names_the_json_problem_only(config, task):
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, models={"fast": "fast-model"})
-    prompts: list[str] = []
-    responses = iter(["I could not decide.", '{"verdict":"done"}'])
-
-    def operator_invoker(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(responses)
-
-    run_task(
-        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
-        first_prompt="go",
-    )
-
-    assert len(prompts) == 2
-    assert "contained no parsable verdict JSON" in prompts[1]
-    assert "was empty" not in prompts[1]
+    for text in must_say:
+        assert text.replace("TIMEOUT", timeout) in retried
+    for text in must_not_say:
+        assert text.replace("TIMEOUT", timeout) not in retried
 
 
 def test_retry_budget_is_shared_and_accumulates_complaints(config, task, capsys):
@@ -1864,7 +1705,8 @@ def test_plan_phase_warns_on_both_channels_for_an_on_disk_bad_slot(
     defaults to None) and its operator is the one whose job is to correct the
     checklist, so an on-disk bad slot has to reach *this* prompt -- the review
     phase meeting all three requirements is no help to a run that never gets
-    there. Both channels: a stderr [warn] and a Slot warning line."""
+    there. Both channels: a stderr [warn] and a Slot warning line. The turn
+    still runs on the default model, and the Model slots section renders."""
     from dataclasses import replace
 
     slug, paths = task
@@ -1874,6 +1716,7 @@ def test_plan_phase_warns_on_both_channels_for_an_on_disk_bad_slot(
     }), encoding="utf-8")
     config = replace(config, model="cfg-model", models={"fast": "fast-model"})
     prompts: list[str] = []
+    seen: list[tuple] = []
     responses = iter([
         json.dumps({"verdict": "continue", "next_prompt": "go"}),
         '{"verdict":"done"}',
@@ -1883,15 +1726,17 @@ def test_plan_phase_warns_on_both_channels_for_an_on_disk_bad_slot(
         prompts.append(prompt)
         return next(responses)
 
-    result = run_task(slug, config, FakeProvider(), _managed_runner_ok, operator_invoker)
+    result = run_task(slug, config, FakeProvider(), _spec_logger(seen), operator_invoker)
 
     assert result.status is TaskStatus.COMPLETE
     plan_prompt = prompts[0]
     assert "Your task: plan" in plan_prompt  # this really is the plan phase
+    assert "## Model slots" in plan_prompt
     assert (
         "Slot warning: step 's1' names model slot 'ghost', which no [models] "
         "config defines; running the default model instead"
     ) in plan_prompt
+    assert seen == [("--model", "cfg-model")]
     assert "which no [models] config defines" in capsys.readouterr().err
     # One-shot, not carried: the review phase re-resolves from disk instead of
     # stacking a second copy of the same sentence onto its prompt.
@@ -2185,32 +2030,12 @@ def test_problem_repeat_cap_resets_on_a_differing_prompt(config, task):
     assert prompts[2] == prompts[3] == prompts[4] == "try this instead"
 
 
-def test_problem_repeat_cap_zero_disables_and_max_iterations_governs(config, task):
-    """cap=0 is today's behavior: an unbounded run of identical-prompt PROBLEMs
-    is governed by max_iterations instead."""
-    from dataclasses import replace
-
-    slug, _ = task
-    config = replace(config, max_iterations=4, problem_repeat_cap=0)
-
-    def operator_invoker(prompt: str) -> str:
-        return '{"verdict":"problem","next_prompt":null}'
-
-    result = run_task(
-        slug, config, FakeProvider(), _managed_runner_ok, operator_invoker,
-        first_prompt="go",
-    )
-
-    assert result.status is TaskStatus.CONTINUE
-    assert result.reason == "max_iterations reached after 4 turns this run (4 total)"
-    assert result.iterations == 4
-
-
-def test_negative_problem_repeat_cap_warns_and_leaves_max_iterations_governing(
-    config, task, fake_home, capsys
+@pytest.mark.parametrize("cap", [0, -2], ids=["zero", "negative"])
+def test_problem_repeat_cap_zero_disables_and_max_iterations_governs(
+    config, task, fake_home, capsys, cap
 ):
-    """End to end: a typo'd negative cap is loud at config resolution, and the
-    run it produces is still bounded -- by max_iterations, since the cap is off.
+    """A disabled cap (0, or a typo'd negative that warns) is today's behavior: an
+    unbounded run of identical-prompt PROBLEMs is governed by max_iterations.
 
     Loaded from real TOML rather than a ``replace``, so the warning and the run
     behavior are pinned on the same path a typo actually takes.
@@ -2222,13 +2047,14 @@ def test_negative_problem_repeat_cap_warns_and_leaves_max_iterations_governing(
     slug, _ = task
     ws = config.workspace_root
     (ws / ".backseat" / "config.toml").write_text(
-        "[harness]\nproblem_repeat_cap = -2\nmax_iterations = 4\n", encoding="utf-8"
+        f"[harness]\nproblem_repeat_cap = {cap}\nmax_iterations = 4\n", encoding="utf-8"
     )
     resolved = replace(load_config(ws, slug, home=fake_home), provider="fake")
 
-    assert resolved.problem_repeat_cap == -2
-    err = capsys.readouterr().err
-    assert "[warn] config: [harness] problem_repeat_cap = -2 is negative" in err
+    assert resolved.problem_repeat_cap == cap
+    if cap < 0:
+        err = capsys.readouterr().err
+        assert f"[warn] config: [harness] problem_repeat_cap = {cap} is negative" in err
 
     def operator_invoker(prompt: str) -> str:
         return '{"verdict":"problem","next_prompt":null}'

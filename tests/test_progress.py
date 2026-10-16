@@ -73,10 +73,17 @@ def test_empty_note_and_prompt_print_nothing():
     assert out.getvalue() == ""
 
 
-def test_non_tty_stream_has_no_ansi_color():
+@pytest.mark.parametrize("channel", ["event", "debug"])
+def test_non_tty_stream_has_no_ansi_color(channel):
     out = io.StringIO()  # StringIO is not a TTY
-    progress.iteration_start(1, 1, "plan", stream=out)
-    progress.operator_note("hello", stream=out)
+    if channel == "event":
+        progress.iteration_start(1, 1, "plan", stream=out)
+        progress.operator_note("hello", stream=out)
+    else:
+        progress.set_debug(True)
+        with progress.step("capture transcript", stream=out):
+            pass
+        progress.debug_note("note", stream=out)
     assert "\033[" not in out.getvalue()
 
 
@@ -146,11 +153,3 @@ def test_debug_lines_go_to_stderr_by_default():
 
     assert "persist verdict" in captured.getvalue()
 
-
-def test_debug_lines_have_no_ansi_when_the_stream_is_not_a_tty():
-    out = io.StringIO()  # StringIO is not a TTY
-    progress.set_debug(True)
-    with progress.step("capture transcript", stream=out):
-        pass
-    progress.debug_note("note", stream=out)
-    assert "\033[" not in out.getvalue()

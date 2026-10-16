@@ -118,25 +118,39 @@ def test_ledger_reads_back_without_the_derived_field(config):
     assert [e.iteration for e in entries] == [1]
 
 
-def test_ledger_reads_back_a_line_written_before_the_model_field(config):
-    """`model` is absent from every line written before it existed; those
-    lines must keep loading, as null -- this lane's own ledger is all of them."""
+@pytest.mark.parametrize(
+    "absent_field, line",
+    [
+        # `model` and `owner_brief` are absent from every line written before
+        # each existed; those lines must keep loading, as null.
+        (
+            "model",
+            '{"at": 1790664771.0685432, "at_local": "2026-09-29T10:00:00-07:00", '
+            '"phase": "plan", "iteration": 0, "generation": 1, '
+            '"verdict": "continue", "exit_code": 0, "timed_out": false, '
+            '"duration_s": 0.0, "notes": "planned", "next_prompt": "step 1", '
+            '"reset_context": false, "owner_brief": null}',
+        ),
+        (
+            "owner_brief",
+            '{"at": 1790664771.0685432, "at_local": "2026-09-29T10:00:00-07:00", '
+            '"phase": "plan", "model": null, "iteration": 0, "generation": 1, '
+            '"verdict": "continue", "exit_code": 0, "timed_out": false, '
+            '"duration_s": 0.0, "notes": "planned", "next_prompt": "step 1", '
+            '"reset_context": false}',
+        ),
+    ],
+)
+def test_ledger_reads_back_a_line_written_before_a_field_existed(config, absent_field, line):
     paths = config.task_paths("t1")
     paths.ledger.parent.mkdir(parents=True, exist_ok=True)
-    paths.ledger.write_text(
-        '{"at": 1790664771.0685432, "at_local": "2026-09-29T10:00:00-07:00", '
-        '"phase": "plan", "iteration": 0, "generation": 1, '
-        '"verdict": "continue", "exit_code": 0, "timed_out": false, '
-        '"duration_s": 0.0, "notes": "planned", "next_prompt": "step 1", '
-        '"reset_context": false}\n',
-        encoding="utf-8",
-    )
+    paths.ledger.write_text(line + "\n", encoding="utf-8")
     (entry,) = list(storage.read_ledger(paths))
-    assert entry.model is None
+    assert getattr(entry, absent_field) is None
     assert entry.phase == "plan"
     assert entry.next_prompt == "step 1"
     # Round-tripping the old line back out writes the field as null.
-    assert entry.to_dict()["model"] is None
+    assert entry.to_dict()[absent_field] is None
 
 
 def test_ledger_round_trips_owner_brief(config):
@@ -154,24 +168,6 @@ def test_ledger_round_trips_owner_brief(config):
     assert entry.owner_brief == "Keep the shared budget."
     assert entry.to_dict()["owner_brief"] == "Keep the shared budget."
 
-
-def test_ledger_reads_back_a_line_written_before_the_owner_brief_field(config):
-    """`owner_brief` is absent from every line written before it existed;
-    those lines must keep loading, as null -- this lane's own ledger is all of
-    them."""
-    paths = config.task_paths("t1")
-    paths.ledger.parent.mkdir(parents=True, exist_ok=True)
-    paths.ledger.write_text(
-        '{"at": 1790664771.0685432, "at_local": "2026-09-29T10:00:00-07:00", '
-        '"phase": "plan", "model": null, "iteration": 0, "generation": 1, '
-        '"verdict": "continue", "exit_code": 0, "timed_out": false, '
-        '"duration_s": 0.0, "notes": "planned", "next_prompt": "step 1", '
-        '"reset_context": false}\n',
-        encoding="utf-8",
-    )
-    (entry,) = list(storage.read_ledger(paths))
-    assert entry.owner_brief is None
-    assert entry.to_dict()["owner_brief"] is None
 
 
 def test_atomic_write_retries_a_contended_replace(config, monkeypatch, capsys):

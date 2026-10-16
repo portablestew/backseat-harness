@@ -354,22 +354,6 @@ def run_cli(capsys, *argv):
     return rc, json.loads(capsys.readouterr().out)
 
 
-def test_generate_task_cli_promotes_and_reports_the_slug(registered, fake_cli_manager, capsys):
-    rc, payload = run_cli(capsys, "-C", str(registered), "generate-task", SOURCE_KEY)
-
-    assert rc == 0
-    assert payload == {
-        "status": "promoted",
-        "final_slug": "token-guard",
-        "reason": "",
-        "staging": None,
-    }
-    assert (registered / ".backseat" / "tasks" / "token-guard" / "goal.md").read_text(
-        encoding="utf-8"
-    ) == GOOD_DRAFT
-    assert not list((registered / ".backseat" / "tasks").glob("_gen-*"))
-
-
 def test_generate_task_cli_parks_with_exit_1_and_keeps_the_staging_dir(
     registered, monkeypatch, capsys
 ):
@@ -412,29 +396,22 @@ def test_generate_task_cli_accepts_a_precreated_staging_dir(registered, fake_cli
     assert not staging.exists()
 
 
-def test_generate_task_cli_refuses_an_unregistered_workspace(workspace, fake_cli_manager, capsys):
-    rc, payload = run_cli(capsys, "-C", str(workspace), "generate-task", SOURCE_KEY)
-
-    assert rc == 2
-    assert "not a registered workspace" in payload["error"]
-    assert not list((workspace / ".backseat" / "tasks").glob("_gen-*"))
-
-
-def test_generate_task_cli_refuses_a_bad_source_key(registered, fake_cli_manager, capsys):
-    rc, payload = run_cli(capsys, "-C", str(registered), "generate-task", "notakey")
-
-    assert rc == 2
-    assert "provider:conversation_id" in payload["error"]
-    assert not list((registered / ".backseat" / "tasks").glob("_gen-*"))
-
-
-@pytest.mark.parametrize("staging_name", ["../outside", "not-a-gen-dir"])
-def test_generate_task_cli_refuses_a_staging_name_outside_gen_dirs(
-    registered, fake_cli_manager, capsys, staging_name
+@pytest.mark.parametrize(
+    "ws_fixture, tail, message",
+    [
+        ("workspace", [SOURCE_KEY], "not a registered workspace"),
+        ("registered", ["notakey"], "provider:conversation_id"),
+        ("registered", [SOURCE_KEY, "--staging", "../outside"], "not a staging dir under tasks/"),
+        ("registered", [SOURCE_KEY, "--staging", "not-a-gen-dir"], "not a staging dir under tasks/"),
+    ],
+    ids=["unregistered-workspace", "bad-source-key", "staging-escapes", "staging-not-gen-dir"],
+)
+def test_generate_task_cli_refuses_bad_input_and_writes_nothing(
+    request, fake_cli_manager, capsys, ws_fixture, tail, message
 ):
-    rc, payload = run_cli(
-        capsys, "-C", str(registered), "generate-task", SOURCE_KEY, "--staging", staging_name
-    )
+    ws = request.getfixturevalue(ws_fixture)
+    rc, payload = run_cli(capsys, "-C", str(ws), "generate-task", *tail)
 
     assert rc == 2
-    assert "not a staging dir under tasks/" in payload["error"]
+    assert message in payload["error"]
+    assert not list((ws / ".backseat" / "tasks").glob("_gen-*"))

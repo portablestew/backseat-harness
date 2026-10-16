@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backseat_harness import db, manager
@@ -186,23 +187,22 @@ def test_workspace_page_shows_generating_row_without_task_link(workspace):
     assert "No active tasks." not in html
 
 
-def test_generating_row_links_its_source_session_to_the_transcript(workspace):
-    make_staging(workspace, status="queued", created_at=time.time())
+@pytest.mark.parametrize(
+    "source_key, linked",
+    [("claude_code:visibility-test", True), ("no-colon", False)],
+    ids=["keyed", "no-provider-key"],
+)
+def test_generating_row_links_its_source_session_to_the_transcript(workspace, source_key, linked):
+    make_staging(workspace, status="queued", created_at=time.time(), source_key=source_key)
     ws_id = _register(workspace)
 
     html = _client().get(f"/ws/{ws_id}").text
 
-    assert f'href="/chat/claude_code/visibility-test?ws={ws_id}"' in html
-
-
-def test_generating_row_without_a_provider_key_shows_the_key_unlinked(workspace):
-    make_staging(workspace, status="queued", created_at=time.time(), source_key="no-colon")
-    ws_id = _register(workspace)
-
-    html = _client().get(f"/ws/{ws_id}").text
-
-    assert "From chat <code>no-colon</code>" in html
-    assert "/chat/no-colon" not in html
+    if linked:
+        assert f'href="/chat/claude_code/visibility-test?ws={ws_id}"' in html
+    else:
+        assert "From chat <code>no-colon</code>" in html
+        assert "/chat/no-colon" not in html
 
 
 def test_workspace_page_shows_failed_generation_reason(workspace):

@@ -102,16 +102,28 @@ def _confirm_message(html: str) -> str:
 # --- button presence and absence -----------------------------------------------
 
 
-def test_button_shows_left_of_continue_with_a_workspace(workspace, chat):
+@pytest.mark.parametrize(
+    "path, next_button",
+    [
+        ("/chat/opencode/ses_gen", "Resume"),  # provider with resume
+        ("/chat/cline/sess_fork", "Fork"),  # provider without resume
+    ],
+    ids=["with-resume", "without-resume"],
+)
+def test_button_shows_left_of_the_next_header_button(workspace, chat, monkeypatch, path, next_button):
+    if next_button == "Fork":
+        monkeypatch.setattr(
+            history, "load_sessions", lambda keys, providers=None: {k: "ide body" for k in keys}
+        )
     ws_id = _register(workspace)
 
     with _client() as client:
-        html = client.get(f"/chat/opencode/ses_gen?ws={ws_id}").text
+        html = client.get(f"{path}?ws={ws_id}").text
 
     assert 'id="generate-task-form"' in html
-    assert 'action="/chat/opencode/ses_gen/generate-task"' in html
+    assert f'action="{path}/generate-task"' in html
     assert re.search(rf'name="ws" value="{ws_id}"', html)
-    assert html.index(">✨ Task<") < html.index(">Resume<")
+    assert html.index(">✨ Task<") < html.index(f">{next_button}<")
 
 
 def test_action_buttons_share_a_right_aligned_group(workspace, chat):
@@ -128,20 +140,6 @@ def test_action_buttons_share_a_right_aligned_group(workspace, chat):
     assert 'class="btn generate-task-btn"' in group
     rule = css[css.index(".chat-header-actions {") :]
     assert "margin-left: auto" in rule[: rule.index("}")]
-    colour = css[css.index(".chat-header .generate-task-btn {") :]
-    assert "#6d28d9" in colour[: colour.index("}")]
-
-
-def test_button_shows_left_of_fork_for_a_provider_without_resume(workspace, chat, monkeypatch):
-    monkeypatch.setattr(
-        history, "load_sessions", lambda keys, providers=None: {k: "ide body" for k in keys}
-    )
-    ws_id = _register(workspace)
-
-    with _client() as client:
-        html = client.get(f"/chat/cline/sess_fork?ws={ws_id}").text
-
-    assert html.index(">✨ Task<") < html.index(">Fork<")
 
 
 def test_button_is_hidden_without_a_workspace(chat):

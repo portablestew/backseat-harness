@@ -12,8 +12,8 @@ from backseat_harness.config import (
 )
 
 
-def test_defaults_without_config_file(tmp_path):
-    cfg = load_config(tmp_path)
+def test_defaults_without_config_file(tmp_path, fake_home):
+    cfg = load_config(tmp_path, home=fake_home)
     assert cfg.turn_timeout_s == DEFAULT_TURN_TIMEOUT_S
     assert cfg.compact_threshold_bytes == DEFAULT_COMPACT_THRESHOLD_BYTES
     assert cfg.provider == "opencode"
@@ -187,13 +187,6 @@ def test_slug_none_ignores_task_layer(tmp_path, fake_home):
     )
     assert load_config(tmp_path, None, home=fake_home).provider == "claude"
     assert load_config(tmp_path, "t", home=fake_home).provider == "kiro"
-
-
-def test_defaults_with_no_layers(tmp_path, fake_home):
-    cfg = load_config(tmp_path, "t", home=fake_home)
-    assert cfg.turn_timeout_s == DEFAULT_TURN_TIMEOUT_S
-    assert cfg.provider == "opencode"
-    assert cfg.operator.provider == "opencode"
 
 
 # --- provider and model defaults roll downhill: manager -> operator -> harness ---
@@ -457,14 +450,16 @@ def test_problem_repeat_cap_parses_and_layers(tmp_path, fake_home):
     assert load_config(tmp_path, None, home=fake_home).problem_repeat_cap == 7
 
 
-def test_problem_repeat_cap_zero_is_preserved_not_dropped(tmp_path, fake_home):
+def test_problem_repeat_cap_zero_is_preserved_not_dropped(tmp_path, fake_home, capsys):
     """0 means "disabled", so it must survive the layer merge rather than being
-    treated as absent and falling back to the default 3."""
+    treated as absent and falling back to the default 3. It is the documented,
+    deliberate way to disable the cap, so it must also stay quiet."""
     _write(
         tmp_path / ".backseat" / "config.toml",
         "[harness]\nproblem_repeat_cap = 0\n",
     )
     assert load_config(tmp_path, "t", home=fake_home).problem_repeat_cap == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_negative_problem_repeat_cap_warns_and_behaves_as_disabled(
@@ -518,13 +513,3 @@ def test_problem_repeat_cap_warns_once_on_the_effective_value(
     err = capsys.readouterr().err
     assert err.count("[warn] config:") == 1
     assert "problem_repeat_cap = -4 is negative" in err
-
-
-def test_zero_problem_repeat_cap_does_not_warn(tmp_path, fake_home, capsys):
-    """0 is the documented, deliberate way to disable the cap, so it stays quiet."""
-    _write(
-        tmp_path / ".backseat" / "config.toml",
-        "[harness]\nproblem_repeat_cap = 0\n",
-    )
-    assert load_config(tmp_path, "t", home=fake_home).problem_repeat_cap == 0
-    assert capsys.readouterr().err == ""

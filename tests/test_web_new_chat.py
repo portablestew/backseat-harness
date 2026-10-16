@@ -68,17 +68,18 @@ def test_binary_for_unknown_provider_raises():
         binary_for("cursor")
 
 
-def test_on_path_providers_keeps_registry_order_and_skips_missing(monkeypatch):
-    monkeypatch.setattr("shutil.which", _which_only("opencode", "claude", "kiro-cli"))
-    assert on_path_providers() == ["claude", "kiro", "opencode"]
-
-    monkeypatch.setattr("shutil.which", _which_only("claude", "opencode"))
-    assert on_path_providers() == ["claude", "opencode"]
-
-
-def test_on_path_providers_empty_when_nothing_installed(monkeypatch):
-    monkeypatch.setattr("shutil.which", _which_only())
-    assert on_path_providers() == []
+@pytest.mark.parametrize(
+    "installed, expected",
+    [
+        (("opencode", "claude", "kiro-cli"), ["claude", "kiro", "opencode"]),  # registry order
+        (("claude", "opencode"), ["claude", "opencode"]),  # missing binaries are skipped
+        ((), []),  # nothing installed
+    ],
+    ids=["registry-order", "skips-missing", "nothing-installed"],
+)
+def test_on_path_providers_keeps_registry_order_and_skips_missing(monkeypatch, installed, expected):
+    monkeypatch.setattr("shutil.which", _which_only(*installed))
+    assert on_path_providers() == expected
 
 
 @pytest.mark.parametrize("name", available_providers())

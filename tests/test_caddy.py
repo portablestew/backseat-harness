@@ -335,6 +335,7 @@ def _readme_caddyfile() -> str:
     return match.group(1)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(shutil.which("caddy") is None, reason="caddy binary is not on PATH")
 def test_real_caddy_validates_readme_example(tmp_path):
     """The README example passes a real ``caddy validate`` once its hash is real.

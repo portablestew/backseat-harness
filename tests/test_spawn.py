@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from backseat_harness import spawn
 from backseat_harness.providers.base import ProviderError, SpawnSpec, TurnResult
 
@@ -88,46 +90,34 @@ def test_a_command_that_outruns_the_deadline_is_killed_and_reported(tmp_path):
     assert elapsed < 20, f"waited {elapsed:.1f}s past a 1s deadline"
 
 
-def test_an_orphaned_grandchild_cannot_outlive_the_deadline(tmp_path):
+@pytest.mark.parametrize(
+    "use_log, bound_s",
+    [
+        # A survivor holding the inherited stdout pipe must not hold the caller.
+        (False, 20),
+        # A log file leaves no pipe to block on, so the deadline holds tightly:
+        # 1s deadline + 2s grace + 1s slack.
+        (True, 4),
+    ],
+    ids=["pipe", "log-file"],
+)
+def test_an_orphaned_grandchild_cannot_outlive_the_deadline(tmp_path, use_log, bound_s):
     """The regression this helper exists for.
 
-    The child spawns a grandchild and both sleep. The grandchild inherits the
-    stdout pipe, so killing only the direct child leaves a writer on it and the
+    The child spawns a grandchild and both sleep. If the grandchild inherits the
+    stdout pipe, killing only the direct child leaves a writer on it and the
     caller waits for that writer instead of the deadline. The whole tree has to
-    go, or the ceiling is decorative.
-    """
-    program = (
-        "import subprocess, sys, time\n"
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-        "time.sleep(30)\n"
-    )
-    start = time.monotonic()
-    call = spawn.run_with_timeout(
-        [sys.executable, "-c", program], cwd=tmp_path, input="", timeout_s=1, grace_s=2
-    )
-    elapsed = time.monotonic() - start
-
-    assert call.timed_out is True
-    # The grandchild sleeps 30s. Returning near the deadline is the only way
-    # this passes, and it is exactly what a bare kill fails to do.
-    assert elapsed < 20, f"blocked {elapsed:.1f}s on a pipe held by a survivor"
-
-
-def test_a_log_file_leaves_the_deadline_nothing_to_wait_on(tmp_path):
-    """The descriptor form of the same teardown, and it is strictly better.
-
-    Both tests above are about a survivor holding an inherited *pipe*. Handing
-    the child the log file as a descriptor removes the pipe from the picture
-    entirely: a survivor can keep appending to the file, but there is no handle
-    for this process to block on, so the deadline holds regardless of what
-    ``_kill_tree`` managed to reach. That is why the loop logs this way and not
-    through a pipe.
+    go, or the ceiling is decorative. Handing the child a log file as its
+    descriptor removes the pipe from the picture: a survivor can keep appending
+    to the file, but there is no handle for this process to block on. That is
+    why the loop logs this way and not through a pipe.
     """
     program = (
         "import subprocess, sys, time\n"
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(45)'])\n"
         "time.sleep(45)\n"
     )
+    log = tmp_path / "call.log" if use_log else None
     start = time.monotonic()
     call = spawn.run_with_timeout(
         [sys.executable, "-c", program],
@@ -135,14 +125,15 @@ def test_a_log_file_leaves_the_deadline_nothing_to_wait_on(tmp_path):
         input="",
         timeout_s=1,
         grace_s=2,
-        log_path=tmp_path / "call.log",
+        log_path=log,
     )
     elapsed = time.monotonic() - start
 
     assert call.timed_out is True
-    assert elapsed <= 1 + 2 + 1, f"waited {elapsed:.1f}s against a 3s bound"
-    # And the partial output survived the kill rather than dying in a buffer.
-    assert (tmp_path / "call.log").exists()
+    assert elapsed <= bound_s, f"blocked {elapsed:.1f}s against a {bound_s}s bound"
+    if use_log:
+        # And the partial output survived the kill rather than dying in a buffer.
+        assert log.exists()
 
 
 def test_a_killed_call_keeps_the_output_it_managed_to_flush(tmp_path):

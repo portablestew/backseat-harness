@@ -21,17 +21,22 @@ from backseat_harness.providers.opencode import OpencodeProvider
 _NO_SUCH_SESSION = f"ses_{uuid.uuid4().hex}"
 
 
-def test_no_match_renders_as_empty_string():
-    """The library returns a "No conversation found" sentinel, not an error.
-
-    The loop treats "no history yet" and "empty history" the same, so that
-    sentinel must never reach a prompt as if it were transcript content.
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (lambda: history.fork_session(_NO_SUCH_SESSION, "opencode"), ""),
+        (lambda: history.find_session(_NO_SUCH_SESSION, "opencode"), None),
+        (lambda: history.load_full_transcript(_NO_SUCH_SESSION, "opencode"), ""),
+    ],
+    ids=["fork_session", "find_session", "load_full_transcript"],
+)
+def test_no_match_is_empty_or_none_never_an_error(call, expected):
+    """The library returns a "No conversation found" sentinel or raises
+    LookupError on no match, not a crash. The loop treats "no history yet" and
+    "empty history" the same, so the sentinel must never reach a prompt as
+    transcript content.
     """
-    assert history.fork_session(_NO_SUCH_SESSION, "opencode") == ""
-
-
-def test_missing_session_is_none_not_an_error():
-    assert history.find_session(_NO_SUCH_SESSION, "opencode") is None
+    assert call() == expected
 
 
 def test_unknown_history_provider_fails_loudly():
@@ -55,15 +60,6 @@ def test_opencode_history_provider_name_is_valid():
 )
 def test_id_from_key(key, expected):
     assert history._id_from_key(key) == expected
-
-
-def test_load_full_transcript_no_match_is_empty():
-    """load_chat raises LookupError on no match; the seam maps that to "".
-
-    The loop treats "no session yet" and "empty session" the same, so the
-    LookupError must never surface as a crash mid-capture.
-    """
-    assert history.load_full_transcript(_NO_SUCH_SESSION, "opencode") == ""
 
 
 def test_load_full_transcript_returns_load_chat_string(monkeypatch):

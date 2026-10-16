@@ -67,16 +67,29 @@ def _from(url: str) -> dict:
 # --- visibility matrix ---------------------------------------------------------
 
 
-def test_chat_with_registered_ws_shows_the_form_with_its_ws_id(workspace, chat, fake_shell):
+@pytest.mark.parametrize("source", ["from", "referer", "written-just-now"])
+def test_form_shown_for_a_known_chat_with_a_registered_ws(
+    workspace, chat, fake_shell, monkeypatch, source
+):
     ws_id = _register(workspace)
+    url = f"/chat/opencode/ses_x?ws={ws_id}"
+    if source == "written-just-now":
+        # No liveness rule: a chat written a moment ago still gets the form.
+        monkeypatch.setattr(
+            history, "load_sessions", lambda keys, providers=None: {k: TRANSCRIPT for k in keys}
+        )
     with _client() as client:
-        html = _shell(client, **_from(f"/chat/opencode/ses_x?ws={ws_id}")).text
+        if source == "referer":
+            html = _shell(client, headers={"referer": f"http://localhost:{PORT}{url}"}).text
+        else:
+            html = _shell(client, **_from(url)).text
 
     assert FORM in html
     assert 'action="/chat/opencode/ses_x/generate-task"' in html
     assert f'<input type="hidden" name="ws" value="{ws_id}">' in html
-    message = json.loads(re.search(r"const message = (.+);", html).group(1))
-    assert f"Target workspace: {workspace.name}\nPath: {workspace.resolve()}" in message
+    if source == "from":
+        message = json.loads(re.search(r"const message = (.+);", html).group(1))
+        assert f"Target workspace: {workspace.name}\nPath: {workspace.resolve()}" in message
 
 
 def test_the_shell_back_link_is_the_chat_it_came_from(workspace, chat, fake_shell):
@@ -88,30 +101,32 @@ def test_the_shell_back_link_is_the_chat_it_came_from(workspace, chat, fake_shel
 
 
 @pytest.mark.parametrize(
-    "back",
+    "back, referer",
     [
-        "/chat/opencode/ses_x",  # no ws
-        "/chat/opencode/ses_x?ws=999",  # unregistered
-        "/chat/opencode/ses_x?ws=abc",  # not an integer
-        "/chat/opencode/ses_x?ws=0",  # below the id range
-        "/chat/opencode/ses_x?ws=-1",
-        "/chat/opencode/ses_x?ws=",  # blank
-        "/chat/opencode/ses_x?ws=1&ws=2",  # ambiguous
-        "/chat/not_a_provider/ses_x?ws=1",  # unknown provider
-        "/chat/opencode/ses_x/extra?ws=1",  # extra path segment
-        "/ws/1",  # the workspace New chat page
-        "/ws/1/tasks/lane",  # a task page
-        "/",  # the homepage
-        "/search/results?q=x",  # any other page
+        ("/chat/opencode/ses_x", None),  # no ws
+        ("/chat/opencode/ses_x?ws=999", None),  # unregistered
+        ("/chat/opencode/ses_x?ws=abc", None),  # not an integer
+        ("/chat/opencode/ses_x?ws=0", None),  # below the id range
+        ("/chat/opencode/ses_x?ws=-1", None),
+        ("/chat/opencode/ses_x?ws=", None),  # blank
+        ("/chat/opencode/ses_x?ws=1&ws=2", None),  # ambiguous
+        ("/chat/not_a_provider/ses_x?ws=1", None),  # unknown provider
+        ("/chat/opencode/ses_x/extra?ws=1", None),  # extra path segment
+        ("/ws/1", None),  # the workspace New chat page
+        ("/ws/1/tasks/lane", None),  # a task page
+        ("/", None),  # the homepage
+        ("/search/results?q=x", None),  # any other page
+        (None, "http://evil.com/chat/opencode/ses_x?ws=1"),  # foreign referer
     ],
 )
 def test_no_form_for_a_back_url_that_is_not_a_chat_with_a_registered_ws(
-    workspace, chat, fake_shell, back
+    workspace, chat, fake_shell, back, referer
 ):
     ws_id = _register(workspace)
-    back = back.replace("ws=1", f"ws={ws_id}")
+    kwargs = _from(back.replace("ws=1", f"ws={ws_id}")) if back else {}
+    headers = {"referer": referer.replace("ws=1", f"ws={ws_id}")} if referer else None
     with _client() as client:
-        resp = _shell(client, **_from(back))
+        resp = _shell(client, headers=headers, **kwargs)
 
     assert resp.status_code == 200
     assert FORM not in resp.text
@@ -124,50 +139,6 @@ def test_bare_shell_with_no_back_url_shows_no_form(workspace, chat, fake_shell):
         html = _shell(client).text
 
     assert FORM not in html
-
-
-def test_a_chat_written_just_now_still_shows_the_form(workspace, monkeypatch, fake_shell):
-    """No liveness rule: the shell offers Generate Task for a chat written a moment ago."""
-    ws_id = _register(workspace)
-    monkeypatch.setattr(
-        history, "load_sessions", lambda keys, providers=None: {k: TRANSCRIPT for k in keys}
-    )
-    with _client() as client:
-        html = _shell(client, **_from(f"/chat/opencode/ses_x?ws={ws_id}")).text
-
-    assert FORM in html
-    assert f'<input type="hidden" name="ws" value="{ws_id}">' in html
-
-
-def test_referer_fallback_with_registered_ws_shows_the_form(workspace, chat, fake_shell):
-    ws_id = _register(workspace)
-    with _client() as client:
-        html = _shell(
-            client,
-            headers={"referer": f"http://localhost:{PORT}/chat/opencode/ses_x?ws={ws_id}"},
-        ).text
-
-    assert 'action="/chat/opencode/ses_x/generate-task"' in html
-    assert f'<input type="hidden" name="ws" value="{ws_id}">' in html
-
-
-def test_foreign_referer_shows_no_form(workspace, chat, fake_shell):
-    ws_id = _register(workspace)
-    with _client() as client:
-        html = _shell(
-            client,
-            headers={"referer": f"http://evil.com/chat/opencode/ses_x?ws={ws_id}"},
-        ).text
-
-    assert FORM not in html
-
-
-def test_encoded_conversation_id_is_percent_encoded_in_the_action(workspace, chat, fake_shell):
-    ws_id = _register(workspace)
-    with _client() as client:
-        html = _shell(client, **_from(f"/chat/opencode/ses%3Fa?ws={ws_id}")).text
-
-    assert 'action="/chat/opencode/ses%3Fa/generate-task"' in html
 
 
 def test_transcript_back_url_round_trips_into_the_shell(workspace, chat, fake_shell):

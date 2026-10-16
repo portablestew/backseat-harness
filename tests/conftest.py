@@ -13,6 +13,35 @@ from backseat_harness.config import Config
 from backseat_harness.providers.base import Provider, SpawnSpec
 
 
+# --- slow gate -----------------------------------------------------------------
+#
+# Tests marked ``slow`` run a real daemon subprocess (~35 s) or a real caddy
+# binary. They are skipped by default; run them with ``pytest --run-slow``
+# (CI and pre-merge runs should pass the flag).
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="also run tests marked 'slow' (real daemon subprocess, real caddy)",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: needs --run-slow (real subprocess or binary)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-slow"):
+        return
+    skip_slow = pytest.mark.skip(reason="slow test; pass --run-slow to run it")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 class FakeProvider(Provider):
     """A managed provider that touches nothing external and reports a fixed id."""
 
@@ -109,7 +138,7 @@ def task(config: Config):
 #: ``$CADDY_STUB_OUT/calls.jsonl`` and behaves by ``$CADDY_STUB_MODE``:
 #: ``exit_on_stop`` exits on the graceful signal, ``hang`` ignores it,
 #: ``spawn_child`` hangs and also starts a long-lived child (pid in child.pid),
-#: ``die_after`` exits 3 after a second, ``validate_fail`` makes ``validate`` fail.
+#: ``die_after`` exits 3 straight away, ``validate_fail`` makes ``validate`` fail.
 _CADDY_STUB = r"""
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -137,7 +166,6 @@ def on_graceful(signum, frame):
 
 signal.signal(graceful, on_graceful)
 if mode == "die_after":
-    time.sleep(1.0)
     sys.exit(3)
 if mode == "spawn_child":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])

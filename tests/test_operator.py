@@ -1,3 +1,5 @@
+import pytest
+
 from backseat_harness.checklist import Checklist
 from backseat_harness.models import TurnOutcome, VerdictKind
 from backseat_harness.operator import ReviewInputs, build_prompt, parse_verdict
@@ -7,25 +9,23 @@ def _outcome(exit_code=0, timed_out=False):
     return TurnOutcome(exit_code=exit_code, timed_out=timed_out, duration_s=1.0)
 
 
-def test_parse_plain_json():
-    v = parse_verdict('{"v":1,"verdict":"continue","next_prompt":"go"}')
-    assert v is not None
-    assert v.kind is VerdictKind.CONTINUE
-    assert v.next_prompt == "go"
-
-
-def test_parse_json_embedded_in_prose():
-    text = 'Here is my assessment.\n{"verdict":"done","notes":"finished"}\nThanks!'
+@pytest.mark.parametrize(
+    "text, kind, next_prompt",
+    [
+        ('{"v":1,"verdict":"continue","next_prompt":"go"}', VerdictKind.CONTINUE, "go"),
+        ('Here is my assessment.\n{"verdict":"done","notes":"finished"}\nThanks!', VerdictKind.DONE, None),
+        # A greedy {.*} match would swallow the trailing braces and fail to parse.
+        ('Checked {the diff}.\n{"verdict":"continue","next_prompt":"x"}\nSee {notes}.', VerdictKind.CONTINUE, "x"),
+        ('{"verdict":"explode"}', None, None),  # unknown verdict
+        ("no json at all", None, None),
+    ],
+)
+def test_parse_verdict_reads_the_json_object_or_nothing(text, kind, next_prompt):
     v = parse_verdict(text)
-    assert v.kind is VerdictKind.DONE
-
-
-def test_parse_unknown_verdict_returns_none():
-    assert parse_verdict('{"verdict":"explode"}') is None
-
-
-def test_parse_garbage_returns_none():
-    assert parse_verdict("no json at all") is None
+    if kind is None:
+        assert v is None
+    else:
+        assert v is not None and v.kind is kind and v.next_prompt == next_prompt
 
 
 def test_prompt_opens_with_operator_meta_tag():
@@ -71,13 +71,6 @@ def test_build_prompt_no_hint_on_clean_exit():
         outcome=_outcome(), iteration=1,
     )
     assert "abnormally" not in build_prompt(inputs)
-
-
-def test_parse_ignores_trailing_prose_with_braces():
-    # A greedy {.*} match would swallow the trailing braces and fail to parse.
-    text = 'Checked {the diff}.\n{"verdict":"continue","next_prompt":"x"}\nSee {notes}.'
-    v = parse_verdict(text)
-    assert v is not None and v.next_prompt == "x"
 
 
 def test_parse_takes_last_verdict_object():

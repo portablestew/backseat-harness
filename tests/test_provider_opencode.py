@@ -115,14 +115,17 @@ def test_history_provider_matches_chat_mother_forker_name():
 
     names = {p.name for p in default_providers()}
     assert OpencodeProvider.history_provider in names
-def test_interactive_command_resumes_session():
+@pytest.mark.parametrize(
+    "session, argv",
+    [
+        (_SESSION, ["opencode", "--session", _SESSION]),
+        (None, ["opencode"]),  # no id: a fresh session
+    ],
+    ids=["resumes-session", "fresh-session"],
+)
+def test_interactive_command_resumes_session_or_starts_fresh(session, argv):
     p = OpencodeProvider()
-    assert p.interactive_command(_SESSION) == ["opencode", "--session", _SESSION]
-
-
-def test_interactive_command_fresh_session_when_no_id():
-    p = OpencodeProvider()
-    assert p.interactive_command(None) == ["opencode"]
+    assert p.interactive_command(session) == argv
 
 
 def test_every_provider_defaults_to_auto_approve():

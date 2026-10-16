@@ -56,6 +56,7 @@ def _make_stub_provider_bin(stub_bin: Path) -> None:
     )
 
 
+@pytest.mark.slow
 def test_e2e_daemon_picks_up_new_goal_and_spawns_run(
     workspace: Path, fake_home: Path, capsys
 ):

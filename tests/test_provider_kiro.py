@@ -12,6 +12,8 @@ two message chunks, runFinished), and the verbatim 115-byte denial stderr.
 
 from pathlib import Path
 
+import pytest
+
 from backseat_harness.providers.base import SpawnSpec
 from backseat_harness.providers.kiro import KiroProvider
 
@@ -222,14 +224,17 @@ def test_extract_text_falls_back_to_raw_output():
     assert p.extract_text("command failed: not authenticated") == (
         "command failed: not authenticated"
     )
-def test_interactive_command_resumes_session():
+@pytest.mark.parametrize(
+    "session, argv",
+    [
+        (_SESSION, ["kiro-cli", "chat", "--resume-id", _SESSION]),
+        (None, ["kiro-cli", "chat"]),  # no id: a fresh session
+    ],
+    ids=["resumes-session", "fresh-session"],
+)
+def test_interactive_command_resumes_session_or_starts_fresh(session, argv):
     p = KiroProvider()
-    assert p.interactive_command(_SESSION) == ["kiro-cli", "chat", "--resume-id", _SESSION]
-
-
-def test_interactive_command_fresh_session_when_no_id():
-    p = KiroProvider()
-    assert p.interactive_command(None) == ["kiro-cli", "chat"]
+    assert p.interactive_command(session) == argv
 
 
 def test_history_provider_matches_chat_mother_forker_name():
@@ -263,20 +268,20 @@ def test_rejected_model_id_reads_the_id_kiro_named():
     assert p.rejected_model_id(_REJECTED, "") == "no-such-model-xyz"
 
 
-def test_rejected_model_id_none_on_a_well_formed_run():
-    p = KiroProvider()
-    assert p.rejected_model_id(_ONESHOT, "") is None
-    assert p.rejected_model_id(_RESUME, "") is None
-
-
-def test_rejected_model_id_ignores_an_unrelated_failure():
-    # An ordinary failed turn shares exit 1, but carries no kiro words naming a
-    # model: keying on the message means naming nothing here.
-    p = KiroProvider()
-    stdout = (
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        _ONESHOT,
+        _RESUME,
+        # An ordinary failed turn shares exit 1, but carries no kiro words naming
+        # a model: keying on the message means naming nothing here.
         '{"type":"runError","data":{"sessionId":"' + _SESSION + '","stage":"prompt",'
-        '"message":"Internal error (code -32603): connection reset by peer"}}\n'
-    )
+        '"message":"Internal error (code -32603): connection reset by peer"}}\n',
+    ],
+    ids=["oneshot-run", "resume-run", "unrelated-failure"],
+)
+def test_rejected_model_id_none_on_a_run_that_names_no_model(stdout):
+    p = KiroProvider()
     assert p.rejected_model_id(stdout, "") is None
 
 

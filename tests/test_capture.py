@@ -1,5 +1,6 @@
 """Full-session transcript capture: redaction and the loop wiring."""
 
+import pytest
 from conftest import FakeProvider
 
 from backseat_harness import capture
@@ -23,13 +24,9 @@ def test_capture_redacts_root_uuid(stub_history):
     assert "done, ref" in text
 
 
-def test_capture_returns_none_when_no_transcript(stub_history):
-    stub_history["transcript"] = ""
-    assert capture.capture("root", "fake_history", "root") is None
-
-
-def test_capture_returns_none_when_whitespace_only(stub_history):
-    stub_history["transcript"] = "   \n  "
+@pytest.mark.parametrize("transcript", ["", "   \n  "], ids=["empty", "whitespace"])
+def test_capture_returns_none_when_no_transcript(stub_history, transcript):
+    stub_history["transcript"] = transcript
     assert capture.capture("root", "fake_history", "root") is None
 
 

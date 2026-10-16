@@ -785,145 +785,83 @@ def test_bare_daemon_prints_help_and_exits_2(capsys):
     assert "usage" in out.lower() or "daemon" in out
 
 
-def test_daemon_run_dispatches_to_foreground_handler(monkeypatch):
+@pytest.mark.parametrize(
+    "argv, expect",
+    [
+        (["daemon", "run"], {"daemon_command": "run", "func": "_cmd_daemon"}),
+        (["--format", "json", "daemon", "status"], {"format": "json", "daemon_command": "status"}),
+        (["--format", "json", "daemon", "stop"], {"format": "json", "daemon_command": "stop"}),
+        (["--format", "json", "daemon", "restart"], {"format": "json", "daemon_command": "restart"}),
+        (["--format", "json", "daemon", "install"], {"format": "json", "daemon_command": "install"}),
+        (
+            ["daemon", "install", "--uninstall", "--path-override", "/tmp/custom"],
+            {
+                "daemon_command": "install",
+                "uninstall": True,
+                "path_override": "/tmp/custom",
+                "func": "_cmd_daemon_install",
+            },
+        ),
+    ],
+    ids=["run", "status", "stop", "restart", "install", "install-uninstall-path"],
+)
+def test_daemon_subcommands_parse_to_their_handlers(argv, expect):
     import backseat_harness.cli as cli
 
-    args = cli._build_parser().parse_args(["daemon", "run"])
+    args = cli._build_parser().parse_args(argv)
     assert args.command == "daemon"
-    assert args.daemon_command == "run"
-    assert args.func == cli._cmd_daemon
+    for key, value in expect.items():
+        if key == "func":
+            assert args.func == getattr(cli, value)
+        else:
+            assert getattr(args, key) == value
 
 
-def test_daemon_subcommands_parse_with_format_json():
-    import backseat_harness.cli as cli
-
-    cmds = [
-        ["daemon", "status"],
-        ["daemon", "stop"],
-        ["daemon", "restart"],
-        ["daemon", "install"],
-    ]
-    for cmd in cmds:
-        args = cli._build_parser().parse_args(["--format", "json", *cmd])
-        assert args.format == "json"
-        assert args.command == "daemon"
-
-
-def test_daemon_install_with_uninstall_and_path_override():
-    import backseat_harness.cli as cli
-
-    args = cli._build_parser().parse_args(
-        ["daemon", "install", "--uninstall", "--path-override", "/tmp/custom"]
-    )
-    assert args.uninstall is True
-    assert args.path_override == "/tmp/custom"
-    assert args.func == cli._cmd_daemon_install
-
-
-def test_daemon_status_running_registered(monkeypatch, capsys):
-    import json
-
+@pytest.mark.parametrize(
+    "record, live, registered, installed, expected",
+    [
+        (
+            {"pid": 1234, "start": 9999.0},
+            True,
+            True,
+            True,
+            {"running": True, "installed": True, "pid": 1234, "start": 9999.0, "owns": True},
+        ),
+        (None, False, False, False, {"running": False, "installed": False}),
+        (None, False, True, True, {"running": False, "installed": True}),
+        (
+            {"pid": 777, "start": 3000.0},
+            True,
+            False,
+            False,
+            {"running": True, "installed": False, "pid": 777, "start": 3000.0, "owns": False},
+        ),
+    ],
+    ids=["running-registered", "not-installed", "installed-not-running", "unmanaged-live"],
+)
+def test_daemon_status_reports_each_state(
+    monkeypatch, capsys, record, live, registered, installed, expected
+):
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
 
-    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 1234, "start": 9999.0})
-    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: record)
+    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: live)
+    monkeypatch.setattr(platform_mod, "is_registered", lambda: registered)
     monkeypatch.setattr(
         platform_mod,
         "artifact_path",
-        lambda: type("P", (), {"exists": lambda s: True})(),
+        lambda: type("P", (), {"exists": lambda s: installed})(),
     )
     rc = main(["--format", "json", "daemon", "status"])
     payload = json.loads(capsys.readouterr().out)
+    uptime = payload.pop("uptime", None)
     assert rc == 0
-    assert payload["running"] is True
-    assert payload["installed"] is True
-    assert payload["pid"] == 1234
-    assert payload["start"] == 9999.0
-    assert payload["owns"] is True
-    assert isinstance(payload.get("uptime"), (int, float))
-    assert "owns" in payload
-
-
-def test_daemon_status_not_installed(monkeypatch, capsys):
-    import json
-
-    import backseat_harness.db as db_mod
-    import backseat_harness.platform as platform_mod
-
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
-    monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
-    monkeypatch.setattr(
-        platform_mod,
-        "artifact_path",
-        lambda: type("P", (), {"exists": lambda s: False})(),
-    )
-    rc = main(["--format", "json", "daemon", "status"])
-    payload = json.loads(capsys.readouterr().out)
-    assert rc == 0
-    assert payload == {"running": False, "installed": False}
-
-
-def test_daemon_status_installed_not_running(monkeypatch, capsys):
-    import json
-
-    import backseat_harness.db as db_mod
-    import backseat_harness.platform as platform_mod
-
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
-    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
-    monkeypatch.setattr(
-        platform_mod,
-        "artifact_path",
-        lambda: type("P", (), {"exists": lambda s: True})(),
-    )
-    rc = main(["--format", "json", "daemon", "status"])
-    payload = json.loads(capsys.readouterr().out)
-    assert rc == 0
-    assert payload == {"running": False, "installed": True}
-    assert "owns" not in payload
-
-
-def test_daemon_status_unmanaged_live(monkeypatch, capsys):
-    import json
-
-    import backseat_harness.db as db_mod
-    import backseat_harness.platform as platform_mod
-
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 777, "start": 3000.0})
-    monkeypatch.setattr(db_mod, "pid_live", lambda pid, start: True)
-    monkeypatch.setattr(platform_mod, "is_registered", lambda: False)
-    monkeypatch.setattr(
-        platform_mod,
-        "artifact_path",
-        lambda: type("P", (), {"exists": lambda s: False})(),
-    )
-    rc = main(["--format", "json", "daemon", "status"])
-    payload = json.loads(capsys.readouterr().out)
-    assert rc == 0
-    assert payload["running"] is True
-    assert payload["installed"] is False
-    assert payload["pid"] == 777
-    assert payload["start"] == 3000.0
-    assert payload["owns"] is False
-    assert "owns" in payload
-    assert isinstance(payload.get("uptime"), (int, float))
-
-
-def test_daemon_stop_registered(monkeypatch, capsys):
-    import backseat_harness.platform as platform_mod
-
-    monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
-    monkeypatch.setattr(platform_mod, "stop", lambda: None)
-    import backseat_harness.db as db_mod
-
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: None)
-    rc = main(["--format", "json", "daemon", "stop"])
-    payload = json.loads(capsys.readouterr().out)
-    assert rc == 0
-    assert payload["stopped"] is True
-    assert payload["was_running"] is False
+    assert payload == expected
+    if expected["running"]:
+        assert isinstance(uptime, (int, float))
+    else:
+        assert uptime is None
 
 
 def test_daemon_stop_confirms_against_the_guard_row(monkeypatch, capsys):
@@ -987,14 +925,23 @@ def test_daemon_stop_kills_recorded_daemon_when_end_reaches_nothing(monkeypatch,
     assert payload["pid"] == 4242
 
 
-def test_daemon_stop_reports_success_when_guard_row_goes_quiet(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "record, expected",
+    [
+        ({"pid": 4242, "start": 7.0}, {"pid": 4242}),
+        (None, {"was_running": False}),  # no record: nothing was known to be running
+    ],
+    ids=["recorded-daemon", "no-record"],
+)
+def test_daemon_stop_reports_success_when_the_daemon_goes_quiet(
+    monkeypatch, capsys, record, expected
+):
     """The live daemon before stop is dead after it: that is a real stop."""
     import backseat_harness.db as db_mod
     import backseat_harness.platform as platform_mod
 
     monkeypatch.setattr(platform_mod, "is_registered", lambda: True)
-    monkeypatch.setattr(platform_mod, "stop", lambda: None)
-    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: {"pid": 4242, "start": 7.0})
+    monkeypatch.setattr(db_mod, "_daemon_record", lambda conn: record)
 
     live = [True]
 
@@ -1009,7 +956,7 @@ def test_daemon_stop_reports_success_when_guard_row_goes_quiet(monkeypatch, caps
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["stopped"] is True
-    assert payload["pid"] == 4242
+    assert {key: payload[key] for key in expected} == expected
 
 
 def test_daemon_stop_unmanaged_live(monkeypatch, capsys):

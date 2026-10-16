@@ -40,19 +40,11 @@ def test_model_null_and_non_string_stripped():
     assert result.steps["s1"]["model"] == "thinker"  # null did not clear the slot
     result2 = merge_update(Checklist(), {"steps": {"s1": {"model": 7}}})
     assert result2.steps["s1"]["model"] == 7  # no semantics here; loop validates
-
-
-def test_null_values_stripped_not_deleting():
+    # Same rule for other fields: a null does not delete an existing value.
     base = merge_update(Checklist(), {"steps": {"s1": {"status": "active", "notes": "keep"}}})
-    result = merge_update(base, {"steps": {"s1": {"notes": None, "status": "done"}}})
-    assert result.steps["s1"]["notes"] == "keep"  # null did not delete
-    assert result.steps["s1"]["status"] == "done"
-
-
-def test_status_can_regress():
-    base = merge_update(Checklist(), {"steps": {"s1": {"status": "done"}}})
-    result = merge_update(base, {"steps": {"s1": {"status": "pending"}}})
-    assert result.steps["s1"]["status"] == "pending"  # operator may move it back
+    result3 = merge_update(base, {"steps": {"s1": {"notes": None, "status": "done"}}})
+    assert result3.steps["s1"]["notes"] == "keep"  # null did not delete
+    assert result3.steps["s1"]["status"] == "done"
 
 
 def test_invalid_status_ignored():
@@ -79,16 +71,18 @@ def test_all_done():
     assert all_done(Checklist(steps={"s1": {"status": "done"}, "s2": {"status": "done"}}))
 
 
-def test_cancelled_is_a_valid_status():
-    result = merge_update(Checklist(), {"steps": {"s1": {"status": "cancelled"}}})
-    assert result.steps["s1"]["status"] == "cancelled"
-
-
-def test_cancelled_can_be_revived():
-    """No forward-only ordering, so a declined step can come back."""
-    base = merge_update(Checklist(), {"steps": {"s1": {"status": "cancelled"}}})
-    result = merge_update(base, {"steps": {"s1": {"status": "active"}}})
-    assert result.steps["s1"]["status"] == "active"
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        (None, "cancelled"),  # cancelled is a valid status
+        ("done", "pending"),  # no forward-only ordering: the operator may move a step back
+        ("cancelled", "active"),  # ...and a declined step can be revived
+    ],
+)
+def test_status_transitions_are_free(before, after):
+    base = Checklist() if before is None else merge_update(Checklist(), {"steps": {"s1": {"status": before}}})
+    result = merge_update(base, {"steps": {"s1": {"status": after}}})
+    assert result.steps["s1"]["status"] == after
 
 
 def test_cancelled_satisfies_the_completion_gate():

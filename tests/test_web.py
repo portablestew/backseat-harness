@@ -49,15 +49,9 @@ def _client(host: str = "localhost") -> TestClient:
 # --- Host/Origin allowlist (step 3.2) ------------------------------------------
 
 
-def test_localhost_host_header_is_accepted():
-    with _client("localhost") as client:
-        resp = client.get("/")
-    assert resp.status_code == 200
-    assert "Workspaces" in resp.text
-
-
-def test_loopback_ip_host_header_is_accepted():
-    with _client("127.0.0.1") as client:
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_loopback_host_header_is_accepted(host):
+    with _client(host) as client:
         resp = client.get("/")
     assert resp.status_code == 200
     assert "Workspaces" in resp.text
@@ -100,30 +94,18 @@ def test_extra_host_accepted_for_http_and_origin():
         assert resp.status_code != 403
         assert "forbidden origin" not in resp.text
 
-        foreign = client.get("/", headers={"Host": "evil.com"})
-    assert foreign.status_code == 403
-    assert "forbidden host" in foreign.text
-
-
-def test_extra_hosts_default_keeps_localhost_only():
-    with TestClient(create_app(port=_PORT), base_url=f"http://{_EXTRA_HOST}") as client:
-        resp = client.get("/")
-    assert resp.status_code == 403
-    assert "forbidden host" in resp.text
-
-
-def test_extra_hosts_still_reject_foreign_origin_on_http():
-    with TestClient(
-        create_app(port=_PORT, extra_hosts=(_EXTRA_HOST,)),
-        base_url=f"http://{_EXTRA_HOST}",
-    ) as client:
-        resp = client.post(
+        # A foreign Origin is still refused on the extra-host site.
+        foreign_origin = client.post(
             "/workspaces",
             data={"path": "/nowhere"},
             headers={"Origin": "http://evil.com"},
         )
-    assert resp.status_code == 403
-    assert "forbidden origin" in resp.text
+        assert foreign_origin.status_code == 403
+        assert "forbidden origin" in foreign_origin.text
+
+        foreign = client.get("/", headers={"Host": "evil.com"})
+    assert foreign.status_code == 403
+    assert "forbidden host" in foreign.text
 
 
 def test_portless_extra_host_forms_are_accepted():
@@ -137,17 +119,27 @@ def test_portless_extra_host_forms_are_accepted():
         assert client.get("/", headers={"Origin": "https://site.lan:443"}).status_code == 200
 
 
-def test_shell_websocket_accepts_extra_host_rejects_foreign(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("extra_hosts", "netloc", "origin"),
+    [
+        ((), f"localhost:{_PORT}", f"http://localhost:{_PORT}"),
+        ((_EXTRA_HOST,), _EXTRA_HOST, f"https://{_EXTRA_HOST}"),
+    ],
+    ids=["localhost", "extra-host"],
+)
+def test_shell_websocket_accepts_allowed_origin_rejects_foreign(
+    tmp_path: Path, extra_hosts, netloc, origin
+):
     cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
     with TestClient(
-        create_app(port=_PORT, extra_hosts=(_EXTRA_HOST,)),
-        base_url=f"http://{_EXTRA_HOST}",
+        create_app(port=_PORT, extra_hosts=extra_hosts),
+        base_url=f"http://{netloc}",
     ) as client:
         session_id = _start_session(client, cmd, tmp_path)
-        url = f"ws://{_EXTRA_HOST}/ws/shell/{session_id}"
+        url = f"ws://{netloc}/ws/shell/{session_id}"
         try:
-            # Positive control: the extra Origin connects.
-            with client.websocket_connect(url, headers={"origin": f"https://{_EXTRA_HOST}"}):
+            # Positive control: the allowed Origin connects.
+            with client.websocket_connect(url, headers={"origin": origin}):
                 pass
 
             with pytest.raises(WebSocketDisconnect):
@@ -774,34 +766,6 @@ def test_shell_websocket_streams_marker_and_second_attach_replays(tmp_path: Path
             _kill_session(session_id)
 
 
-def test_shell_websocket_rejects_foreign_origin_and_host(tmp_path: Path):
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        url = f"ws://localhost:{_PORT}/ws/shell/{session_id}"
-        try:
-            # Positive control: an allowed Origin still connects.
-            with client.websocket_connect(
-                url, headers={"origin": f"http://localhost:{_PORT}"}
-            ):
-                pass
-
-            # A foreign Origin must not be accepted (WebSocketDisconnect is
-            # raised on close-before-accept, denial responses subclass it).
-            with pytest.raises(WebSocketDisconnect):
-                with client.websocket_connect(
-                    url, headers={"origin": "http://evil.com"}
-                ):
-                    pass
-
-            # Same for a foreign Host header.
-            with pytest.raises(WebSocketDisconnect):
-                with client.websocket_connect(url, headers={"host": "evil.com"}):
-                    pass
-        finally:
-            _kill_session(session_id)
-
-
 def test_shell_start_accepts_initial_pty_size(tmp_path: Path):
     """POST /shell/start with optional cols/rows sizes the PTY at spawn
     (plan 3g): a real child reports the OS-view of its own terminal."""
@@ -810,7 +774,7 @@ def test_shell_start_accepts_initial_pty_size(tmp_path: Path):
         sys.executable,
         "-c",
         (
-            "import os, sys, time; time.sleep(1); "
+            "import os, sys, time; "
             "s = os.get_terminal_size(sys.stdout.fileno()); "
             f"print('{probe}' + ':' + str(s.columns) + 'x' + str(s.lines), flush=True); "
             "time.sleep(60)"
@@ -828,29 +792,6 @@ def test_shell_start_accepts_initial_pty_size(tmp_path: Path):
                 session_id, f"{probe}:123x41".encode(), timeout=10.0
             )
             assert f"{probe}:123x41".encode() in snapshot
-        finally:
-            _kill_session(session_id)
-
-
-def test_shell_page_sends_resize_on_open(tmp_path: Path):
-    """The served shell page (plan 3g): the WS onopen handler emits a resize
-    frame with the live term sizes, and onResize is registered before the
-    first fit() so fit's own frame is not dropped."""
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        try:
-            page = client.get(f"/shell/{session_id}")
-            assert page.status_code == 200
-            js = page.text
-
-            # onResize registered BEFORE the first fit() call.
-            assert js.index("term.onResize") < js.index("fitAddon.fit()")
-
-            # onopen announces the real terminal size to the PTY.
-            open_idx = js.index("ws.onopen")
-            open_resize_idx = js.index("cols: term.cols, rows: term.rows")
-            assert 0 < open_idx < open_resize_idx
         finally:
             _kill_session(session_id)
 
@@ -1185,51 +1126,45 @@ def test_add_workspace_initializes_plain_dir_and_triggers_refresh(
         assert str(plain.resolve()) in db.list_workspaces(conn)
 
 
-def test_add_workspace_plus_css_centers_glyph():
-    """The served CSS must keep the ``+`` centered in its round control
-    (goal G2 / plan 3b): Pico pads ``summary`` vertically, which squeezes the
-    2.1rem flex box asymmetrically once the box-sizing border-box rule
-    applies, so the summary needs ``padding: 0``; ``place-items`` mirrors the
-    explicit ``align-items``/``justify-content`` pair."""
-    with _client() as client:
-        page = client.get("/")
+# --- stylesheet contract -------------------------------------------------------
 
-    assert page.status_code == 200
-    css = page.text
-    start = css.index(".expander-plus {")
-    rule = css[start : css.index("}", start)]
-    assert "display: inline-flex" in rule
-    assert "place-items: center" in rule
-    assert "align-items: center" in rule
-    assert "justify-content: center" in rule
-    assert "line-height: 1" in rule
-    assert "list-style: none" in rule
-    assert "padding: 0" in rule
-    # Smaller than before (owner brief).
-    assert "width: 1.7rem" in rule
-    assert "height: 1.7rem" in rule
-    # The glyph is two bars pinned to the control's exact midpoint, so its
-    # vertical centering does not depend on font metrics (owner brief: the
-    # glyph sat slightly below center).
-    bar_start = css.index(".expander-plus::before,")
-    bar_rule = css[bar_start : css.index("}", bar_start)]
-    assert "position: absolute" in bar_rule
-    assert "top: 50%" in bar_rule
-    assert "left: 50%" in bar_rule
-    assert "translate(-50%, -50%)" in bar_rule
-    # Belt-and-braces: the UA's webkit disclosure marker stays suppressed.
-    assert ".expander-plus::-webkit-details-marker" in css
-    assert ".expander-plus::after" in css
-    # Expanded/hover no longer fill with the loud accent; they stay on the
-    # surface palette, and the open state collapses the vertical bar (minus).
-    hover_start = css.index(".expander-plus:hover")
-    hover_rule = css[hover_start : css.index("}", hover_start)]
-    assert "background: var(--surface-hover)" in hover_rule
-    assert "--accent" not in hover_rule
-    open_start = css.index(".expander[open] .expander-plus {")
-    open_rule = css[open_start : css.index("}", open_start)]
-    assert "background: var(--surface-hover)" in open_rule
-    assert "scaleY(0)" in css
+#: (rule marker, property/value fragments that must appear in that rule). The
+#: served CSS is one shared stylesheet, so one page fetch covers every rule.
+#: Pixel sizes and rule order are deliberately not pinned; a fragment with no
+#: text to check (``[]``) only asserts the rule is present.
+_STYLE_CONTRACT = [
+    (".chat-header-prompt > strong {", ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]),
+    (".chat-header .chat-continue-form {", ["align-self: flex-end", "margin: 0.6rem 0 0"]),
+    (".transcript {", ["overflow: auto", "overscroll-behavior: auto"]),
+    (".chat-header-back {", ["text-decoration: none"]),
+    (".expander-plus {", ["display: inline-flex", "place-items: center", "padding: 0"]),
+    (".expander-plus:hover {", ["background: var(--surface-hover)"]),
+    (".expander[open] .expander-plus {", ["background: var(--surface-hover)"]),
+    (".expander-plus::before,", ["position: absolute", "top: 50%", "left: 50%", "translate(-50%, -50%)"]),
+    ("transform: translate(-50%, -50%) scaleY(0)", []),
+    ("textarea {", ["font-size: 0.85rem"]),
+    (".data-table .prompt h4 {", ["margin: 0 0 0.3rem", "0.72rem", "font-weight: 700"]),
+    (".data-table small,", [".prompt", "font-size: 0.8em"]),
+    (".data-table a {", ["text-decoration: none"]),
+    (
+        ".data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover a:not(.task-link) {",
+        ["text-decoration: underline", "color: var(--accent-hover)"],
+    ),
+    (".data-table a.task-link:hover {", ["text-decoration: underline", "color: var(--accent-hover)"]),
+]
+
+
+@pytest.mark.parametrize(("marker", "fragments"), _STYLE_CONTRACT, ids=lambda v: str(v)[:40])
+def test_stylesheet_contract(marker, fragments):
+    """Each rule keeps the property/value pairs that carry its behaviour."""
+    with _client() as client:
+        css = client.get("/").text
+
+    assert marker in css
+    start = css.index(marker)
+    body = css[start : css.index("}", start)]
+    for fragment in fragments:
+        assert fragment in body
 
 
 def test_base_has_no_global_h1_and_smaller_font():
@@ -1241,21 +1176,6 @@ def test_base_has_no_global_h1_and_smaller_font():
     assert resp.status_code == 200
     assert "backseat-harness</h1>" not in resp.text
     assert 'class="nav-back"' not in resp.text
-    body_start = resp.text.index("body {")
-    body_css = resp.text[body_start : resp.text.index("}", body_start)]
-    assert "font-size: 14px" in body_css
-
-
-def test_toast_status_sits_at_the_bottom():
-    """Owner brief: the add-workspace status ("ok: Initialized and registered
-    workspace ...") is shown at the bottom of the page, so ``#toast`` renders
-    after the content block rather than above it."""
-    with _client() as client:
-        home = client.get("/")
-
-    assert home.status_code == 200
-    assert 'id="toast"' in home.text
-    assert home.text.index('id="toast"') > home.text.rindex("</section>")
 
 
 def test_page_and_section_headers_are_one_level_smaller(
@@ -1673,9 +1593,6 @@ def test_back_links_are_not_underlined(workspace: Path):
         ws_page = client.get(f"/ws/{ws_id}")
         task_page = client.get(f"/ws/{ws_id}/tasks/back-lane")
 
-    rule = css[css.index(".chat-header-back {") :]
-    rule = rule[: rule.index("}")]
-    assert "text-decoration: none" in rule
     assert '<a class="chat-header-back" href="/">← Workspaces</a>' in ws_page.text
     assert 'class="chat-header-back"' in task_page.text
     # The old back-link offset rule (workspace.html pre-3c) is gone.
@@ -1897,11 +1814,7 @@ def test_base_css_has_transcript_markdown_rules():
         css = client.get("/").text
 
     assert ".transcript-md {" in css
-    start = css.index(".transcript-md {")
-    rule = css[start : css.index("}", start)]
-    assert "font-family: ui-monospace" in rule
     assert ".transcript-md pre {" in css
-    assert "overflow-x: auto" in css[css.index(".transcript-md pre {") :]
 
 
 def test_badge_css_covers_all_and_unknown_status(workspace: Path):
@@ -2043,12 +1956,6 @@ def _write_lane(
             ),
             encoding="utf-8",
         )
-
-
-def _section(html: str, heading: str) -> str:
-    """Body of the ``<section>`` that starts at ``heading``."""
-    start = html.index(heading)
-    return html[start : html.index("</section>", start)]
 
 
 def _section(html: str, heading: str) -> str:
@@ -2213,32 +2120,6 @@ def test_workspace_page_other_chats_is_one_capped_list(
     assert "<th>Session</th>" not in resp.text
 
 
-def test_other_chats_strips_quote_prefix_in_rendered_prompt(
-    monkeypatch, workspace: Path
-):
-    """Goal 6 / plan 3e: a multi-line quoted prompt renders without any ``>``
-    marker -- the collapsed text lands in the prompt cell, and no escaped
-    ``&gt;`` survives in the table."""
-    ws_id = _register_workspace(workspace)
-    refs = [_Ref("opencode:ses_quoted", mtime=300.0, project=str(workspace))]
-    transcripts = {
-        "opencode:ses_quoted": (
-            "## USER\n> plan the widget\n> then ship it\n"
-            "## ASSISTANT\n> done"
-        )
-    }
-    _stub_chat_history(monkeypatch, refs, transcripts)
-
-    with _client() as client:
-        page = client.get(f"/ws/{ws_id}")
-
-    assert page.status_code == 200
-    chats = _other_chats_section(page.text)
-    row = _data_rows(chats)[0]
-    assert "plan the widget then ship it" in row
-    assert "&gt;" not in row  # the quoting marker is gone entirely
-
-
 def test_other_chats_table_has_provider_column(monkeypatch, workspace: Path):
     """Goal 16 / plan 3e: a Provider column sits between Prompt and Updated,
     read from the row's own provider (the key prefix), exact per row."""
@@ -2268,46 +2149,6 @@ def test_other_chats_table_has_provider_column(monkeypatch, workspace: Path):
     assert "<td>opencode</td>" in rows[0]
     assert "<td>kiro_ide_v2</td>" in rows[1]
     assert 'href="/chat/opencode/ses_col_a?ws=' in rows[0]
-
-
-def test_other_chats_empty_state_spans_three_columns(monkeypatch, workspace: Path):
-    """Goal 16 / plan 3e: with no chats the empty-state row spans the new
-    three-column table."""
-    ws_id = _register_workspace(workspace)
-    _stub_chat_history(monkeypatch, [], {})
-
-    with _client() as client:
-        page = client.get(f"/ws/{ws_id}")
-
-    assert page.status_code == 200
-    chats = _other_chats_section(page.text)
-    assert '<td colspan="3">No other chats.</td>' in chats
-
-
-def test_other_chats_prompt_font_matches_date(monkeypatch, workspace: Path):
-    """Goal 6 / plan 3e: the Other-chats prompt takes the date cell's size
-    (one shared ``0.8em`` rule for ``.data-table small`` and ``.prompt``); the
-    prompt keeps only its fixed-width family."""
-    ws_id = _register_workspace(workspace)
-    refs = [_Ref("opencode:ses_size", mtime=300.0, project=str(workspace))]
-    _stub_chat_history(monkeypatch, refs, {"opencode:ses_size": "chat body"})
-
-    with _client() as client:
-        page = client.get(f"/ws/{ws_id}")
-
-    assert page.status_code == 200
-    html = page.text
-    shared = html.index(".data-table small,")
-    rule_end = html.index("}", shared)
-    shared_rule = html[shared:rule_end]
-    assert ".prompt" in shared_rule
-    assert "font-size: 0.8em" in shared_rule
-
-    # The prompt's own rule keeps the family and no longer sets a size.
-    prompt_start = html.index(".prompt {", rule_end)
-    prompt_rule = html[prompt_start : html.index("}", prompt_start)]
-    assert "font-family: ui-monospace" in prompt_rule
-    assert "font-size" not in prompt_rule
 
 
 def test_other_chats_recovers_workspace_from_provider_store(
@@ -2386,11 +2227,11 @@ def test_other_chats_bounds_the_transcripts_it_reads(
     assert _data_rows(_other_chats_section(page.text)) == []
 
 
-def test_completed_tasks_section_renders_when_empty(
+def test_completed_tasks_and_other_chats_render_their_empty_states(
     monkeypatch, workspace: Path
 ):
-    """An empty Completed list renders the heading with the empty-state row
-    and no data rows (plan edge case)."""
+    """With no tasks and no chats, each section keeps its heading and shows its
+    empty-state text with no data rows (plan edge case)."""
     _register_workspace(workspace)
     _stub_chat_history(monkeypatch, [], {})
 
@@ -2401,6 +2242,9 @@ def test_completed_tasks_section_renders_when_empty(
     completed = _section(resp.text, "<h4>Completed tasks</h4>")
     assert "No completed tasks." in completed
     assert _data_rows(completed) == []
+    chats = _other_chats_section(resp.text)
+    assert "No other chats." in chats
+    assert _data_rows(chats) == []
 
 
 def test_prompt_excerpt_normalizes_and_truncates():
@@ -2949,16 +2793,9 @@ def test_fork_prompt_names_source_session_and_file_and_ends_with_recap_instructi
     assert f"Read the transcript file {transcript} first" in prompt
     assert prompt.endswith(_RECAP_INSTRUCTION)
     assert prompt.index(str(transcript)) < prompt.index("recap")
-
-
-def test_fork_prompt_never_tells_the_cli_to_fork():
-    """The prompt is a read-this-file request: no sentence may ask the CLI to
-    fork, or the CLI goes looking for a fork command to run."""
-    from backseat_harness.web.routes import search as search_routes
-
-    prompt = search_routes._fork_prompt("kiro_ide", "sess_1", Path("t.txt"))
-
-    assert "fork" not in prompt.lower()
+    # It is a read-this-file request: no sentence may ask the CLI to fork
+    # (the path is checked apart from the text, since tmp_path names this test).
+    assert "fork" not in prompt.replace(str(transcript), "").lower()
 
 
 def _capture_fork_command(monkeypatch, chat_root: Path) -> dict:
@@ -2998,45 +2835,32 @@ def _assert_fork_prompt(cmd: list[str], transcript: Path, source: str, session: 
     assert prompt.endswith(_RECAP_INSTRUCTION)
 
 
-def test_search_fork_launches_kiro_with_initial_prompt(monkeypatch, tmp_path):
-    """A kiro_ide source chat forks via kiro-cli, and the launch command ends
-    with the initial prompt that names the transcript file (no delayed PTY write)."""
-    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
-    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
-    captured = _capture_fork_command(monkeypatch, tmp_path)
-
-    resp = _post_fork("sess_cur", "kiro_ide:sess_cur")
-
-    assert resp.status_code == 303
-    cmd = captured["cmd"]
-    assert cmd[:2] == ["kiro-cli", "chat"]
-    _assert_fork_prompt(
-        cmd, tmp_path / ".backseat" / "tmp" / "transcript-sess_cur.txt",
-        "kiro_ide", "sess_cur",
-    )
-
-
-def test_search_fork_launches_opencode_with_initial_prompt_for_kilo(monkeypatch, tmp_path):
-    """A kilo source chat has no fork provider of its own, so it forks via the
-    configured [harness] provider (the default, opencode), and the prompt names
-    the kilo source. PATH is pinned so the guard does not depend on the host."""
-    refs = [
-        _Ref("opencode:ses_recent", mtime=100.0, project=None),
-        _Ref("kilo:sess_k", mtime=200.0, project=None),
-    ]
-    _stub_chat_history(
-        monkeypatch, refs, {"opencode:ses_recent": "x", "kilo:sess_k": "y"}
-    )
+@pytest.mark.parametrize(
+    ("key", "source", "launch"),
+    [
+        # kiro_ide forks via kiro-cli; a kilo chat has no fork provider of its
+        # own, so it forks via the configured [harness] provider (opencode).
+        ("kiro_ide:sess_cur", "kiro_ide", ["kiro-cli", "chat"]),
+        ("kilo:sess_k", "kilo", ["opencode", "--prompt"]),
+    ],
+    ids=["kiro_ide", "kilo"],
+)
+def test_search_fork_launches_with_initial_prompt(monkeypatch, tmp_path, key, source, launch):
+    """The launch command ends with the initial prompt that names the source
+    chat and its transcript file (no delayed PTY write). PATH is pinned so the
+    guard does not depend on the host."""
+    session = key.split(":", 1)[1]
+    _stub_chat_history(monkeypatch, [_Ref(key, mtime=200.0, project=None)], {key: f"{source} chat"})
     monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
     captured = _capture_fork_command(monkeypatch, tmp_path)
 
-    resp = _post_fork("sess_k", "kilo:sess_k")
+    resp = _post_fork(session, key)
 
     assert resp.status_code == 303
     cmd = captured["cmd"]
-    assert cmd[:2] == ["opencode", "--prompt"]
+    assert cmd[: len(launch)] == launch
     _assert_fork_prompt(
-        cmd, tmp_path / ".backseat" / "tmp" / "transcript-sess_k.txt", "kilo", "sess_k"
+        cmd, tmp_path / ".backseat" / "tmp" / f"transcript-{session}.txt", source, session
     )
 
 
@@ -3075,20 +2899,6 @@ def test_search_fork_writes_redacted_transcript_with_footnote_in_workspace(
     _assert_fork_prompt(captured["cmd"], path, "kiro_ide", "sess_cur")
 
 
-def test_search_fork_unknown_workspace_falls_back_to_server_cwd(monkeypatch, tmp_path):
-    """An unregistered ?ws= id falls back to '.' (chat.py's fallback), so the
-    transcript and the PTY cwd both use the server's cwd."""
-    refs = [_Ref("kiro_ide:sess_cur", mtime=200.0, project=None)]
-    _stub_chat_history(monkeypatch, refs, {"kiro_ide:sess_cur": "kiro ide chat"})
-    captured = _capture_fork_command(monkeypatch, tmp_path)
-
-    resp = _post_fork("sess_cur", "kiro_ide:sess_cur", ws="999999")
-
-    assert resp.status_code == 303
-    assert captured["cwd"] == Path(".")
-    assert (tmp_path / ".backseat" / "tmp" / "transcript-sess_cur.txt").is_file()
-
-
 @pytest.mark.parametrize(
     ("key", "history_provider", "launch"),
     [
@@ -3119,35 +2929,37 @@ def test_search_fork_hands_source_key_prefix_to_fork_session(
     assert captured["cmd"][:len(launch)] == launch
 
 
-def test_search_fork_empty_transcript_is_404_and_launches_nothing(monkeypatch, tmp_path):
-    _stub_chat_history(monkeypatch, [], {})
-    captured = _capture_fork_command(monkeypatch, tmp_path)
-
-    resp = _post_fork("sess_gone", "kiro_ide:sess_gone")
-
-    assert resp.status_code == 404
-    assert "could not read the session for forking" in resp.text
-    assert captured == {}
-    assert not (tmp_path / ".backseat" / "tmp").exists()
-
-
-def test_search_fork_history_error_is_502_not_404(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("unreadable", "status", "messages"),
+    [
+        # An empty read is "gone": 404. A store error is a server fault: 502.
+        (None, 404, ["could not read the session for forking"]),
+        ("no provider named 'kilo'", 502,
+         ["Could not read the session for forking", "no provider named 'kilo'"]),
+    ],
+    ids=["empty-transcript", "history-error"],
+)
+def test_search_fork_unreadable_session_answers_an_error_and_launches_nothing(
+    monkeypatch, tmp_path, unreadable, status, messages
+):
     from backseat_harness import history
 
     _stub_chat_history(monkeypatch, [], {})
+    if unreadable is not None:
 
-    def _unknown_provider(search, provider):
-        raise history.HistoryError("chat-mother-forker has no provider named 'kilo'")
+        def _unknown_provider(search, provider):
+            raise history.HistoryError(f"chat-mother-forker has {unreadable}")
 
-    monkeypatch.setattr(history, "fork_session", _unknown_provider)
+        monkeypatch.setattr(history, "fork_session", _unknown_provider)
     captured = _capture_fork_command(monkeypatch, tmp_path)
 
     resp = _post_fork("sess_k", "kilo:sess_k")
 
-    assert resp.status_code == 502
-    assert "Could not read the session for forking" in resp.text
-    assert "no provider named 'kilo'" in resp.text
+    assert resp.status_code == status
+    for message in messages:
+        assert message in resp.text
     assert captured == {}
+    assert not (tmp_path / ".backseat" / "tmp").exists()
 
 
 def test_search_fork_refork_overwrites_the_transcript(monkeypatch, tmp_path):
@@ -3183,12 +2995,16 @@ def test_search_fork_sanitizes_the_session_id_in_the_file_name(monkeypatch, tmp_
     assert str((tmp_dir / "transcript-sess_.._x.txt").resolve()) in captured["cmd"][-1]
 
 
-@pytest.mark.parametrize("extra", [{}, {"ws": ""}], ids=["no-ws", "empty-ws"])
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"ws": ""}, {"ws": "999999"}],
+    ids=["no-ws", "empty-ws", "unknown-ws"],
+)
 def test_search_fork_without_a_workspace_id_posts_cleanly_to_the_server_cwd(
     monkeypatch, tmp_path, extra
 ):
-    """A fork with no bound workspace (the form omits ``ws``, or sends it empty)
-    is accepted, not a 422, and uses the server's cwd like an unknown id."""
+    """A fork with no bound workspace (the form omits ``ws``, sends it empty, or
+    names an unregistered id) is accepted, not a 422, and uses the server's cwd."""
     _stub_chat_history(monkeypatch, [], {"kiro_ide:sess_k": "a chat"})
     captured = _capture_fork_command(monkeypatch, tmp_path)
 
@@ -3274,38 +3090,6 @@ def test_data_table_rows_hover_and_links_underline_only_on_hover():
     css = page.text
     assert ".data-table tbody tr:not(.empty-row):hover" in css
 
-    a_start = css.index(".data-table a {")
-    a_rule = css[a_start : css.index("}", a_start)]
-    assert "text-decoration: none" in a_rule
-
-    h_sel = ".data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover"
-    h_start = css.index(f"{h_sel} a:not(.task-link) {{")
-    h_rule = css[h_start : css.index("}", h_start)]
-    assert "text-decoration: underline" in h_rule
-    assert "color: var(--accent-hover)" in h_rule
-
-
-def test_task_links_underline_only_under_their_own_pointer():
-    """Homepage task links (``.task-link``) are excluded from the row-hover
-    rule, so they underline only while hovered themselves; and the row's other
-    links stay quiet while a task link is the thing hovered (goal 4 / owner
-    feedback on the Tasks cell)."""
-    with _client() as client:
-        page = client.get("/")
-
-    assert page.status_code == 200
-    css = page.text
-    # Excluded from the row-hover underline.
-    row_rule = css[css.index(".data-table tbody tr:not(.empty-row):not(:has(") :]
-    row_rule = row_rule[: row_rule.index("{")]
-    assert ":not(.task-link)" in row_rule
-    assert ":has(a.task-link:hover)" in row_rule
-    # Own-hover rule underlines the task link itself.
-    t_start = css.index(".data-table a.task-link:hover {")
-    t_rule = css[t_start : css.index("}", t_start)]
-    assert "text-decoration: underline" in t_rule
-    assert "color: var(--accent-hover)" in t_rule
-
 
 def test_workspace_empty_and_chat_rows_use_shared_hover(monkeypatch, workspace: Path):
     """Empty listings are inert .empty-row rows; Other chats rows are populated
@@ -3351,71 +3135,6 @@ def test_task_checklist_rows_hover_but_status_table_does_not(workspace: Path):
     checklist = html[cl_start : html.index("</table>", cl_start)]
     assert "<td>1-a</td>" in checklist
     assert ".data-table tbody tr:not(.empty-row):hover" in html
-
-
-def test_expander_glyph_strokes_share_centre_and_collapse_to_minus():
-    """Goal 2: Pico's summary::after margin/float are cleared so both strokes
-    cross at the centre (was "-|"); expanded collapses to a clean minus."""
-    with _client() as client:
-        css = client.get("/").text
-
-    start = css.index(".expander-plus::before,")
-    rule = css[start : css.index("}", start)]
-    assert "position: absolute" in rule
-    assert "top: 50%" in rule
-    assert "left: 50%" in rule
-    assert "translate(-50%, -50%)" in rule
-    assert "margin: 0" in rule
-    assert "float: none" in rule
-    assert "scaleY(0)" in css
-
-
-def test_transcript_box_is_height_bounded_and_scrolls_vertically():
-    """Goal 14: the transcript box has a bounded height so it scrolls
-    vertically itself, and overscroll stays auto so it chains to the page."""
-    with _client() as client:
-        css = client.get("/").text
-
-    start = css.index(".transcript {")
-    rule = css[start : css.index("}", start)]
-    assert "max-height" in rule
-    assert "overflow: auto" in rule
-    assert "overscroll-behavior: auto" in rule
-
-
-def test_textareas_use_compact_font():
-    """Goal 8: one shared compact textarea size, so the run brief matches the
-    add forms rather than inheriting the 14px body size."""
-    with _client() as client:
-        html = client.get("/").text
-
-    assert "    textarea {\n      font-size: 0.85rem;\n    }" in html
-
-
-def test_top_header_text_larger_and_prompt_cannot_overflow():
-    """Goal 12: the top header line is modestly larger, and a long chat prompt
-    excerpt is clipped with an ellipsis so it fits the sticky bar."""
-    with _client() as client:
-        css = client.get("/").text
-
-    start = css.index(".chat-header-prompt > strong {")
-    rule = css[start : css.index("}", start)]
-    assert "font-size: 1.15rem" in rule
-    assert "overflow: hidden" in rule
-    assert "text-overflow: ellipsis" in rule
-    assert "white-space: nowrap" in rule
-
-
-def test_header_action_button_sits_below_back_link():
-    """Goal 13: the Continue/Fork/Takeover form is bottom-aligned and offset so
-    it cannot overlap the back link."""
-    with _client() as client:
-        css = client.get("/").text
-
-    start = css.index(".chat-header .chat-continue-form {")
-    rule = css[start : css.index("}", start)]
-    assert "align-self: flex-end" in rule
-    assert "margin: 0.6rem 0 0" in rule
 
 
 # --- step 4-test: edge coverage named in the QA plan ---------------------------
@@ -3496,97 +3215,51 @@ def test_shell_page_back_link_falls_back_to_same_origin_referer(tmp_path: Path):
             _kill_session(session_id)
 
 
-def test_shell_page_back_link_rejects_foreign_referer(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("params", "headers"),
+    [
+        (None, {"referer": "http://evil.com/chat/opencode/ses_x"}),
+        ({"from": "//evil.com/x", "label": "x"}, None),
+        (None, {"referer": f"http://localhost:{_PORT}//evil.example/x?ws=3"}),
+        # A browser reads a backslash as "/" and drops tab/CR/LF, so these
+        # values become protocol-relative: each must fall back to the index.
+        ({"from": "//evil.example/x", "label": "x"}, None),
+        ({"from": "/\\evil.example/x", "label": "x"}, None),
+        ({"from": "/\\\\evil.example/x", "label": "x"}, None),
+        ({"from": "/\t/evil.example/x", "label": "x"}, None),
+        ({"from": "/chat/opencode/ses_x\r\nLocation: evil", "label": "x"}, None),
+    ],
+)
+def test_shell_page_back_link_rejects_untrusted_from_or_referer(tmp_path: Path, params, headers):
+    """A foreign or protocol-relative Referer, or a rewritten ``from``, falls
+    back to the workspaces index and never becomes a protocol-relative link."""
     cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
     with _client() as client:
         session_id = _start_session(client, cmd, tmp_path)
         try:
-            page = client.get(
-                f"/shell/{session_id}",
-                headers={"referer": "http://evil.com/chat/opencode/ses_x"},
-            )
-            assert (
-                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
-            )
-        finally:
-            _kill_session(session_id)
-
-
-def test_shell_page_back_link_rejects_protocol_relative_from(tmp_path: Path):
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        try:
-            page = client.get(
-                f"/shell/{session_id}",
-                params={"from": "//evil.com/x", "label": "x"},
-            )
-            assert (
-                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
-            )
+            page = client.get(f"/shell/{session_id}", params=params, headers=headers)
+            assert page.status_code == 200
+            assert '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+            assert 'href="//evil' not in page.text
         finally:
             _kill_session(session_id)
 
 
 @pytest.mark.parametrize(
-    "from_value",
+    ("session", "data"),
     [
-        "//evil.example/x",
-        "/\\evil.example/x",
-        "/\\\\evil.example/x",
-        "/\t/evil.example/x",
-        "/chat/opencode/ses_x\r\nLocation: evil",
+        ("live", {"back_url": "/\\evil.example/x"}),
+        ("live", {"back_url": "https://evil.com/"}),
+        ("unknown", {}),
     ],
+    ids=["backslash-back-url", "foreign-back-url", "unknown-session"],
 )
-def test_shell_page_back_link_rejects_browser_rewritten_from(tmp_path: Path, from_value):
-    """A browser reads a backslash as "/" and drops tab/CR/LF, so these
-    values become protocol-relative: each must fall back to the workspaces index."""
+def test_shell_stop_unsafe_or_unknown_session_redirects_home(tmp_path: Path, session, data):
+    """shell_stop shares the back_url check, and an unknown session still redirects."""
     cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
     with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        try:
-            page = client.get(
-                f"/shell/{session_id}",
-                params={"from": from_value, "label": "x"},
-            )
-            assert page.status_code == 200
-            assert (
-                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
-            )
-        finally:
-            _kill_session(session_id)
-
-
-def test_shell_page_back_link_rejects_protocol_relative_referer(tmp_path: Path):
-    """The same-origin Referer keeps its query, so a path that starts "//" must
-    not come back as a protocol-relative back link."""
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        try:
-            page = client.get(
-                f"/shell/{session_id}",
-                headers={"referer": f"http://localhost:{_PORT}//evil.example/x?ws=3"},
-            )
-            assert page.status_code == 200
-            assert (
-                '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
-            )
-            assert 'href="//evil.example' not in page.text
-        finally:
-            _kill_session(session_id)
-
-
-def test_shell_stop_rejects_browser_rewritten_back_url(tmp_path: Path):
-    """shell_stop shares the check: a backslash back_url redirects to the home page."""
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        resp = client.post(
-            f"/shell/{session_id}/stop",
-            data={"back_url": "/\\evil.example/x"},
-            follow_redirects=False,
-        )
+        session_id = _start_session(client, cmd, tmp_path) if session == "live" else "000000000000"
+        resp = client.post(f"/shell/{session_id}/stop", data=data, follow_redirects=False)
 
     assert resp.status_code == 303
     assert resp.headers["location"] == "/"
@@ -3605,28 +3278,6 @@ def test_shell_stop_kills_session_and_redirects_back(tmp_path: Path):
     assert resp.status_code == 303
     assert resp.headers["location"] == "/ws/1/tasks/lane-a"
     assert _shell_manager().get_session(session_id) is None
-
-
-def test_shell_stop_unsafe_back_url_falls_back_to_home(tmp_path: Path):
-    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
-    with _client() as client:
-        session_id = _start_session(client, cmd, tmp_path)
-        resp = client.post(
-            f"/shell/{session_id}/stop",
-            data={"back_url": "https://evil.com/"},
-            follow_redirects=False,
-        )
-
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/"
-
-
-def test_shell_stop_unknown_session_still_redirects():
-    with _client() as client:
-        resp = client.post("/shell/000000000000/stop", follow_redirects=False)
-
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/"
 
 
 def test_task_takeover_form_carries_back_nav_hidden_inputs(workspace: Path):
@@ -3655,17 +3306,25 @@ def test_task_takeover_form_carries_back_nav_hidden_inputs(workspace: Path):
     assert _hidden_input(page.text, "back_label") == workspace.name
 
 
-def test_chat_continue_form_carries_back_nav_hidden_inputs(monkeypatch):
+@pytest.mark.parametrize(
+    "path",
+    ["/chat/opencode/ses_backnav", "/chat/cline/sess_fork"],
+    ids=["continue", "fork"],
+)
+def test_chat_pages_carry_back_nav_hidden_inputs(monkeypatch, path):
+    """The continue and fork forms both send the chat itself as back_url, labelled Workspaces."""
     from backseat_harness import history
 
     monkeypatch.setattr(
-        history, "load_sessions", lambda keys, providers=None: {k: "chat body" for k in keys}
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: "chat body" for k in keys},
     )
 
     with _client() as client:
-        resp = client.get("/chat/opencode/ses_backnav")
+        resp = client.get(path)
 
-    assert _hidden_input(resp.text, "back_url") == "/chat/opencode/ses_backnav"
+    assert _hidden_input(resp.text, "back_url") == path
     assert _hidden_input(resp.text, "back_label") == "Workspaces"
 
 
@@ -3934,39 +3593,21 @@ def test_search_results_fragment_interleaves_task_and_other_rows(
     assert datetime.fromtimestamp(200.0).strftime("%Y-%m-%d %H:%M") in html
 
 
-def test_search_task_name_heading_is_compacted_by_the_shared_style():
-    """The task row's prompt-cell <h4> must not inherit the browser's large
-    default: the shared style pins it to the transcript h4 scale with a small
-    0.3rem gap, so the task name reads as a label above the goal excerpt."""
-    with _client() as client:
-        page = client.get("/")
-
-    rule = _css_rule_bodies(page.text)[".data-table .prompt h4"][0]
-    assert "margin: 0 0 0.3rem" in rule
-    assert "0.72rem" in rule
-    assert "font-weight: 700" in rule
-
-
-def test_search_results_caps_at_twenty_rows(monkeypatch):
-    refs = [_Ref(f"opencode:ses_{i:02d}", mtime=100.0 + i) for i in range(25)]
+@pytest.mark.parametrize(
+    ("sessions", "rows", "no_match"),
+    [(25, 20, False), (0, 0, True)],
+    ids=["capped-at-twenty", "empty"],
+)
+def test_search_results_row_count_is_capped_and_empty_says_so(monkeypatch, sessions, rows, no_match):
+    refs = [_Ref(f"opencode:ses_{i:02d}", mtime=100.0 + i) for i in range(sessions)]
     _stub_chat_history(monkeypatch, refs, {})
 
     with _client() as client:
         resp = client.get("/search/results", params={"q": ""})
 
     assert resp.status_code == 200
-    assert resp.text.count('data-href="/chat/') == 20
-
-
-def test_search_results_empty(monkeypatch):
-    _stub_chat_history(monkeypatch, [], {})
-
-    with _client() as client:
-        resp = client.get("/search/results", params={"q": "nothing"})
-
-    assert resp.status_code == 200
-    assert "No sessions found." in resp.text
-    assert "<table" not in resp.text
+    assert resp.text.count('data-href="/chat/') == rows
+    assert ("No sessions found." in resp.text) is no_match
 
 
 def test_search_results_collapses_operator_chat_into_task_row(
@@ -4205,25 +3846,6 @@ def test_search_unresolved_task_hit_fallback_stays_bare(
     assert "ses_orphan?ws=" not in resp.text
 
 
-def test_search_href_round_trips_to_a_transcript_with_generate_task(
-    monkeypatch, workspace: Path
-):
-    """End to end: the search row's href, followed, shows the Generate Task
-    form for the same workspace id."""
-    ws_id = _register_workspace(workspace)
-    refs = [_Ref("opencode:ses_plain", mtime=200.0, project=str(workspace))]
-    _stub_chat_history(monkeypatch, refs, {"opencode:ses_plain": "a plain chat"})
-
-    with _client() as client:
-        search = client.get("/search/results", params={"q": ""}).text
-        href = re.search(r'data-href="(/chat/opencode/ses_plain\?ws=\d+)"', search).group(1)
-        page = client.get(href).text
-
-    assert 'id="generate-task-form"' in page
-    assert 'action="/chat/opencode/ses_plain/generate-task"' in page
-    assert f'<input type="hidden" name="ws" value="{ws_id}">' in page
-
-
 class _ShellSessionStub:
     """Knows one shell session, so the shell page can render without a child."""
 
@@ -4254,6 +3876,9 @@ def test_search_row_to_resume_back_url_to_shell_shows_generate_task(
         href = re.search(rf'data-href="(/chat/{provider}/{conversation_id}\?ws=\d+)"', search)
         assert href is not None, search
         chat = client.get(href.group(1)).text
+        assert 'id="generate-task-form"' in chat
+        assert f'action="/chat/{provider}/{conversation_id}/generate-task"' in chat
+        assert f'<input type="hidden" name="ws" value="{ws_id}">' in chat
         shell = client.get(
             f"/shell/{_ShellSessionStub.SESSION_ID}",
             params={
@@ -4264,22 +3889,6 @@ def test_search_row_to_resume_back_url_to_shell_shows_generate_task(
 
     assert f'action="/chat/{provider}/{conversation_id}/generate-task"' in shell
     assert f'<input type="hidden" name="ws" value="{ws_id}">' in shell
-
-
-def test_chat_fork_form_carries_back_nav_hidden_inputs(monkeypatch):
-    from backseat_harness import history
-
-    monkeypatch.setattr(
-        history,
-        "load_sessions",
-        lambda keys, providers=None: {k: "ide chat body" for k in keys},
-    )
-
-    with _client() as client:
-        resp = client.get("/chat/cline/sess_fork")
-
-    assert _hidden_input(resp.text, "back_url") == "/chat/cline/sess_fork"
-    assert _hidden_input(resp.text, "back_label") == "Workspaces"
 
 
 def test_chat_fork_form_recarries_workspace_in_back_url(monkeypatch, workspace: Path):

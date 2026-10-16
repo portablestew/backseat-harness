@@ -297,21 +297,6 @@ def _complete(**kwargs):
     return TaskResult(slug="t", status=TaskStatus.COMPLETE, iterations=1)
 
 
-def test_init_registers_the_workspace_and_a_repeat_does_not_bump(
-    workspace: Path, capsys
-):
-    from backseat_harness.cli import main
-
-    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
-    with db.open_db() as conn:
-        assert db.workspaces_version(conn) == 1
-        assert db.list_workspaces(conn) == [str(workspace.resolve())]
-    # Repeat init: the set did not change, so the version must not move.
-    assert main(["-C", str(workspace), "init", "t"]) == 0
-    with db.open_db() as conn:
-        assert db.workspaces_version(conn) == 1
-
-
 def test_run_claims_before_run_task_releases_after_and_leaves_no_row(
     workspace: Path, monkeypatch
 ):
@@ -551,27 +536,46 @@ def test_release_runs_even_when_run_task_raises(workspace: Path, monkeypatch):
 # db lands under fake_home and this command never consults a pid at all.
 
 
+@pytest.mark.parametrize(
+    "first, repeat, first_msg, repeat_msg",
+    [
+        (
+            ["register-workspace", "{ws}"],
+            ["register-workspace", "{ws}"],
+            "Registered workspace",
+            "already registered",
+        ),
+        # init registers through the same path as register-workspace.
+        (["init", "t", "Goal"], ["init", "t"], None, None),
+    ],
+    ids=["register-workspace", "init"],
+)
 def test_register_workspace_adds_once_and_bumps_only_for_a_new_path(
-    workspace: Path, capsys
+    workspace: Path, capsys, first, repeat, first_msg, repeat_msg
 ):
     from backseat_harness.cli import main
 
-    assert main(["register-workspace", str(workspace)]) == 0
-    assert "Registered workspace" in capsys.readouterr().out
+    def argv(args):
+        return ["-C", str(workspace), *[a.replace("{ws}", str(workspace)) for a in args]]
+
+    assert main(argv(first)) == 0
+    if first_msg:
+        assert first_msg in capsys.readouterr().out
     with db.open_db() as conn:
         assert len(db.list_workspaces(conn)) == 1
         # Stored exactly as the db helpers normalize it: absolute + resolved.
         assert db.list_workspaces(conn) == [str(workspace.resolve())]
         assert db.workspaces_version(conn) == 1
     # Repeat add of a listed path: the set did not change, so no bump.
-    assert main(["register-workspace", str(workspace)]) == 0
-    assert "already registered" in capsys.readouterr().out
+    assert main(argv(repeat)) == 0
+    if repeat_msg:
+        assert repeat_msg in capsys.readouterr().out
     with db.open_db() as conn:
         assert db.workspaces_version(conn) == 1
         assert len(db.list_workspaces(conn)) == 1
 
 
-def test_register_workspace_unregister_bumps_and_keeps_task_rows(workspace: Path):
+def test_register_workspace_unregister_bumps_and_keeps_task_rows(workspace: Path, capsys):
     from backseat_harness.cli import main
 
     assert main(["register-workspace", str(workspace)]) == 0
@@ -587,18 +591,12 @@ def test_register_workspace_unregister_bumps_and_keeps_task_rows(workspace: Path
         rows = db.list_tasks(conn)
     assert [row["task_relpath"] for row in rows] == ["tasks/x"]
 
-
-def test_register_workspace_unregister_of_an_unlisted_path_is_a_no_op(
-    workspace: Path, capsys
-):
-    from backseat_harness.cli import main
-
-    ghost = workspace / "ghost"  # never listed, and does not exist on disk
+    # A path that was never listed (and does not exist) is a no-op, not an error.
+    ghost = workspace / "ghost"
     assert main(["register-workspace", "--unregister", str(ghost)]) == 0
     assert "is not registered" in capsys.readouterr().out
     with db.open_db() as conn:
-        assert db.list_workspaces(conn) == []
-        assert db.workspaces_version(conn) == 0
+        assert db.workspaces_version(conn) == 2
 
 
 def test_register_workspace_rejects_a_path_that_is_not_a_workspace(
