@@ -13,9 +13,17 @@ def _outcome(exit_code=0, timed_out=False):
     "text, kind, next_prompt",
     [
         ('{"v":1,"verdict":"continue","next_prompt":"go"}', VerdictKind.CONTINUE, "go"),
-        ('Here is my assessment.\n{"verdict":"done","notes":"finished"}\nThanks!', VerdictKind.DONE, None),
+        (
+            'Here is my assessment.\n{"verdict":"done","notes":"finished"}\nThanks!',
+            VerdictKind.DONE,
+            None,
+        ),
         # A greedy {.*} match would swallow the trailing braces and fail to parse.
-        ('Checked {the diff}.\n{"verdict":"continue","next_prompt":"x"}\nSee {notes}.', VerdictKind.CONTINUE, "x"),
+        (
+            'Checked {the diff}.\n{"verdict":"continue","next_prompt":"x"}\nSee {notes}.',
+            VerdictKind.CONTINUE,
+            "x",
+        ),
         ('{"verdict":"explode"}', None, None),  # unknown verdict
         ("no json at all", None, None),
     ],

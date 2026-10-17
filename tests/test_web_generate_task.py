@@ -110,7 +110,9 @@ def _confirm_message(html: str) -> str:
     ],
     ids=["with-resume", "without-resume"],
 )
-def test_button_shows_left_of_the_next_header_button(workspace, chat, monkeypatch, path, next_button):
+def test_button_shows_left_of_the_next_header_button(
+    workspace, chat, monkeypatch, path, next_button
+):
     if next_button == "Fork":
         monkeypatch.setattr(
             history, "load_sessions", lambda keys, providers=None: {k: "ide body" for k in keys}

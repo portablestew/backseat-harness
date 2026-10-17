@@ -993,8 +993,14 @@ def test_bare_daemon_prints_help_and_exits_2(capsys):
         (["daemon", "run"], {"daemon_command": "run", "func": "_cmd_daemon"}),
         (["--format", "json", "daemon", "status"], {"format": "json", "daemon_command": "status"}),
         (["--format", "json", "daemon", "stop"], {"format": "json", "daemon_command": "stop"}),
-        (["--format", "json", "daemon", "restart"], {"format": "json", "daemon_command": "restart"}),
-        (["--format", "json", "daemon", "install"], {"format": "json", "daemon_command": "install"}),
+        (
+            ["--format", "json", "daemon", "restart"],
+            {"format": "json", "daemon_command": "restart"},
+        ),
+        (
+            ["--format", "json", "daemon", "install"],
+            {"format": "json", "daemon_command": "install"},
+        ),
         (
             ["daemon", "install", "--uninstall", "--path-override", "/tmp/custom"],
             {

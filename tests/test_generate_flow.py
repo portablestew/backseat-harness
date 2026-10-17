@@ -131,7 +131,12 @@ def test_full_generation_promotes_a_lane_listed_as_pending(workspace, monkeypatc
     rc, payload = _generate(capsys, workspace)
 
     assert rc == 0
-    assert payload == {"status": "promoted", "final_slug": "token-guard", "reason": "", "staging": None}
+    assert payload == {
+        "status": "promoted",
+        "final_slug": "token-guard",
+        "reason": "",
+        "staging": None,
+    }
     lane = workspace / ".backseat" / "tasks" / "token-guard"
     assert (lane / "goal.md").read_text(encoding="utf-8") == GOOD_DRAFT
     assert not list((workspace / ".backseat" / "tasks").glob(f"{manager.STAGING_PREFIX}*"))

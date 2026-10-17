@@ -80,7 +80,10 @@ def test_all_done():
     ],
 )
 def test_status_transitions_are_free(before, after):
-    base = Checklist() if before is None else merge_update(Checklist(), {"steps": {"s1": {"status": before}}})
+    if before is None:
+        base = Checklist()
+    else:
+        base = merge_update(Checklist(), {"steps": {"s1": {"status": before}}})
     result = merge_update(base, {"steps": {"s1": {"status": after}}})
     assert result.steps["s1"]["status"] == after
 

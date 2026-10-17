@@ -12,7 +12,6 @@ import pytest
 from backseat_harness.config import Config
 from backseat_harness.providers.base import Provider, SpawnSpec
 
-
 # --- slow gate -----------------------------------------------------------------
 #
 # Tests marked ``slow`` run a real daemon subprocess (~35 s) or a real caddy

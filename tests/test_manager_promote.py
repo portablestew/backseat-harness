@@ -402,7 +402,11 @@ def test_generate_task_cli_accepts_a_precreated_staging_dir(registered, fake_cli
         ("workspace", [SOURCE_KEY], "not a registered workspace"),
         ("registered", ["notakey"], "provider:conversation_id"),
         ("registered", [SOURCE_KEY, "--staging", "../outside"], "not a staging dir under tasks/"),
-        ("registered", [SOURCE_KEY, "--staging", "not-a-gen-dir"], "not a staging dir under tasks/"),
+        (
+            "registered",
+            [SOURCE_KEY, "--staging", "not-a-gen-dir"],
+            "not a staging dir under tasks/",
+        ),
     ],
     ids=["unregistered-workspace", "bad-source-key", "staging-escapes", "staging-not-gen-dir"],
 )
