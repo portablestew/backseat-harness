@@ -1,7 +1,8 @@
+# Example config using opencode for free models
 [manager]
 provider = "opencode"
-model = "opencode/cat-jam-free"
+model = "opencode/mimo-v2.6-flash-free"
 
 [models]
-default = "opencode/deepseek-v4.1-flash-free"
-planning = "opencode/space-bunny-free"
+default = "deepseek-v4.1-flash-free"
+planning = "opencode/glm-5.3-flash-free"
