@@ -1133,24 +1133,34 @@ def test_add_workspace_initializes_plain_dir_and_triggers_refresh(
 #: Pixel sizes and rule order are deliberately not pinned; a fragment with no
 #: text to check (``[]``) only asserts the rule is present.
 _STYLE_CONTRACT = [
-    (".chat-header-prompt > strong {", ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]),
+    (
+        ".chat-header-prompt > strong {",
+        ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"],
+    ),
     (".chat-header .chat-continue-form {", ["align-self: flex-end", "margin: 0.6rem 0 0"]),
     (".transcript {", ["overflow: auto", "overscroll-behavior: auto"]),
     (".chat-header-back {", ["text-decoration: none"]),
     (".expander-plus {", ["display: inline-flex", "place-items: center", "padding: 0"]),
     (".expander-plus:hover {", ["background: var(--surface-hover)"]),
     (".expander[open] .expander-plus {", ["background: var(--surface-hover)"]),
-    (".expander-plus::before,", ["position: absolute", "top: 50%", "left: 50%", "translate(-50%, -50%)"]),
+    (
+        ".expander-plus::before,",
+        ["position: absolute", "top: 50%", "left: 50%", "translate(-50%, -50%)"],
+    ),
     ("transform: translate(-50%, -50%) scaleY(0)", []),
     ("textarea {", ["font-size: 0.85rem"]),
     (".data-table .prompt h4 {", ["margin: 0 0 0.3rem", "0.72rem", "font-weight: 700"]),
     (".data-table small,", [".prompt", "font-size: 0.8em"]),
     (".data-table a {", ["text-decoration: none"]),
     (
-        ".data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover a:not(.task-link) {",
+        ".data-table tbody tr:not(.empty-row):not(:has(a.task-link:hover)):hover"
+        " a:not(.task-link) {",
         ["text-decoration: underline", "color: var(--accent-hover)"],
     ),
-    (".data-table a.task-link:hover {", ["text-decoration: underline", "color: var(--accent-hover)"]),
+    (
+        ".data-table a.task-link:hover {",
+        ["text-decoration: underline", "color: var(--accent-hover)"],
+    ),
 ]
 
 
@@ -3720,7 +3730,9 @@ def test_search_results_fragment_interleaves_task_and_other_rows(
     [(25, 20, False), (0, 0, True)],
     ids=["capped-at-twenty", "empty"],
 )
-def test_search_results_row_count_is_capped_and_empty_says_so(monkeypatch, sessions, rows, no_match):
+def test_search_results_row_count_is_capped_and_empty_says_so(
+    monkeypatch, sessions, rows, no_match
+):
     refs = [_Ref(f"opencode:ses_{i:02d}", mtime=100.0 + i) for i in range(sessions)]
     _stub_chat_history(monkeypatch, refs, {})
 
@@ -3966,6 +3978,84 @@ def test_search_unresolved_task_hit_fallback_stays_bare(
 
     assert 'data-href="/chat/opencode/ses_orphan"' in resp.text
     assert "ses_orphan?ws=" not in resp.text
+
+
+def test_classification_reads_only_the_first_user_message():
+    """A marker quoted in a *later* turn is prose about the harness, not a
+    harness session.
+
+    The chat that prompted this discussed provider switching, and its assistant
+    turn quoted ``operator.py``'s ``<meta>OPERATOR SESSION ...</meta>``
+    docstring. Reading the whole transcript classified it as an operator session
+    with no lane, which dropped it from both listings -- an ordinary chat going
+    missing because it talked about the harness.
+    """
+    classify = chat_search_service.classify_session
+    is_backseat = chat_search_service._is_backseat_session
+
+    for quoted in (
+        "operator.py:144- the UUID-free ``<meta>OPERATOR SESSION ...</meta>`` tag",
+        f"a fork carrying <meta>START SESSION {_MARKER_ROOT_UUID} #1</meta>",
+    ):
+        transcript = (
+            "## USER\nUSER\n> how do the session markers work?\n\n"
+            f"## ASSISTANT\nASSISTANT\n> TOOL_RESULT\n> {quoted}\n"
+        )
+        assert classify(transcript) == "other", quoted
+        assert is_backseat(transcript) is False, quoted
+
+
+def test_classification_accepts_the_real_first_user_message_shapes():
+    """The three session families as they are stored: the managed marker on the
+    first line of the first user message, and the operator/manager tags after
+    the persona their invoker prepends -- still inside that same message."""
+    classify = chat_search_service.classify_session
+
+    managed = (
+        f"## USER\nUSER\n> {_MARKER}\n>\n> go\n\n"
+        "## ASSISTANT\nASSISTANT\n> done\n"
+    )
+    assert classify(managed) == "backseat task"
+
+    operator = (
+        "## USER\nUSER\n> # backseat-harness: operator persona\n> review it\n>\n"
+        "> <meta>OPERATOR SESSION op-lane review</meta>\n>\n> ## Goal-prompt\n> x\n\n"
+        '## ASSISTANT\nASSISTANT\n> {"verdict":"done"}\n'
+    )
+    assert classify(operator) == "operator"
+
+    # The manager tags through the operator form, with manager-<phase> in the
+    # slug position, so it classifies as "operator" and resolves (or not) by lane.
+    manager = (
+        "## USER\nUSER\n> # backseat-harness: manager persona\n> write the goal\n>\n"
+        "> <meta>OPERATOR SESSION manager-draft</meta>\n>\n> ## Task\n> x\n\n"
+        '## ASSISTANT\nASSISTANT\n> {"approved":true}\n'
+    )
+    assert classify(manager) == "operator"
+
+
+def test_search_keeps_a_chat_that_only_quotes_the_marker_syntax(
+    monkeypatch, workspace: Path
+):
+    """Regression, end to end: such a chat maps to no lane, so a whole-transcript
+    classification dropped it from the search list rather than listing it."""
+    ws_id = _register_workspace(workspace)
+    refs = [_Ref("opencode:ses_prose", mtime=400.0, project=str(workspace))]
+    transcripts = {
+        "opencode:ses_prose": (
+            "## USER\nUSER\n> how do the session markers work?\n\n"
+            "## ASSISTANT\nASSISTANT\n> TOOL_RESULT\n> operator.py:144- the "
+            "UUID-free ``<meta>OPERATOR SESSION ...</meta>`` tag\n"
+        )
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    assert f'data-href="/chat/opencode/ses_prose?ws={ws_id}"' in resp.text
+    assert "how do the session markers work?" in resp.text
 
 
 class _ShellSessionStub:

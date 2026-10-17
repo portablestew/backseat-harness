@@ -4,6 +4,7 @@ from backseat_harness.marker import (
     format_operator_marker,
     new_root_uuid,
     parse_marker,
+    parse_operator_marker,
     prepend_marker,
 )
 
@@ -62,3 +63,32 @@ def test_operator_marker_matches_and_never_holds_a_uuid():
     # match the task's root-UUID marker search even if the slug were a UUID.
     assert root not in text
     assert parse_marker(text) is None
+
+
+def test_operator_marker_requires_a_real_token():
+    """A tag-shaped string with no slug/phase token is a description of the tag.
+
+    The docs quote the syntax with an elision (``...``); the sanitized-slug and
+    phase vocabularies never produce it, so neither form is a real marker --
+    which is what keeps a chat *about* the harness from classifying as one.
+    """
+    for quoted in (
+        "<meta>OPERATOR SESSION</meta>",
+        "<meta>OPERATOR SESSION ...</meta>",
+        "<meta>OPERATOR SESSION <slug> <phase></meta>",
+    ):
+        assert OPERATOR_SESSION_RE.search(quoted) is None, quoted
+        assert parse_operator_marker(quoted) is None, quoted
+
+
+def test_operator_marker_accepts_the_slug_phase_and_phase_only_forms():
+    # Task-scoped: slug then phase.
+    assert OPERATOR_SESSION_RE.search(format_operator_marker(slug="demo", phase="plan"))
+    # Task-less: the phase token sits in the slug position.
+    phase_only = format_operator_marker(phase="review")
+    assert OPERATOR_SESSION_RE.search(phase_only)
+    assert parse_operator_marker(phase_only) == "review"
+    # The manager tags with ``manager-<phase>`` in the slug position.
+    manager = format_operator_marker(phase="manager-draft")
+    assert OPERATOR_SESSION_RE.search(manager)
+    assert parse_operator_marker(manager) == "manager-draft"

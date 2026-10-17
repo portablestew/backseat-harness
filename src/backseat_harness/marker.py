@@ -20,10 +20,20 @@ _MARKER_RE = re.compile(r"<meta>START SESSION\s+([0-9a-fA-F-]{36})\s+#(\d+)</met
 
 # Operator session tag: the constant prefix is the identity signal; the slug and
 # phase that may follow are human context only. Never contains a root UUID.
-OPERATOR_SESSION_RE = re.compile(r"<meta>OPERATOR SESSION[^<]*</meta>")
+#
+# The token requirement is what keeps the tag from matching *prose about* the
+# tag. ``format_operator_marker`` only ever emits real tokens -- a sanitized
+# task slug (``[a-z0-9_-]``, see config.sanitize_slug) or a phase
+# (``plan``/``review``/``manager-<phase>``) -- so a tag with no token at all
+# (the bare formatter shape) or with a non-token such as the ``...`` elision the
+# docs use when quoting this syntax is a description of a marker, not a marker.
+_OPERATOR_TOKEN = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+OPERATOR_SESSION_RE = re.compile(
+    rf"<meta>OPERATOR SESSION(?:[ \t]+{_OPERATOR_TOKEN}){{1,2}}[ \t]*</meta>"
+)
 
 # First token after the tag: the task slug for a task-scoped operator session.
-_OPERATOR_SLUG_RE = re.compile(r"<meta>OPERATOR SESSION\s+([^\s<]+)")
+_OPERATOR_SLUG_RE = re.compile(rf"<meta>OPERATOR SESSION[ \t]+({_OPERATOR_TOKEN})")
 
 
 def parse_operator_marker(text: str) -> str | None:
@@ -33,6 +43,10 @@ def parse_operator_marker(text: str) -> str | None:
     operator session (slug empty) leaves the phase token in the slug position;
     callers disambiguate that against the filesystem, since a phase name is
     never a valid lane slug in practice.
+
+    Only a real token parses: the tag must carry at least one slug/phase token,
+    so a quoted or elided form such as ``<meta>OPERATOR SESSION ...</meta>``
+    returns None rather than the ``...``. See ``OPERATOR_SESSION_RE``.
     """
     m = _OPERATOR_SLUG_RE.search(text)
     return m.group(1) if m else None

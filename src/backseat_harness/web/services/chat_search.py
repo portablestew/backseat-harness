@@ -1,8 +1,10 @@
 """Workspace chat search service (step 5.3, 6.1, 6.3).
 
 Wraps chat-mother-forker search scoped to a workspace path, filtering out
-backseat-managed sessions (those carrying <meta>START SESSION or
-<meta>OPERATOR SESSION markers).
+backseat-managed sessions -- those whose *first user message* carries a
+``<meta>START SESSION`` or ``<meta>OPERATOR SESSION`` marker. The marker is read
+only there because it is written only there: a later turn that merely quotes the
+syntax is prose about the harness, not a harness session.
 Also provides global session search and classification (step 6.1).
 Also provides fork-provider selection helper (step 6.3).
 """
@@ -39,6 +41,36 @@ _META_LINE_RE = re.compile(r"^\s*<meta>.*</meta>\s*$")
 # chat_fork quotes USER/ASSISTANT lines with a leading blockquote marker; drop
 # one marker (and a single following space) so the listing shows the prompt.
 _QUOTE_PREFIX_RE = re.compile(r"^\s*>\s?")
+#: A rendered transcript opens each turn with a ``## USER`` / ``## ASSISTANT``
+#: header (chat-mother-forker's ``render_conversation``). The first assistant
+#: header therefore ends the first user message, whatever its body looks like.
+_ASSISTANT_TURN_RE = re.compile(r"^## ASSISTANT[ \t]*$", re.MULTILINE)
+
+
+def _first_user_message(text: str) -> str:
+    """The transcript through the end of its first user turn.
+
+    The harness writes a session's identity marker into its first user message
+    and nowhere else, so that is the only region a marker may be read from.
+    Scanning the whole transcript instead lets any later turn that merely
+    *quotes* the marker syntax -- a chat about the harness, a grep result, a
+    docstring -- masquerade as a harness session and hide an ordinary chat from
+    the listings.
+
+    Rendered transcripts put every turn under a ``## USER``/``## ASSISTANT``
+    header and always open on the user's side (providers drop everything before
+    the first user message), so the first user message is everything before the
+    first assistant header. A headerless transcript -- the raw-prompt shape a
+    one-shot capture or a test fixture may use -- is returned whole, since
+    there is nothing to bound it with.
+
+    Note the marker is not always the *first line* of that message: a managed
+    turn puts it there (``marker.prepend_marker``), while the operator and the
+    manager get the persona prepended ahead of the tagged prompt
+    (``cli._make_oneshot_invoker``). The region, not a line, is the unit.
+    """
+    m = _ASSISTANT_TURN_RE.search(text)
+    return text[: m.start()] if m else text
 
 
 def _prompt_excerpt(text: str, limit: int = 120) -> str:
@@ -150,10 +182,17 @@ def _project_matches_workspace(project: str, workspace: Path) -> bool:
 
 
 def _is_backseat_session(text: str) -> bool:
-    """Return True if text contains a backseat marker (START SESSION or OPERATOR SESSION)."""
-    if marker.parse_marker(text) is not None:
+    """Return True when the session's *first user message* carries a backseat marker.
+
+    Only that message is read (see ``_first_user_message``): a real
+    ``START SESSION`` root-UUID marker or a real ``OPERATOR SESSION`` tag.
+    A later turn quoting either syntax is not a harness session, so it must not
+    be filtered out of a listing as one.
+    """
+    head = _first_user_message(text)
+    if marker.parse_marker(head) is not None:
         return True
-    if marker.OPERATOR_SESSION_RE.search(text):
+    if marker.OPERATOR_SESSION_RE.search(head):
         return True
     return False
 
@@ -273,13 +312,23 @@ def list_recent_chats(workspace: Path | str, limit: int = 20) -> list[ChatInfo]:
 def classify_session(text: str) -> str:
     """Classify a session transcript: "backseat task", "operator", or "other".
 
-    - "backseat task": contains a START SESSION marker (marker.parse_marker)
-    - "operator": contains an OPERATOR SESSION marker (marker.OPERATOR_SESSION_RE)
-    - "other": neither marker present
+    Only the session's *first user message* is inspected (``_first_user_message``),
+    because that is the only place the harness writes its marker. A later turn
+    that merely quotes the syntax -- a chat about the harness, a tool result, a
+    docstring -- must not classify a session, or an ordinary chat is hidden from
+    the listings as a harness session it never was.
+
+    - "backseat task": a ``START SESSION`` marker naming a real root UUID
+      (``marker.parse_marker``)
+    - "operator": a real ``OPERATOR SESSION`` tag, i.e. one carrying at least one
+      slug/phase token (``marker.OPERATOR_SESSION_RE``). The manager's sessions
+      tag this way too, with ``manager-<phase>`` in the slug position.
+    - "other": no marker in the first user message
     """
-    if marker.parse_marker(text) is not None:
+    head = _first_user_message(text)
+    if marker.parse_marker(head) is not None:
         return "backseat task"
-    if marker.OPERATOR_SESSION_RE.search(text):
+    if marker.OPERATOR_SESSION_RE.search(head):
         return "operator"
     return "other"
 
@@ -335,14 +384,18 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
             marker_id = ""
             operator_slug = ""
         else:
-            classification = classify_session(text)
+            # One scoped read of the first user message feeds the classification
+            # and both marker extractions: the identity marker lives only there,
+            # so a later turn quoting it cannot donate a task's UUID or slug.
+            head = _first_user_message(text)
+            classification = classify_session(head)
             preview = text.strip()
             if len(preview) > 200:
                 preview = preview[:200] + "…"
             prompt = _prompt_excerpt(text)
-            parsed_marker = marker.parse_marker(text)
+            parsed_marker = marker.parse_marker(head)
             marker_id = parsed_marker[0] if parsed_marker else ""
-            operator_slug = marker.parse_operator_marker(text) or ""
+            operator_slug = marker.parse_operator_marker(head) or ""
 
         results.append(SessionSearchResult(
             key=ref.key,
