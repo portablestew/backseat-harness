@@ -1,16 +1,16 @@
 {% extends "_chat_page.html" %}
 {% block title %}{{ provider }}:{{ conversation_id }} - backseat-harness{% endblock %}
+{% block main_attrs %}{% if auto_refresh %} data-auto-refresh="60"{% endif %}{% endblock %}
 {% block back %}
-    {% if ws_name %}
-    <a class="chat-header-back" href="/ws/{{ ws_id }}">← {{ ws_name }}</a>
-    {% else %}
-    <a class="chat-header-back" href="/">← Workspaces</a>
-    {% endif %}
+    <a class="chat-header-back" href="{{ back_href }}">← {{ back_label }}</a>
 {% endblock %}
 {% block heading %}{{ prompt }}{% endblock %}
 {% block sub %}<small>{{ provider }}:{{ conversation_id }}</small>{% endblock %}
 {% block action %}
+  {# A managed/operator session is a task's own transcript: no Generate Task,
+     Resume, or Fork -- reusing it would spin up a confusing second lineage. #}
   <div class="chat-header-actions">
+  {% if not is_task_session %}
   {% if generate_task %}
   {% include "_generate_task_button.html" %}
   {% endif %}
@@ -36,6 +36,7 @@
     <button type="submit" class="btn">Fork</button>
   </form>
   {% endif %}
+  {% endif %}
   </div>
 {% endblock %}
 
@@ -48,6 +49,7 @@
 {% endblock %}
 
 {% block scripts %}
+{% if not is_task_session %}
 {% if resume_command %}
 <script>
   document.getElementById('resume-form').addEventListener('submit', async (e) => {
@@ -81,5 +83,6 @@
 {% endif %}
 {% if generate_task %}
 {% include "_generate_task_script.html" %}
+{% endif %}
 {% endif %}
 {% endblock %}

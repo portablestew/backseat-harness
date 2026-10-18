@@ -216,6 +216,41 @@ def test_workspace_page_shows_failed_generation_reason(workspace):
     assert "review cap reached after 3 rounds" in html
 
 
+def test_generating_row_links_the_manager_transcript_when_recorded(workspace):
+    """A generation whose manager call reported its session links that transcript
+    from the row -- the only handle on a run that has not produced a task yet."""
+    make_staging(
+        workspace,
+        status="failed",
+        reason="manager did not approve",
+        manager_session="opencode:ses_manager",
+    )
+    ws_id = _register(workspace)
+
+    html = _client().get(f"/ws/{ws_id}").text
+
+    assert '<a href="/chat/opencode/ses_manager">generator transcript</a>' in html
+
+
+def test_generating_row_has_no_manager_link_without_a_recorded_session(workspace):
+    make_staging(workspace, status="running", created_at=time.time())
+    ws_id = _register(workspace)
+
+    html = _client().get(f"/ws/{ws_id}").text
+
+    assert "generator transcript" not in html
+
+
+def test_list_generating_carries_the_manager_href(workspace):
+    make_staging(workspace, status="failed", manager_session="opencode:ses_manager")
+    make_staging(workspace, status="queued", created_at=time.time())
+
+    rows = {row["status"]: row for row in task_service.list_generating(workspace)}
+
+    assert rows["failed"]["manager_href"] == "/chat/opencode/ses_manager"
+    assert rows["generating"]["manager_href"] is None
+
+
 def test_workspace_page_shows_interrupted_row(workspace, monkeypatch):
     _no_live_pids(monkeypatch)
     make_staging(workspace, status="running", pid=999999, pid_start=1.0)

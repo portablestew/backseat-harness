@@ -221,6 +221,52 @@ def test_manager_invoker_uses_the_manager_persona_and_profile(config, monkeypatc
     assert seen["timeout_s"] == 45
 
 
+def test_oneshot_invoker_reports_the_stored_session(config, monkeypatch):
+    """The one-shot invoker hands the call's stored session to a recorder.
+
+    This is how the manager (and any future one-shot caller) learns the
+    transcript key it records: the invoker parses the id off the same provider
+    output a managed turn parses it from.
+    """
+    monkeypatch.setattr(cli, "get_provider", lambda name: FakeProvider())
+    monkeypatch.setattr(cli.spawn, "resolve_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        cli.spawn,
+        "run_with_timeout",
+        lambda cmd, **kwargs: spawn.CompletedCall(0, "ok", "", False),
+    )
+    seen: list[tuple[str, str]] = []
+    spawn.set_session_recorder(lambda hp, nid: seen.append((hp, nid)))
+    try:
+        invoke = cli._make_oneshot_invoker(
+            config, config.manager_profile(), load_persona("manager_persona.md"), role="manager"
+        )
+        invoke("Draft it.")
+    finally:
+        spawn.set_session_recorder(None)
+
+    # FakeProvider.parse_result returns its fixed id, tagged with its history name.
+    assert seen == [("fake_history", "fake-session-1")]
+
+
+def test_run_generation_records_the_manager_session_key(config, staging, loader):
+    """A reported session lands in the manifest, so a parked or promoted
+    generation can be traced to the transcript behind it."""
+    def step(prompt):
+        (staging / manager.GOAL_DRAFT).write_text(DRAFT, encoding="utf-8")
+        data = manager.read_manifest(staging)
+        data.update(approved=True, suggested_slug="token-guard")
+        manager.write_manifest(staging, data)
+        # What the real invoker does after the provider call reports an id.
+        spawn.record_session("opencode", "ses_manager")
+        return reply("generate", approved=True, suggested_slug="token-guard", reviews=1)
+
+    result = manager.run_generation(config, staging, SOURCE_KEY, Script(step), load=loader)
+
+    assert result.approved
+    assert manager.read_manifest(staging)["manager_session"] == "opencode:ses_manager"
+
+
 def test_redact_all_removes_every_marker_uuid_and_bare_occurrences():
     a = "11111111-1111-1111-1111-111111111111"
     b = "22222222-2222-2222-2222-222222222222"

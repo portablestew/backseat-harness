@@ -1300,6 +1300,15 @@ def test_workspace_page_auto_refreshes_every_60s(workspace: Path):
     dom_ready = script.index("document.addEventListener('DOMContentLoaded'")
     assert dom_ready < script.index("[data-auto-refresh]")
     assert dom_ready < script.index("window.location.reload()")
+    # The reload carries the scroll offsets across: both the page scroll (so a
+    # reader at the bottom is kept there) and the scroll inside the bounded text
+    # panels, which is where a transcript reader actually loses their place.
+    assert "sessionStorage.setItem" in script
+    assert "window.scrollTo(" in script
+    assert "state.bottom" in script
+    assert ".transcript, .goal" in script
+    assert "scrollTop" in script
+    assert "state.tops" in script
     # Homepage keeps the HTMX poll instead of the reload hook.
     assert home.status_code == 200
     assert 'data-auto-refresh="60"' not in home.text
@@ -1352,7 +1361,7 @@ def test_task_page_matches_the_polish_brief(workspace: Path):
     header-less Provider/Iteration/Generation/Reason table, a required-brief
     Run block with the in progress copy beside a 2/3 Status column,
     state-colored checklist capsules, no Logs section and no inline
-    transcript -- just a "Raw transcript" link to the 6d page."""
+    transcript -- just the quiet transcript-link footer."""
     ws_id = _register_workspace(workspace)
     lane = workspace / ".backseat" / "tasks" / "polish-lane"
     lane.mkdir(parents=True)
@@ -1376,13 +1385,10 @@ def test_task_page_matches_the_polish_brief(workspace: Path):
                 "v": 1,
                 "root_uuid": "11111111-2222-3333-4444-555555555555",
                 "provider": "claude",
-                "generations": [],
+                "generations": [{"n": 1, "native_id": "sess-polish"}],
             }
         ),
         encoding="utf-8",
-    )
-    (lane / "transcript.md").write_text(
-        "FULL INLINE TRANSCRIPT BODY\n", encoding="utf-8"
     )
     logs = lane / "logs"
     logs.mkdir()
@@ -1454,14 +1460,20 @@ def test_task_page_matches_the_polish_brief(workspace: Path):
     assert '<span class="badge" data-status="active">active</span>' in html
     assert '<span class="badge" data-status="blocked">blocked</span>' in html
 
-    # No Logs section and no inline transcript; only the "Raw transcript" link
-    # (its 6d target page is not built yet).
+    # No Logs section and no inline transcript; only the quiet transcript-link
+    # footer, whose managed entry points at the live session in the chat viewer.
     assert "<h4>Logs</h4>" not in html
-    assert "FULL INLINE TRANSCRIPT BODY" not in html
-    assert (
-        f'<a href="/ws/{ws_id}/tasks/polish-lane/transcript">Raw transcript</a>'
-        in html
-    )
+    assert "<h4>Transcript</h4>" not in html
+    assert 'class="transcript-links"' in html
+    assert '<a href="/chat/claude_code/sess-polish?from=' in html
+    # The links read as links: accent blue at rest, underlined under the pointer.
+    at_rest = html[html.index(".transcript-links a {") :]
+    at_rest = at_rest[: at_rest.index("}")]
+    assert "color: var(--accent)" in at_rest
+    assert "text-decoration: none" in at_rest
+    hover = html[html.index(".transcript-links a:hover {") :]
+    hover = hover[: hover.index("}")]
+    assert "text-decoration: underline" in hover
 
 
 def test_task_page_run_copy_restarts_when_not_in_progress(workspace: Path):
@@ -1666,65 +1678,102 @@ def test_run_button_text_matches_task_state(workspace: Path, status, expected):
     assert f"{expected} this task with an added instruction" in body
 
 
-def _write_transcript_lane(workspace: Path, slug: str, body: str) -> None:
-    """A minimal lane with a ``transcript.md`` for the 6d viewer."""
+def _write_managed_lane(
+    workspace: Path, slug: str, native_id: str = "ses_live", provider: str = "opencode"
+) -> None:
+    """A minimal lane whose binding names a live managed session."""
     lane = workspace / ".backseat" / "tasks" / slug
     lane.mkdir(parents=True, exist_ok=True)
     (lane / "goal.md").write_text(f"goal for {slug}\n", encoding="utf-8")
-    (lane / "transcript.md").write_text(body, encoding="utf-8")
-
-
-def test_task_transcript_page_shares_the_chat_layout(workspace: Path):
-    """[6d]: the raw-transcript page reuses the chat layout -- the chat header
-    shell with a back link to the task page, and the full transcript below."""
-    ws_id = _register_workspace(workspace)
-    body = "## USER\nfull transcript body line\n" + "tail chunk " * 20
-    _write_transcript_lane(workspace, "talk-lane", body)
-
-    with _client() as client:
-        resp = client.get(f"/ws/{ws_id}/tasks/talk-lane/transcript")
-
-    assert resp.status_code == 200
-    html = resp.text
-    # Same header shell as the chat page (shared _chat_page.html).
-    assert 'class="chat-header"' in html
-    assert html.count('class="chat-header-back"') == 1
-    assert (
-        f'<a class="chat-header-back" href="/ws/{ws_id}/tasks/talk-lane">← talk-lane</a>'
-        in html
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "root_uuid": _MARKER_ROOT_UUID,
+                "provider": provider,
+                "generations": [{"n": 1, "native_id": native_id}],
+            }
+        ),
+        encoding="utf-8",
     )
-    # Full transcript below, untruncated, in the shared transcript box.
-    assert '<pre class="transcript">' in html
-    assert "full transcript body line" in html
-    assert html.count("tail chunk") == 20
 
 
-def test_task_page_raw_transcript_link_resolves(workspace: Path):
-    """[6d] bar (1): the task page's "Raw transcript" link resolves to the new
-    page with HTTP 200."""
+def test_task_page_managed_link_targets_the_live_session(workspace: Path):
+    """The task page links the managed agent to the regular chat viewer for the
+    lane's current session -- the live transcript, not a task-specific page."""
     ws_id = _register_workspace(workspace)
-    _write_transcript_lane(workspace, "talk-lane", "the transcript\n")
+    _write_managed_lane(workspace, "talk-lane", native_id="ses_talk")
 
     with _client() as client:
-        task_page = client.get(f"/ws/{ws_id}/tasks/talk-lane")
-        assert task_page.status_code == 200
-        href = re.search(r'href="([^"]*talk-lane/transcript)"', task_page.text).group(1)
-        assert href == f"/ws/{ws_id}/tasks/talk-lane/transcript"
-        followed = client.get(href)
+        page = client.get(f"/ws/{ws_id}/tasks/talk-lane")
 
-    assert followed.status_code == 200
-    assert "the transcript" in followed.text
+    assert page.status_code == 200
+    # The link carries this task page as the viewer's back target.
+    assert (
+        f'<a href="/chat/opencode/ses_talk?from=/ws/{ws_id}/tasks/talk-lane'
+        f'&amp;label=talk-lane">managed agent</a>'
+    ) in page.text
 
 
-def test_task_transcript_page_unknown_task_or_workspace_are_404(workspace: Path):
-    """[6d] bar (1): an unknown workspace or task slug on the transcript route
-    returns 404 rather than crashing."""
+def test_task_page_links_operator_and_generator_transcripts(workspace: Path):
+    """The footer's operator link resolves the newest operator call from its log
+    (numeric iteration/attempt order), and the generator link comes from the
+    lane's ``manager.json`` provenance."""
     ws_id = _register_workspace(workspace)
-    bogus_id = ws_id + 9999
+    lane = workspace / ".backseat" / "tasks" / "linked-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("ship it\n", encoding="utf-8")
+    (lane / "binding.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "root_uuid": _MARKER_ROOT_UUID,
+                "provider": "opencode",
+                "generations": [{"n": 1, "native_id": "ses_managed"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    logs = lane / "logs"
+    logs.mkdir()
+    (logs / "iter-0002.operator.0.log").write_text("ses_old\n", encoding="utf-8")
+    # Attempt 10 is newer than attempt 9, though "10" sorts before "9".
+    (logs / "iter-0003.operator.9.log").write_text("ses_attempt9\n", encoding="utf-8")
+    (logs / "iter-0003.operator.10.log").write_text("ses_attempt10\n", encoding="utf-8")
+    (lane / "manager.json").write_text(
+        json.dumps({"manager_session": "claude_code:ses_mgr"}), encoding="utf-8"
+    )
 
     with _client() as client:
-        assert client.get(f"/ws/{bogus_id}/tasks/anything/transcript").status_code == 404
-        assert client.get(f"/ws/{ws_id}/tasks/no-such-lane/transcript").status_code == 404
+        page = client.get(f"/ws/{ws_id}/tasks/linked-lane")
+
+    assert page.status_code == 200, page.text
+    html = page.text
+    assert '<a href="/chat/opencode/ses_managed?from=' in html
+    assert '<a href="/chat/opencode/ses_attempt10?from=' in html
+    assert '<a href="/chat/claude_code/ses_mgr?from=' in html
+    assert html.index(">managed agent</a>") < html.index(">operator</a>")
+    assert html.index(">operator</a>") < html.index(">task generator</a>")
+    # The dot is its own element between the links -- never generated content on
+    # an anchor, which would put it inside a link's click target.
+    assert html.count('class="transcript-sep" aria-hidden="true">·</span>') == 2
+    assert 'a + a::before' not in html
+    assert html.index(">managed agent</a>") < html.index(">·</span>")
+    assert html.index(">·</span>") < html.index(">operator</a>")
+
+
+def test_task_page_footer_omits_missing_operator_and_generator_links(workspace: Path):
+    """A written lane has no operator log and no manager.json, so the footer
+    carries only the managed-agent link."""
+    ws_id = _register_workspace(workspace)
+    _write_managed_lane(workspace, "plain-lane", native_id="ses_plain")
+
+    with _client() as client:
+        html = client.get(f"/ws/{ws_id}/tasks/plain-lane").text
+
+    assert '<a href="/chat/opencode/ses_plain?from=' in html
+    assert ">operator</a>" not in html
+    assert "task generator" not in html
 
 
 _MARKED_TAG = '<script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.min.js"></script>'
@@ -1733,8 +1782,8 @@ _MD_PAYLOAD = "## USER\n> <script>alert(1)</script> & <b>bold</b>\n"
 
 
 def _assert_transcript_markdown_page(html: str) -> None:
-    """Both transcript pages: pinned renderer tags, the escaped <pre> fallback,
-    and the renderer's ``transcript-md`` swap."""
+    """The chat transcript page: pinned renderer tags, the escaped <pre>
+    fallback, and the renderer's ``transcript-md`` swap."""
     assert _MARKED_TAG in html
     assert _DOMPURIFY_TAG in html
     # The server still emits the escaped plain-text <pre> the renderer falls back to.
@@ -1765,16 +1814,96 @@ def test_chat_page_includes_transcript_markdown_renderer(monkeypatch):
     _assert_transcript_markdown_page(resp.text)
 
 
-def test_task_transcript_page_includes_transcript_markdown_renderer(workspace: Path):
-    """The task transcript page loads the same renderer and fallback <pre>."""
-    ws_id = _register_workspace(workspace)
-    _write_transcript_lane(workspace, "md-lane", _MD_PAYLOAD)
+def test_chat_page_auto_refreshes_a_managed_session(monkeypatch):
+    """The chat viewer reloads itself for a managed session -- the task page
+    links here to follow a running turn -- but leaves a plain chat static."""
+    from backseat_harness import history
 
+    payloads = {
+        "opencode:ses_task": f"{_MARKER}\n## USER\nmanaged body\n",
+        "opencode:ses_plain": "a plain chat\n\n## ASSISTANT\nreply\n",
+    }
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: payloads[k] for k in keys},
+    )
     with _client() as client:
-        resp = client.get(f"/ws/{ws_id}/tasks/md-lane/transcript")
+        managed = client.get("/chat/opencode/ses_task")
+        plain = client.get("/chat/opencode/ses_plain")
 
-    assert resp.status_code == 200
-    _assert_transcript_markdown_page(resp.text)
+    assert managed.status_code == 200 and plain.status_code == 200
+    assert 'data-auto-refresh="60"' in managed.text
+    assert 'data-auto-refresh="60"' not in plain.text
+
+
+def test_chat_page_from_param_sets_the_back_link(monkeypatch):
+    """A ``from`` referral (the task page that linked here) becomes the viewer's
+    back link, so following a task's transcript returns to the task."""
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: f"{_MARKER}\n## USER\nbody\n" for k in keys},
+    )
+    with _client() as client:
+        page = client.get(
+            "/chat/opencode/ses_task",
+            params={"from": "/ws/3/tasks/talk-lane", "label": "talk-lane"},
+        )
+
+    assert page.status_code == 200
+    assert (
+        '<a class="chat-header-back" href="/ws/3/tasks/talk-lane">← talk-lane</a>'
+        in page.text
+    )
+
+
+def test_chat_page_ignores_an_offsite_from(monkeypatch):
+    """An off-site ``from`` is no back target -- honoring it would be an open
+    redirect -- so the link falls back as if there were no referral."""
+    from backseat_harness import history
+
+    monkeypatch.setattr(
+        history, "load_sessions", lambda keys, providers=None: {k: "a chat" for k in keys}
+    )
+    with _client() as client:
+        page = client.get("/chat/opencode/ses_plain", params={"from": "//evil.example/x"})
+
+    assert page.status_code == 200
+    assert '<a class="chat-header-back" href="/">← Workspaces</a>' in page.text
+    assert "evil.example" not in page.text
+
+
+def test_chat_page_task_session_offers_no_chat_actions(workspace: Path, monkeypatch):
+    """A managed session is already a task's transcript: the viewer hides
+    Generate Task, Resume, and Fork (opencode supports Resume) while a plain
+    chat keeps them."""
+    from backseat_harness import history
+
+    ws_id = _register_workspace(workspace)
+    payloads = {
+        "opencode:ses_task": f"{_MARKER}\n## USER\nmanaged body\n",
+        "opencode:ses_plain": "a plain chat\n\n## ASSISTANT\nreply\n",
+    }
+    monkeypatch.setattr(
+        history,
+        "load_sessions",
+        lambda keys, providers=None: {k: payloads[k] for k in keys},
+    )
+    with _client() as client:
+        task_session = client.get(f"/chat/opencode/ses_task?ws={ws_id}")
+        plain_session = client.get(f"/chat/opencode/ses_plain?ws={ws_id}")
+
+    assert "generate-task-form" not in task_session.text
+    assert 'id="resume-form"' not in task_session.text
+    assert 'id="fork-form"' not in task_session.text
+    assert ">Resume</button>" not in task_session.text
+    assert ">Fork</button>" not in task_session.text
+    # A plain chat keeps all three.
+    assert "generate-task-form" in plain_session.text
+    assert ">Resume</button>" in plain_session.text
 
 
 def test_task_page_renders_goal_as_markdown(workspace: Path):
@@ -1801,8 +1930,8 @@ def test_task_page_renders_goal_as_markdown(workspace: Path):
 
 
 def test_workspace_page_loads_no_transcript_renderer(workspace: Path, monkeypatch):
-    """Only the chat and task transcript pages load marked and DOMPurify; the
-    workspace page has no transcript box and must not pull them in."""
+    """Only the chat page loads marked and DOMPurify; the workspace page has no
+    transcript box and must not pull them in."""
     ws_id = _register_workspace(workspace)
     _stub_chat_history(monkeypatch, [], {})
 
@@ -3845,6 +3974,33 @@ def test_search_results_drops_operator_chat_without_a_task(monkeypatch):
     assert "a plain chat about refactors" in html
 
 
+def test_search_results_drops_a_task_chat_whose_lane_is_gone(monkeypatch):
+    """A managed session with a real START SESSION marker but no lane under any
+    registered workspace (the task was deleted, its workspace unregistered) is a
+    task by definition: it is dropped rather than surfaced as an ordinary chat,
+    the same rule operator hits already follow."""
+    refs = [
+        _Ref("opencode:ses_orphan", mtime=500.0, project="somewhere"),
+        _Ref("opencode:ses_plain", mtime=200.0),
+    ]
+    transcripts = {
+        "opencode:ses_orphan": f"{_MARKER}\n## USER\nmanaged body\n",
+        "opencode:ses_plain": "a plain chat about refactors",
+    }
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    html = resp.text
+    assert "ses_orphan" not in html
+    assert "managed body" not in html
+    # The plain other chat still renders.
+    assert 'data-href="/chat/opencode/ses_plain"' in html
+    assert "a plain chat about refactors" in html
+
+
 def test_search_results_recovers_workspace_dir_from_the_provider_store(
     monkeypatch, workspace: Path, tmp_path: Path
 ):
@@ -3887,6 +4043,38 @@ def test_search_results_recovers_workspace_dir_from_the_provider_store(
     row = next(r for r in _data_rows(resp.text) if "recovered-lane" in r)
     cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
     assert cells[3].strip() == "claude_code"
+
+
+def test_search_places_a_marker_hit_by_workspace_name_when_store_dir_is_gone(
+    monkeypatch, workspace: Path
+):
+    """A managed task hit whose provider store no longer holds the session's dir
+    (only a bare ``project`` basename survives) is placed in the registered
+    workspace whose directory name matches -- so it renders as a task row with
+    its lane and workspace instead of a workspace-less chat."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "named-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal for named lane\n", encoding="utf-8")
+    (lane / "state.json").write_text(
+        json.dumps({"slug": "named-lane", "status": "continue"}), encoding="utf-8"
+    )
+    (lane / "binding.json").write_text(
+        json.dumps({"v": 1, "root_uuid": _MARKER_ROOT_UUID, "generations": []}),
+        encoding="utf-8",
+    )
+    # No locator/database: store recovery cannot fill the dir, only the basename.
+    refs = [_Ref("opencode:ses_by_name", mtime=400.0, project=workspace.name)]
+    transcripts = {"opencode:ses_by_name": f"{_MARKER}\n## USER\nmanaged body\n"}
+    _stub_chat_history(monkeypatch, refs, transcripts)
+
+    with _client() as client:
+        resp = client.get("/search/results", params={"q": ""})
+
+    assert resp.status_code == 200
+    assert f'data-href="/ws/{ws_id}/tasks/named-lane"' in resp.text
+    assert "goal for named lane" in resp.text
+    assert "managed body" not in resp.text
 
 
 def test_search_plain_chat_in_a_registered_workspace_links_with_ws(
@@ -3962,12 +4150,10 @@ def test_search_results_workspace_column_names_the_registered_workspace(
     assert _workspace_cell("ses_outside") == "N/A"
 
 
-def test_search_unresolved_task_hit_fallback_stays_bare(
-    monkeypatch, workspace: Path
-):
-    """A managed task hit whose lane does not resolve falls back to a plain
-    chat row. Its project is a registered workspace, yet the href stays bare:
-    the task's ws mapping is only for resolved lanes."""
+def test_search_unresolved_task_hit_is_dropped(monkeypatch, workspace: Path):
+    """A managed task hit is dropped, not shown as a chat, when its lane does
+    not resolve -- here the project is a registered workspace but no lane under
+    it carries the hit's marker."""
     _register_workspace(workspace)
     refs = [_Ref("opencode:ses_orphan", mtime=400.0, project=str(workspace))]
     transcripts = {"opencode:ses_orphan": f"{_MARKER}\n## USER\norphan body\n"}
@@ -3976,8 +4162,9 @@ def test_search_unresolved_task_hit_fallback_stays_bare(
     with _client() as client:
         resp = client.get("/search/results", params={"q": ""})
 
-    assert 'data-href="/chat/opencode/ses_orphan"' in resp.text
-    assert "ses_orphan?ws=" not in resp.text
+    assert "ses_orphan" not in resp.text
+    assert "orphan body" not in resp.text
+    assert "No sessions found." in resp.text
 
 
 def test_classification_reads_only_the_first_user_message():

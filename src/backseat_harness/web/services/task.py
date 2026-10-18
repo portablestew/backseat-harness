@@ -22,10 +22,12 @@ Wraps the seams from 2-plan.md §5 so routes/templates stay thin:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from backseat_harness import db, manager, storage
 from backseat_harness.config import (
@@ -37,6 +39,7 @@ from backseat_harness.config import (
     sanitize_slug,
 )
 from backseat_harness.models import TaskStatus
+from backseat_harness.providers import get_provider
 
 
 def create_task(workspace: Path | str, name: str, goal: str) -> str:
@@ -212,6 +215,109 @@ def list_recent_task_dirs(
     return slugs[:limit], max(0, len(slugs) - limit)
 
 
+def _chat_href(key: object) -> str | None:
+    """A chat-viewer URL for a stored session key, or None when unusable.
+
+    The key is chat-mother-forker's own ``provider:conversation_id`` shape, which
+    is exactly what ``/chat/<provider>/<conversation_id>`` accepts.
+    """
+    if not isinstance(key, str) or not key:
+        return None
+    provider, sep, conversation_id = key.partition(":")
+    if not sep or not provider or not conversation_id:
+        return None
+    return f"/chat/{provider}/{quote(conversation_id, safe='')}"
+
+
+#: One operator call's log: ``iter-<iteration>.operator.<attempt>.log``.
+#: Iteration is zero-padded, the attempt is not, so ordering is parsed rather
+#: than trusted to the filename.
+_OPERATOR_LOG_RE = re.compile(r"^iter-(\d+)\.operator\.(\d+)\.log$")
+
+
+def _newest_operator_log(task_dir: Path) -> Path | None:
+    """The lane's most recent operator-call log, or None when none was written."""
+    logs_dir = task_dir / "logs"
+    if not logs_dir.is_dir():
+        return None
+    newest: tuple[int, int] | None = None
+    newest_path: Path | None = None
+    for path in logs_dir.iterdir():
+        match = _OPERATOR_LOG_RE.match(path.name)
+        if match is None or not path.is_file():
+            continue
+        key = (int(match.group(1)), int(match.group(2)))
+        if newest is None or key > newest:
+            newest, newest_path = key, path
+    return newest_path
+
+
+def _operator_transcript_href(ws_path: Path, slug: str, task_dir: Path) -> str | None:
+    """The newest operator call's transcript URL, or None.
+
+    The per-call log is the exact record of which stored session the last
+    operator invocation used, and it is already on disk. Reading it avoids a
+    content search at page load, and it still resolves the most recent operator
+    session for a lane that ran before this link existed. The provider adapter
+    parses the id out of the same event stream it parses for a managed turn.
+    """
+    path = _newest_operator_log(task_dir)
+    if path is None:
+        return None
+    try:
+        config = load_config(ws_path, slug)
+        provider = get_provider(config.operator.provider)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        native_id = provider.parse_result(0, text, text)
+    except Exception:
+        # A diagnostic link is never worth failing the page for: an unregistered
+        # operator provider, an unreadable log, or a stream with no id all leave
+        # the row out, exactly as a lane that never ran does.
+        return None
+    if not native_id:
+        return None
+    return _chat_href(f"{provider.history_provider}:{native_id}")
+
+
+def _manager_transcript_href(task_dir: Path) -> str | None:
+    """The generate-task manager's transcript URL, when the lane records one.
+
+    A lane promoted from a generation carries the manager call's
+    ``provider:conversation_id`` in ``manager.json`` (see manager.PROVENANCE_KEYS).
+    A hand-written lane has no manifest, so it has no manager transcript.
+    """
+    manifest = manager.read_manifest(task_dir)
+    if manifest is None:
+        return None
+    return _chat_href(manifest.get("manager_session"))
+
+
+def _managed_transcript_href(task_dir: Path) -> str | None:
+    """The managed session's live-transcript URL, or None.
+
+    ``binding.json`` names the current generation's native session id, so the
+    regular chat viewer can render the *session* -- which the CLI keeps writing
+    as a turn runs -- rather than the ``transcript.md`` snapshot the loop only
+    rewrites once a turn ends. The newest generation that recorded an id wins,
+    so a generation whose first turn has not reported one yet still points at
+    the previous turn's still-readable session.
+    """
+    try:
+        binding = storage.load_binding(TaskPaths(task_dir))
+    except Exception:
+        return None
+    if binding is None:
+        return None
+    gen = next((g for g in reversed(binding.generations) if g.native_id), None)
+    if gen is None or not gen.native_id:
+        return None
+    try:
+        history_provider = get_provider(gen.provider or binding.provider).history_provider
+    except Exception:
+        return None
+    return _chat_href(f"{history_provider}:{gen.native_id}")
+
+
 #: Badge text for each :func:`manager.generation_state` value.
 GENERATION_BADGES = {
     "generating": "generating",
@@ -258,6 +364,10 @@ def list_generating(workspace: Path | str) -> list[dict]:
                 "source_key": source_key,
                 "provider": provider,
                 "conversation_id": conversation_id,
+                # The manager call's stored session, written as soon as the
+                # call reports an id. It is the one place a generation in
+                # flight or parked can be observed, so the row links it.
+                "manager_href": _chat_href(manifest.get("manager_session")),
                 "created_at": float(created) if isinstance(created, int | float) else 0.0,
             }
         )
@@ -296,7 +406,14 @@ class TaskDetail:
     updated_at: float
     checklist: dict
     remarks: list[str]
-    transcript: str | None
+    #: Chat-viewer URL for the managed session itself (the live one), when the
+    #: lane's binding records a native session id.
+    managed_href: str | None = None
+    #: Chat-viewer URL for the newest operator call, when one was logged.
+    operator_href: str | None = None
+    #: Chat-viewer URL for the generate-task manager, when the lane was promoted
+    #: from a generation that recorded its session.
+    manager_href: str | None = None
 
 
 def _task_provider(ws_path: Path, task_dir: Path) -> str:
@@ -333,7 +450,6 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
 
     goal_path = task_dir / "goal.md"
     checklist_path = task_dir / "checklist.json"
-    transcript_path = task_dir / "transcript.md"
 
     # Load goal.md (always exists if task dir exists)
     try:
@@ -368,14 +484,6 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
     except Exception:
         checklist_data = {"steps": {}, "remarks": []}
 
-    # Load transcript.md
-    transcript = None
-    if transcript_path.exists():
-        try:
-            transcript = transcript_path.read_text(encoding="utf-8")
-        except OSError:
-            pass
-
     return TaskDetail(
         slug=slug,
         goal=goal,
@@ -389,7 +497,9 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         updated_at=updated_at,
         checklist=checklist_data.get("steps", {}),
         remarks=checklist_data.get("remarks", []),
-        transcript=transcript,
+        managed_href=_managed_transcript_href(task_dir),
+        operator_href=_operator_transcript_href(ws_path, slug, task_dir),
+        manager_href=_manager_transcript_href(task_dir),
     )
 
 

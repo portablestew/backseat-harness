@@ -88,6 +88,39 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  /* Transcript links: a quiet debug footer on a hairline rule. Muted at rest,
+     accent only under the pointer, so they stay visually below the content
+     sections -- these are diagnostic artifacts, not page content. */
+  .transcript-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.2rem 0.6rem;
+    margin: 0.75rem 0 0.25rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.8rem;
+  }
+  .transcript-links-label {
+    color: var(--muted);
+    font-weight: 600;
+  }
+  /* Blue like the task links in the workspace tables: unambiguously a link at
+     rest, underlined under the pointer. */
+  .transcript-links a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .transcript-links a:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+  }
+  /* Separator between links: its own element, not generated content on the
+     anchor, so it is never part of a link's click target or underlined on
+     hover -- it is punctuation, not something to click. */
+  .transcript-sep {
+    color: var(--border-hover);
+  }
 </style>
 
 <header class="chat-header task-header">
@@ -242,9 +275,20 @@
   {% endif %}
 </section>
 
-{% if task.transcript %}
-<section>
-  <p><a href="/ws/{{ ws_id }}/tasks/{{ task.slug }}/transcript">Raw transcript</a></p>
-</section>
+{% if task.managed_href or task.operator_href or task.manager_href %}
+{# Each transcript opens in the shared chat viewer; carry this task page as the
+   back target so the viewer's back link returns here, not to the workspace. #}
+{% set q = '?from=' ~ (('/ws/' ~ ws_id ~ '/tasks/' ~ task.slug) | urlencode) ~ '&label=' ~ (task.slug | urlencode) %}
+{% set links = [] %}
+{% if task.managed_href %}{% set _ = links.append(('managed agent', task.managed_href ~ q)) %}{% endif %}
+{% if task.operator_href %}{% set _ = links.append(('operator', task.operator_href ~ q)) %}{% endif %}
+{% if task.manager_href %}{% set _ = links.append(('task generator', task.manager_href ~ q)) %}{% endif %}
+<div class="transcript-links" aria-label="Transcripts">
+  <span class="transcript-links-label">Transcripts</span>
+  {% for label, href in links %}
+  {% if not loop.first %}<span class="transcript-sep" aria-hidden="true">·</span>{% endif %}
+  <a href="{{ href }}">{{ label }}</a>
+  {% endfor %}
+</div>
 {% endif %}
 {% endblock %}

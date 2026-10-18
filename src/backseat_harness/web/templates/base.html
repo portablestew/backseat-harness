@@ -531,7 +531,35 @@
     // DOMContentLoaded before querying the attribute. It pauses while the user
     // is typing in a field or has a + expander open, then reschedules rather
     // than reloading mid-edit.
+    //
+    // A reload would otherwise reset both the page scroll and the scroll inside
+    // the bounded text panels (the transcript box is max-height:70vh and scrolls
+    // on its own, so the panel -- not the page -- is where a reader loses their
+    // place). Both offsets are stashed in sessionStorage just before the reload
+    // and restored on the next load; a reader who was at the bottom of the page
+    // is kept at the bottom instead, so newly appended turns stay in view.
     document.addEventListener('DOMContentLoaded', function () {
+      var key = 'bsh:auto-refresh:' + location.pathname + location.search;
+      // The bounded, self-scrolling text panels: the chat/task transcript box and
+      // the task goal box. Matched in DOM order, which is stable across a reload.
+      var panelSel = '.transcript, .goal';
+      var atBottom = 40;
+      var saved = null;
+      try { saved = sessionStorage.getItem(key); } catch (err) { /* storage blocked */ }
+      if (saved !== null) {
+        try {
+          sessionStorage.removeItem(key);
+          var state = JSON.parse(saved);
+          window.scrollTo(
+            0, state.bottom ? document.documentElement.scrollHeight : state.y
+          );
+          var tops = state.tops || [];
+          var boxes = document.querySelectorAll(panelSel);
+          for (var b = 0; b < boxes.length && b < tops.length; b++) {
+            boxes[b].scrollTop = tops[b];
+          }
+        } catch (err) { /* storage blocked or unreadable: leave the scroll alone */ }
+      }
       var root = document.querySelector('[data-auto-refresh]');
       if (!root) return;
       var seconds = parseInt(root.getAttribute('data-auto-refresh'), 10);
@@ -542,6 +570,16 @@
         var typing = el && /^(input|textarea|select)$/i.test(el.tagName);
         var openPanel = document.querySelector('details.expander[open]');
         if (typing || openPanel) { schedule(); return; }
+        var bottom = window.innerHeight + window.scrollY
+          >= document.documentElement.scrollHeight - atBottom;
+        var boxes = document.querySelectorAll(panelSel);
+        var tops = [];
+        for (var b = 0; b < boxes.length; b++) tops.push(boxes[b].scrollTop);
+        try {
+          sessionStorage.setItem(
+            key, JSON.stringify({ y: window.scrollY, bottom: bottom, tops: tops })
+          );
+        } catch (err) { /* storage blocked: reload without scroll memory */ }
         window.location.reload();
       };
       schedule();

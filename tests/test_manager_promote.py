@@ -133,6 +133,20 @@ def test_promotion_lands_goal_and_a_provenance_only_manifest(config, tasks_dir):
     assert sorted(p.name for p in tasks_dir.iterdir()) == [slug]
 
 
+def test_promotion_carries_the_manager_session_key(config, tasks_dir):
+    """Provenance keeps the manager call's stored session, so the promoted task
+    page can link the transcript that drafted its goal."""
+    staging = make_approved_staging(config)
+    data = manager.read_manifest(staging)
+    data["manager_session"] = "opencode:ses_manager"
+    manager.write_manifest(staging, data)
+
+    slug = manager.promote(staging, tasks_dir)
+
+    manifest = json.loads((tasks_dir / slug / "manager.json").read_text(encoding="utf-8"))
+    assert manifest["manager_session"] == "opencode:ses_manager"
+
+
 def test_promoted_lane_is_exactly_goal_and_manifest(config, tasks_dir):
     """Source, logs, and staging do not reach the promoted lane."""
     small = replace(config, compact_threshold_bytes=10)  # force source.md

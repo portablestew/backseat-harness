@@ -372,6 +372,10 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
         texts = history.load_sessions([r.key for r in refs], providers=providers)
     except Exception:
         texts = {}
+    # Lazily built registry index for the store-recovery fallback below: only a
+    # marker-bearing hit needs it, so a search dominated by plain chats pays for
+    # it only when one appears.
+    workspaces_by_name: dict[str, str] | None = None
     for ref in refs:
         if len(results) >= limit:
             break
@@ -397,13 +401,21 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
             marker_id = parsed_marker[0] if parsed_marker else ""
             operator_slug = marker.parse_operator_marker(head) or ""
 
+        # Absolute workspace dir: ``ChatRef.project`` is only a basename, so the
+        # dir is recovered from the provider's own store (the homepage search
+        # resolves task hits to their lane through it). A marker-bearing hit whose
+        # session directory the store no longer holds (the row was deleted) still
+        # gets one from the registry when its name is a unique match -- the lane
+        # lookup confirms it, and an unconfirmed "other" chat is left unplaced.
+        project = _ref_workspace_path(ref)
+        if project is None and classification != "other":
+            if workspaces_by_name is None:
+                workspaces_by_name = _registered_workspaces_by_name()
+            project = workspaces_by_name.get(getattr(ref, "project", "") or "")
         results.append(SessionSearchResult(
             key=ref.key,
             native_id=getattr(ref, "session", "") or ref.key.partition(":")[2],
-            # Absolute workspace dir: ``ChatRef.project`` is only a basename,
-            # so the dir is recovered from the provider's own store (the
-            # homepage search resolves task hits to their lane through it).
-            project=_ref_workspace_path(ref),
+            project=project,
             mtime=getattr(ref, "mtime", 0),
             preview=preview,
             classification=classification,
@@ -523,6 +535,35 @@ def _ref_workspace_path(ref: object) -> str | None:
     return None
 
 
+def _registered_workspaces_by_name() -> dict[str, str]:
+    """Registered workspace dirs keyed by directory name, unique names only.
+
+    A hit whose store recovery failed (``_ref_workspace_path`` returned None)
+    carries only ``ChatRef.project``, a bare basename, because the provider store
+    no longer holds the session's directory. A directory name registered exactly
+    once recovers the absolute dir; an ambiguous name is omitted rather than
+    guessed. Only marker-bearing hits use this, and the caller's lane lookup then
+    confirms the match -- a wrong dir holds no lane for the hit's marker.
+    """
+    seen: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    try:
+        pairs = workspace_service.list_workspaces_with_ids()
+    except Exception:
+        return {}
+    for _ws_id, path in pairs:
+        name = Path(path).expanduser().name
+        if not name:
+            continue
+        if name in seen:
+            ambiguous.add(name)
+        else:
+            seen[name] = path
+    for name in ambiguous:
+        seen.pop(name, None)
+    return seen
+
+
 def _read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -615,32 +656,22 @@ def _ws_entry(project: str | None, ws_index: WsIndex) -> tuple[int, str, str] | 
 
 
 def _task_row(
-    result: SessionSearchResult, lane: Path | None, ws_index: WsIndex
+    result: SessionSearchResult, lane: Path, ws_index: WsIndex
 ) -> HomepageResult:
-    """Enrich a task hit: resolve its lane for the goal prompt and status.
+    """Enrich a resolved task hit: its lane for the goal prompt and status.
 
     The row's ``provider`` is always the chat's own provider (its key prefix),
     even on a task row -- the task name rides ``task_name`` (rendered as the
     prompt cell's heading) so the Provider column never holds a lane slug.
 
-    Falls back to the chat link and the chat's parsed prompt when the lane
-    (or its registered workspace) cannot be resolved. The Workspace column
-    reads the hit's project whether or not the lane resolved; the ``/ws/``
-    href still requires a resolved lane (and a registered workspace).
+    ``lane`` is always present: ``homepage_search`` drops a marker hit whose
+    lane cannot be resolved rather than passing it here. A lane in an
+    unregistered workspace has no ``/ws/`` id, so its href falls back to the
+    chat link; the Workspace column reads the hit's project either way.
     """
     provider = _extract_provider_from_key(result.key) or ""
     entry = _ws_entry(result.project, ws_index)
     ws_name, ws_path = (entry[1], entry[2]) if entry else ("", "")
-    if lane is None:
-        return HomepageResult(
-            href=f"/chat/{provider}/{result.native_id}",
-            prompt=result.prompt,
-            provider=provider,
-            mtime=result.mtime,
-            workspace=ws_name,
-            workspace_path=ws_path,
-        )
-
     ws_id = entry[0] if entry else None
     info = task_service._lane_info(lane)
     href = (
@@ -681,8 +712,10 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
 
     All hits for one task collapse into a single row -- managed chats (root
     UUID marker) and operator chats (slug marker) alike -- keyed by the task's
-    lane, keeping the first hit's sort position and metadata. An operator hit
-    whose task lane no longer resolves is harness-internal and is dropped.
+    lane, keeping the first hit's sort position and metadata. A hit whose task
+    lane no longer resolves (managed or operator) is harness-internal and is
+    dropped: a marker-bearing session is a task by definition, so it is never
+    shown as an ordinary chat.
     """
     # Extra raw results so task dedup still fills the row cap.
     raw = search_all_sessions(query, limit * 3)
@@ -699,9 +732,12 @@ def homepage_search(query: str = "", limit: int = 20) -> list[HomepageResult]:
         if result.classification == "backseat task":
             lane = _task_lane(result, lane_index)
             if lane is None:
-                # An unresolvable task hit is still a real user chat: keep it
-                # as a plain chat row rather than dropping it.
-                rows.append(_task_row(result, None, ws_index))
+                # A session carrying a real START SESSION marker is a managed
+                # task by definition, so it must never surface as an ordinary
+                # chat. When its lane cannot be resolved -- the task was
+                # deleted, its workspace is unregistered, or its project is
+                # unrecoverable -- drop it, the same rule an operator hit with
+                # no lane already follows.
                 continue
             key = (workspace_service._normalize(result.project), lane.name)
             if key in seen_tasks:

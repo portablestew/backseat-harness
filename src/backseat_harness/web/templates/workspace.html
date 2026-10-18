@@ -19,7 +19,7 @@
     <tbody>
       {% for g in generating %}
       <tr class="generation-row">
-        <td>From chat {% if g.provider and g.conversation_id %}<a href="/chat/{{ g.provider | urlencode }}/{{ g.conversation_id | urlencode }}?ws={{ ws_id }}"><code>{{ g.source_key }}</code></a>{% else %}<code>{{ g.source_key }}</code>{% endif %}{% if g.reason %}<br><small>{{ g.reason }}</small>{% endif %}</td>
+        <td>From chat {% if g.provider and g.conversation_id %}<a href="/chat/{{ g.provider | urlencode }}/{{ g.conversation_id | urlencode }}?ws={{ ws_id }}"><code>{{ g.source_key }}</code></a>{% else %}<code>{{ g.source_key }}</code>{% endif %}{% if g.reason %}<br><small>{{ g.reason }}</small>{% endif %}{% if g.manager_href %}<br><small><a href="{{ g.manager_href }}">generator transcript</a></small>{% endif %}</td>
         <td><span class="badge" data-status="{{ g.status }}">{{ g.badge }}</span></td>
         <td><small>{{ g.created_at | format_datetime }}</small></td>
       </tr>

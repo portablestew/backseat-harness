@@ -328,6 +328,11 @@ class _Generation:
         self.calls = 0
         self.provider_pids: list[list[float | int | None]] = []
         manifest = read_manifest(staging) or {}
+        # Carry a session key from a prior invocation of this same staging dir
+        # (the web route creates the dir, the CLI child runs it) until this
+        # run's own call reports a newer one.
+        carried = manifest.get("manager_session")
+        self.session: str | None = carried if isinstance(carried, str) and carried else None
         self.manifest: dict[str, Any] = {
             **manifest,
             "status": "running",
@@ -339,9 +344,15 @@ class _Generation:
 
     def save(self) -> None:
         # Pids are written on every save, including a park, so a failed call's
-        # process tree is still on record for the manual cleanup.
+        # process tree is still on record for the manual cleanup. The manager
+        # session key is written the same way: it is what lets the web page link
+        # a parked or promoted generation to the transcript that produced it.
         self.manifest["rounds"] = self.rounds
         self.manifest["provider_pids"] = self.provider_pids
+        if self.session:
+            self.manifest["manager_session"] = self.session
+        else:
+            self.manifest.pop("manager_session", None)
         write_manifest(self.staging, self.manifest)
 
     def fail(self, reason: str) -> None:
@@ -424,9 +435,11 @@ class _Generation:
         previous_log = logs.current()
         logs.set_current(logs.manager_log(self.staging, phase, self.calls))
         spawn.set_provider_recorder(self._record_pids)
+        spawn.set_session_recorder(self._record_session)
         try:
             reply = self.invoker(prompt)
         finally:
+            spawn.set_session_recorder(None)
             spawn.set_provider_recorder(None)
             logs.set_current(previous_log)
         out = changed_outside(before, _snapshot(self.staging), ALLOWED_WRITES[phase])
@@ -438,6 +451,15 @@ class _Generation:
         # Held in memory and written after the call, so the recorder never races a
         # manager write to manager.json made during the same call.
         self.provider_pids.extend([pid, start] for pid, start in pids)
+
+    def _record_session(self, history_provider: str, native_id: str) -> None:
+        """Keep the newest call's stored session key; a re-ask overwrites it.
+
+        The key uses chat-mother-forker's own ``provider:conversation_id`` shape,
+        so the web layer can hand it straight to the chat viewer without knowing
+        which adapter ran the manager.
+        """
+        self.session = f"{history_provider}:{native_id}"
 
     def _reconcile(self, phase: str, env: dict[str, Any] | None) -> None:
         """Merge the manager's manifest writes back under the wrapper's own keys.
@@ -499,6 +521,10 @@ PROVENANCE_KEYS = (
     "workspace",
     "created_at",
     "rounds",
+    #: ``provider:conversation_id`` of the manager call that produced the draft,
+    #: so the task page can link to the transcript behind its goal. Absent on a
+    #: generation whose provider never reported an id.
+    "manager_session",
     "final_slug",
     "promoted_at",
 )

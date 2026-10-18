@@ -1405,13 +1405,27 @@ def _make_oneshot_invoker(
             extra_args=tuple(extra),
         )
         cmd = spawn.resolve_argv(provider.build_command(spec))
+        log_path = logs.current()
         call = spawn.run_with_timeout(
             cmd,
             cwd=config.workspace_root,
             input=prompt,
             timeout_s=profile.timeout_s,
-            log_path=logs.current(),
+            log_path=log_path,
         )
+        # The stored session id is on the output we already hold (the adapter
+        # parses it for a managed turn too). Report it before anything can park
+        # or fail the call: a generate-task run that ends timed-out or
+        # out-of-scope still leaves a readable manager transcript behind.
+        output = _read_output(log_path, call)
+        stdout, stderr = (
+            (output, output) if log_path is not None else (call.stdout, call.stderr)
+        )
+        native = provider.parse_result(
+            -1 if call.timed_out else call.returncode, stdout, stderr
+        )
+        if native:
+            spawn.record_session(provider.history_provider, native)
         if call.timed_out:
             print(
                 f"[warn] task: {role} call hit its {profile.timeout_s}s timeout "
@@ -1425,7 +1439,7 @@ def _make_oneshot_invoker(
         # with, so a character cut at a write boundary degrades rather than
         # raising -- which matters here, where an unreadable reply costs a whole
         # operator call out of the retry budget.
-        return provider.extract_text(_read_output(logs.current(), call))
+        return provider.extract_text(output)
 
     return invoke
 

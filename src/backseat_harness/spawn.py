@@ -50,6 +50,45 @@ def set_provider_recorder(
     _provider_recorder.set(fn)
 
 
+#: Callback fired when a one-shot call knows its stored session id: the
+#: operator's verdict call and the generate-task manager's call both go through
+#: ``cli._make_oneshot_invoker``, which reads the id off the provider's own
+#: output and reports it here. The caller that owns the durable record -- the
+#: loop's ledger, the manager's manifest -- installs the callback for the
+#: duration of the call. A ContextVar for the same reason as the pid recorder:
+#: a future concurrent lane cannot write another lane's record.
+_session_recorder: contextvars.ContextVar[
+    Callable[[str, str], None] | None
+] = contextvars.ContextVar("backseat_harness_session_recorder", default=None)
+
+
+def set_session_recorder(fn: Callable[[str, str], None] | None) -> None:
+    """Declare the callback the next one-shot invoker fires (None clears)."""
+    _session_recorder.set(fn)
+
+
+def record_session(history_provider: str, native_id: str) -> None:
+    """Report a one-shot call's stored session, when a recorder is installed.
+
+    ``history_provider`` is the chat-mother-forker provider name, so the key is
+    exactly what the web viewer needs (``provider:conversation_id``). Recording
+    is best-effort: a lost link is diagnosable, a killed operator call is not,
+    so a failing callback warns and the call proceeds -- the same rule as the
+    pid recorder.
+    """
+    recorder = _session_recorder.get()
+    if recorder is None:
+        return
+    try:
+        recorder(history_provider, native_id)
+    except Exception as exc:  # noqa: BLE001 - recording is best-effort
+        print(
+            f"[warn] task: could not record session id {native_id!r} from "
+            f"{history_provider!r} ({exc}); continuing",
+            file=sys.stderr,
+        )
+
+
 class CompletedCall(NamedTuple):
     """Result of one bounded subprocess call."""
 

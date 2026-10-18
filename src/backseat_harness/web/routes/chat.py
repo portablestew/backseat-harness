@@ -160,6 +160,13 @@ def chat_page(request: Request, provider: str, conversation_id: str):
     # string the workspace lists show -- reuse the 3e helper, no duplication.
     prompt = chat_search_service._prompt_excerpt(transcript)
 
+    # A managed/operator session is a task's own transcript, so it carries no
+    # chat affordances: no Generate Task (it already is one), no Resume, no
+    # Fork. It also may still be running -- the task page links here to follow
+    # it live -- so it reloads itself on the task page's own 60s cadence. A
+    # plain chat is not a task, and stays static.
+    is_task_session = chat_search_service.classify_session(transcript) != "other"
+
     # Back-nav (3c pattern) to the workspace the chat list lives on, when the
     # referral carries ``?ws=<id>``; without it, fall back to the homepage.
     # The same workspace context also drives Generate Task (see the helper).
@@ -171,6 +178,19 @@ def chat_page(request: Request, provider: str, conversation_id: str):
     # workspace when it is known (fixing the cwd='.' default: the *server's*
     # cwd, not the chat's).
     chat_cwd = str(generate_task.ws_path) if generate_task is not None else "."
+
+    # This page's own back link: an explicit ``from`` (the task page that linked
+    # here) wins, then the referral's workspace, then the homepage. Only a
+    # same-site path is honored -- an off-site ``from`` would be an open
+    # redirect.
+    from_param = request.query_params.get("from")
+    if from_param and from_param.startswith("/") and not from_param.startswith("//"):
+        back_href = from_param
+        back_label = request.query_params.get("label") or "Back"
+    elif ws_name:
+        back_href, back_label = f"/ws/{ws_id}", ws_name
+    else:
+        back_href, back_label = "/", "Workspaces"
 
     # The shell page's back link is this page, reached through ``?from=``, so
     # the payload must re-carry ``?ws=``; without it the round trip lands on
@@ -186,6 +206,8 @@ def chat_page(request: Request, provider: str, conversation_id: str):
             "provider": provider,
             "conversation_id": conversation_id,
             "back_url": back_url,
+            "back_href": back_href,
+            "back_label": back_label,
             "current_session_key": search_key,
             "transcript": transcript,
             "resume_command": resume_command,
@@ -194,6 +216,8 @@ def chat_page(request: Request, provider: str, conversation_id: str):
             "ws_name": ws_name,
             "chat_cwd": chat_cwd,
             "generate_task": generate_task,
+            "auto_refresh": is_task_session,
+            "is_task_session": is_task_session,
         },
     )
 

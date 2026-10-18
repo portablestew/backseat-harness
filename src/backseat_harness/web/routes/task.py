@@ -78,34 +78,6 @@ def task_page(request: Request, ws_id: int, slug: str):
     )
 
 
-@router.get("/ws/{ws_id}/tasks/{slug}/transcript", response_class=HTMLResponse)
-def task_transcript(request: Request, ws_id: int, slug: str):
-    """Standalone transcript page for a task lane (step 6d).
-
-    Shares the chat page's layout (``_chat_page.html``): a sticky header whose
-    back link returns to the task page, and the full transcript below. Unknown
-    workspace or task slugs 404 like every other task route.
-    """
-    ws_path = _resolve_or_404(ws_id)
-    if ws_path is None:
-        return HTMLResponse("Workspace not found", status_code=404)
-
-    task = task_service.load_task(ws_path, slug)
-    if task is None:
-        return HTMLResponse("Task not found", status_code=404)
-
-    return templates.TemplateResponse(
-        request,
-        "transcript.html",
-        {
-            "ws_id": ws_id,
-            "ws_name": ws_path.name,
-            "task": task,
-            "transcript": task.transcript or "",
-        },
-    )
-
-
 @router.post("/ws/{ws_id}/tasks/{slug}/run", response_class=HTMLResponse)
 def task_run(request: Request, ws_id: int, slug: str, brief: str = Form(default="")):
     """Launch a detached run for this task, then wait briefly for it to take the lane.
