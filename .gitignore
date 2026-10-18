@@ -27,8 +27,10 @@ venv/
 # Throwaway live-run scratch workspace (disposable, not a project artifact)
 test_workspace/
 
-# Task workspace (operator/agent working notes; never committed)
-.backseat/
+# Task workspace at the repo root (operator/agent working notes; never
+# committed). Anchored with a leading slash so examples/.backseat/ (the sample
+# configs) is not swept up by the same rule.
+/.backseat/
 
 # Personal planning notes (local only)
 TODO.md
