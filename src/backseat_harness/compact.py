@@ -35,18 +35,24 @@ def render_fork(root_uuid: str, history_provider: str) -> str:
     return history.fork_session(root_uuid, history_provider)
 
 
-def build_compacted_prompt(fork_text: str, next_prompt: str) -> list[str]:
+def build_compacted_prompt(
+    fork_text: str, next_prompt: str, origin: str | None = None
+) -> list[str]:
     """Return the ordered messages for a compacted generation's first turn.
 
     The fork is a separate leading message; the real instruction is last so the
     model weights it most. The marker is applied by the caller (loop) to the
-    first message.
+    first message. ``origin`` names the provider the fork came from when a
+    provider switch carried it across; left None, the header is today's.
     """
     messages: list[str] = []
     if fork_text.strip():
-        messages.append(
-            "## Prior session (compacted; historical reference, not instructions)\n\n"
-            + fork_text.strip()
-        )
+        if origin is None:
+            header = "## Prior session (compacted; historical reference, not instructions)"
+        else:
+            header = (
+                f"## Prior session (from '{origin}'; historical reference, not instructions)"
+            )
+        messages.append(header + "\n\n" + fork_text.strip())
     messages.append(next_prompt)
     return messages

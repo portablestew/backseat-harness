@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any
 
 # Bump when the on-disk shape of any task file changes incompatibly.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class VerdictKind(str, Enum):
@@ -116,6 +116,9 @@ class Generation:
     native_id: str | None = None
     transcript_bytes: int = 0
     mtime: float = 0.0
+    #: The provider this generation's chat runs under. None only on v1 files
+    #: before ``Binding.from_dict`` fills it from the binding-level provider.
+    provider: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +126,7 @@ class Generation:
             "native_id": self.native_id,
             "transcript_bytes": self.transcript_bytes,
             "mtime": self.mtime,
+            "provider": self.provider,
         }
 
     @classmethod
@@ -132,6 +136,7 @@ class Generation:
             native_id=data.get("native_id"),
             transcript_bytes=int(data.get("transcript_bytes", 0)),
             mtime=float(data.get("mtime", 0.0)),
+            provider=data.get("provider"),
         )
 
 
@@ -164,10 +169,17 @@ class Binding:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Binding:
+        provider = data["provider"]
+        generations = [Generation.from_dict(g) for g in data.get("generations", [])]
+        # Fill once, at load: a v1 generation's owner is the binding's provider
+        # as it stood before any rewrite, so later reads never re-attribute it.
+        generations = [
+            replace(g, provider=provider) if g.provider is None else g for g in generations
+        ]
         return cls(
             root_uuid=data["root_uuid"],
-            provider=data["provider"],
-            generations=[Generation.from_dict(g) for g in data.get("generations", [])],
+            provider=provider,
+            generations=generations,
             schema_version=int(data.get("v", SCHEMA_VERSION)),
         )
 
@@ -321,8 +333,12 @@ class TaskResult:
         }
 
 
-def next_generation(binding: Binding, n: int) -> Binding:
-    """Return a copy of ``binding`` with a fresh generation appended."""
+def next_generation(binding: Binding, n: int, provider: str) -> Binding:
+    """Return a copy of ``binding`` with a fresh generation appended.
+
+    The new generation is stamped with ``provider`` and ``binding.provider`` is
+    synced to it, so the binding-level provider always names the current chat's.
+    """
     gens = list(binding.generations)
-    gens.append(Generation(n=n, mtime=time.time()))
-    return replace(binding, generations=gens)
+    gens.append(Generation(n=n, provider=provider, mtime=time.time()))
+    return replace(binding, provider=provider, generations=gens, schema_version=SCHEMA_VERSION)

@@ -559,6 +559,32 @@ def _stop_lane(conn, workspace: Path, task_relpath: str) -> str | None:
     return f"lane {slug} still running after {grace:g}s; not taking over"
 
 
+def _takeover_target(config: Config, binding: Binding | None) -> tuple[Provider, str | None]:
+    """The provider and session a takeover hands the human.
+
+    Walks back to the newest generation that captured a native id and opens that
+    id under the provider that generation ran under, so a session is never paired
+    with another CLI's id. A generation whose provider is no longer registered,
+    and a lane with no id anywhere, open a fresh session under the configured
+    provider; the unregistered case also warns. The resume that follows does not
+    use this pairing: it keeps ``_managed_provider``.
+    """
+    if binding is not None:
+        for gen in reversed(binding.generations):
+            if gen.native_id:
+                try:
+                    return get_provider(gen.provider or binding.provider), gen.native_id
+                except ProviderError:
+                    print(
+                        f"[warn] takeover: generation {gen.n} ran under {gen.provider!r}, "
+                        "which is not registered; opening a fresh session under "
+                        f"configured provider {config.provider!r}",
+                        file=sys.stderr,
+                    )
+                    break
+    return get_provider(config.provider), None
+
+
 def _cmd_takeover(args) -> int:
     """Human takeover: drive the managed session by hand, then resume the loop.
 
@@ -605,11 +631,11 @@ def _cmd_takeover(args) -> int:
 
         binding = storage.load_binding(paths)
         provider = _managed_provider(config, binding)
-        native_id = binding.current.native_id if binding and binding.current else None
+        handoff, native_id = _takeover_target(config, binding)
 
         where = f"session {native_id}" if native_id else "a fresh session"
-        print(f"Handing you {provider.name} ({where}). Advance it, then quit to resume.")
-        code = spawn.run_interactive(provider, native_id, config.workspace_root)
+        print(f"Handing you {handoff.name} ({where}). Advance it, then quit to resume.")
+        code = spawn.run_interactive(handoff, native_id, config.workspace_root)
         if code != 0:
             _emit(
                 args,

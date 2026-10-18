@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from backseat_harness import capture as capture_mod
@@ -42,7 +42,7 @@ from backseat_harness.models import (
     VerdictKind,
     next_generation,
 )
-from backseat_harness.providers import Provider
+from backseat_harness.providers import Provider, ProviderError, get_provider
 from backseat_harness.providers.base import SpawnSpec, TurnResult
 
 # Runs one managed turn and returns its outcome. Injected (real subprocess/fake).
@@ -132,6 +132,46 @@ def _model_rejection_warning(
     return f"{subject} ({origin}); the turn produced no reply.{hint}"
 
 
+def _switch_notice(owner: str, effective: str, generation: int, provider: Provider) -> str:
+    """The operator's notice that a turn's new chat runs under a different CLI (D6).
+
+    Names both providers and the generation, and asks the operator to rebind
+    the model slots, since slot ids are CLI-specific. The remedy hint rides
+    along when the new CLI's adapter knows how to list its ids.
+    """
+    hint = (
+        f" List its model ids with `{provider.list_models_command}`."
+        if provider.list_models_command
+        else ""
+    )
+    return (
+        f"provider switched {owner!r} -> {effective!r} (generation {generation}); "
+        "[models] slot ids are CLI-specific, so rebind [models] slots to "
+        f"{effective}'s model ids.{hint}"
+    )
+
+
+@dataclass(frozen=True)
+class SwitchDecision:
+    """The provider comparison behind one turn's new-chat decision (D1).
+
+    ``owner`` is the provider the lane's current chat runs under; ``switching``
+    is True only when a chat already exists and config names a different
+    provider; ``effective`` is the provider any new chat starts under.
+    """
+
+    owner: str
+    switching: bool
+    effective: str
+
+
+def _switch_decision(binding: Binding, config: Config) -> SwitchDecision:
+    gen = binding.current
+    owner = binding.provider if gen is None else (gen.provider or binding.provider)
+    switching = gen is not None and bool(config.provider) and owner != config.provider
+    return SwitchDecision(owner=owner, switching=switching, effective=config.provider or owner)
+
+
 def run_task(
     slug: str,
     config: Config,
@@ -140,6 +180,7 @@ def run_task(
     operator_invoker: OperatorInvoker,
     first_prompt: str | None = None,
     owner_brief: str | None = None,
+    provider_lookup: Callable[[str], Provider] = get_provider,
 ) -> TaskResult:
     """Drive a single task lane to a terminal state.
 
@@ -156,6 +197,9 @@ def run_task(
     question it usually answers rides alongside it on the same prompts,
     captured from ``state.reason`` below -- the operator is invoked fresh and
     has no memory of having asked.
+
+    ``provider_lookup`` resolves a provider name to its adapter. The default is
+    the registry; tests inject a name-to-fake mapping.
     """
     paths = config.task_paths(slug)
     state = storage.load_state(paths, slug)
@@ -393,6 +437,20 @@ def run_task(
                 paths, state, TaskStatus.BLOCKED, last_verdict, "no prompt to send"
             )
 
+        # --- Provider in force for this turn's chat (D1, D2). Any chat that starts
+        # under another CLI than the one held is spawned under that CLI, so the
+        # reassignment lands before any state moves: a refused lookup ends the
+        # run BLOCKED with nothing recorded under the wrong name.
+        decision = _switch_decision(binding, config)
+        if decision.effective != provider.name:
+            try:
+                provider = provider_lookup(decision.effective)
+            except ProviderError:
+                return _finish(
+                    paths, state, TaskStatus.BLOCKED, last_verdict,
+                    f"configured provider {decision.effective!r} is not registered",
+                )
+
         turns_this_run += 1
         state.iteration += 1
         progress.iteration_start(state.iteration, state.generation, "review")
@@ -407,39 +465,61 @@ def run_task(
             # Operator abandoned the session chat: fresh session, no fork, no
             # resume -- only the marker and the next prompt.
             new_n = (gen.n + 1) if gen else 1
-            binding = next_generation(binding, new_n)
+            binding = next_generation(binding, new_n, decision.effective)
             state.generation = new_n
             resume_id = None
             prompt = marker_mod.prepend_marker(binding.root_uuid, new_n, pending_prompt)
             pending_reset = False
-        elif gen and compact_mod.should_compact(transcript_bytes, config):
-            if compact_mod.can_compact_again(gen.n, config):
-                # Rendered inside the step because this is the one fork whose
-                # text is large enough to matter (the ~1MB session that tripped
-                # the threshold), and it happens immediately after the iteration
-                # header, so an untimed read here looks like a hung loop.
-                with progress.step(f"render compaction fork (gen {gen.n + 1})"):
-                    fork_text = compact_mod.render_fork(
-                        binding.root_uuid, provider.history_provider
-                    )
+        elif gen and (decision.switching or compact_mod.should_compact(transcript_bytes, config)):
+            # A provider switch is a second cause of the same boundary. The cap
+            # suppresses only the fork (D3), so a switch always starts the chat.
+            can_fork = compact_mod.can_compact_again(gen.n, config)
+            if decision.switching or can_fork:
+                fork_text = ""
+                if decision.switching and can_fork:
+                    fork_text = _switch_fork(binding.root_uuid, decision.owner, provider_lookup)
+                elif can_fork:
+                    # Rendered inside the step because this is the one fork whose
+                    # text is large enough to matter (the ~1MB session that tripped
+                    # the threshold), and it happens immediately after the iteration
+                    # header, so an untimed read here looks like a hung loop.
+                    with progress.step(f"render compaction fork (gen {gen.n + 1})"):
+                        fork_text = compact_mod.render_fork(
+                            binding.root_uuid, provider.history_provider
+                        )
                 # New generation: fresh session, marker with incremented #n.
-                binding = next_generation(binding, gen.n + 1)
+                binding = next_generation(binding, gen.n + 1, decision.effective)
                 state.generation = gen.n + 1
                 resume_id = None
-                messages = compact_mod.build_compacted_prompt(fork_text, pending_prompt)
+                origin = decision.owner if decision.switching else None
+                messages = compact_mod.build_compacted_prompt(
+                    fork_text, pending_prompt, origin=origin
+                )
                 prompt = "\n\n".join(messages)
                 prompt = marker_mod.prepend_marker(binding.root_uuid, state.generation, prompt)
             # else: over budget on generations; proceed without compacting.
         elif gen is None:
             # First ever turn: apply the marker to establish identity.
-            binding = next_generation(binding, 1)
+            binding = next_generation(binding, 1, decision.effective)
             state.generation = 1
             prompt = marker_mod.prepend_marker(binding.root_uuid, 1, pending_prompt)
+
+        # --- Provider switch notice (D6): on any turn whose new chat runs under a
+        # different CLI than its owner's. Logged now, merged into this turn's review.
+        switch_notice = (
+            _switch_notice(decision.owner, decision.effective, state.generation, provider)
+            if decision.effective != decision.owner
+            else None
+        )
+        if switch_notice:
+            print(f"[warn] task: {switch_notice}", file=sys.stderr)
 
         # --- Model resolution (per turn, from the current checklist). ---
         turn_model, slot_source, slot_warning = _resolve_turn_model(
             checklist_mod.load_checklist(paths.checklist), config
         )
+        if switch_notice:
+            slot_warning = f"{switch_notice}; {slot_warning}" if slot_warning else switch_notice
         # --- Spawn + wait (turn end == process exit). ---
         turn_log = logs.call_log(paths, state.iteration, logs.ROLE_MANAGED)
         spec = SpawnSpec(
@@ -793,6 +873,27 @@ def _capture_transcript(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path.relative_to(workspace_root).as_posix()
+
+
+def _switch_fork(
+    root_uuid: str, owner: str, provider_lookup: Callable[[str], Provider]
+) -> str:
+    """Render the prior generation's fork from its owner's store (D4).
+
+    The store is named by the owner, never the new provider. An unreachable one
+    -- owner unregistered, or its history unreadable -- degrades to "" (a fresh
+    chat) with a warning rather than failing the run.
+    """
+    try:
+        with progress.step(f"render prior fork (from {owner})"):
+            return compact_mod.render_fork(root_uuid, provider_lookup(owner).history_provider)
+    except (ProviderError, history.HistoryError) as exc:
+        print(
+            f"[warn] task: could not fork the prior session from {owner!r}; "
+            f"starting a fresh chat without it ({exc})",
+            file=sys.stderr,
+        )
+        return ""
 
 
 def _operator_fork(binding: Binding, provider: Provider) -> str:
