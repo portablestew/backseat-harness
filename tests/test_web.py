@@ -3424,6 +3424,33 @@ def test_auto_refresh_keeps_homepage_poll_and_pauses_on_edit(workspace: Path):
     assert "window.location.reload()" in body
 
 
+def test_auto_refresh_defers_while_any_text_field_holds_text(workspace: Path):
+    """Plan Step 1/3: the shared reload helper defers its tick while *any* text
+    field holds a non-empty value -- whitespace-only included, with no trim --
+    independent of focus and of ``details[open]``. This is a rendered-source
+    assertion: it pins that the dirty guard is present, not that the browser
+    keeps the text (see 2-plan.md QA B1)."""
+    ws_id = _register_workspace(workspace)
+    _write_lane(workspace, "dirty-guard-lane", updated_at=1_700_000_000.0)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/dirty-guard-lane")
+
+    assert page.status_code == 200
+    body = page.text
+    # The field scan: a textarea or a text-like input.
+    assert 'textarea, input[type="text"]' in body
+    # The predicate counts any non-empty value; no trim, so spaces are dirty.
+    assert "fields[f].value !== ''" in body
+    # The tick's early return folds the dirty check in beside focus and the open
+    # + expander, so a blurred field or a closed panel still defers.
+    assert "var dirty = hasDirtyField();" in body
+    assert "if (typing || openPanel || dirty)" in body
+    # The contract comment reads the same way, so the two cannot drift apart.
+    assert "whitespace-only counts" in body
+    assert "independent of focus and of details[open]" in body
+
+
 # --- shell header: back link, command heading, disconnect ----------------------
 
 

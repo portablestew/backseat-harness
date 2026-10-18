@@ -528,9 +528,12 @@
     // Opt-in auto-refresh (goal.md:3): a page sets data-auto-refresh="<seconds>"
     // on <main> (or via the main_attrs block) to reload itself on a timer. This
     // script runs in <head>, before <main> exists, so it waits for
-    // DOMContentLoaded before querying the attribute. It pauses while the user
-    // is typing in a field or has a + expander open, then reschedules rather
-    // than reloading mid-edit.
+    // DOMContentLoaded before querying the attribute. The tick defers -- never
+    // reloading mid-edit -- on three conditions: the user is focused in a form
+    // field, a + expander is open, or any text field holds a non-empty value.
+    // The last reads the DOM value alone: whitespace-only counts, and it is
+    // independent of focus and of details[open], so a panel closed with text
+    // still defers. Each defer simply reschedules.
     //
     // A reload would otherwise reset both the page scroll and the scroll inside
     // the bounded text panels (the transcript box is max-height:70vh and scrolls
@@ -544,6 +547,23 @@
       // the task goal box. Matched in DOM order, which is stable across a reload.
       var panelSel = '.transcript, .goal';
       var atBottom = 40;
+      // Text-entry fields: textarea plus the text-like input types. Hidden,
+      // submit, checkbox and the rest are deliberately excluded: they hold no
+      // user text worth preserving.
+      var textFieldSel =
+        'textarea, input[type="text"], input[type="search"], ' +
+        'input[type="url"], input[type="email"], input[type="tel"], ' +
+        'input:not([type])';
+      // Any non-empty value counts as dirty, whitespace-only included: a draft
+      // of spaces is still text the user typed. Deliberately independent of
+      // focus and of details[open], so a panel closed with text still defers.
+      var hasDirtyField = function () {
+        var fields = document.querySelectorAll(textFieldSel);
+        for (var f = 0; f < fields.length; f++) {
+          if (fields[f].value !== '') return true;
+        }
+        return false;
+      };
       var saved = null;
       try { saved = sessionStorage.getItem(key); } catch (err) { /* storage blocked */ }
       if (saved !== null) {
@@ -569,7 +589,8 @@
         var el = document.activeElement;
         var typing = el && /^(input|textarea|select)$/i.test(el.tagName);
         var openPanel = document.querySelector('details.expander[open]');
-        if (typing || openPanel) { schedule(); return; }
+        var dirty = hasDirtyField();
+        if (typing || openPanel || dirty) { schedule(); return; }
         var bottom = window.innerHeight + window.scrollY
           >= document.documentElement.scrollHeight - atBottom;
         var boxes = document.querySelectorAll(panelSel);
