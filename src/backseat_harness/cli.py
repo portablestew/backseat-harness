@@ -351,10 +351,11 @@ def _cmd_run(args) -> int:
     with db.open_db() as conn:
         db.sweep_orphans(conn)
     with contextlib.ExitStack() as stack:
-        refusal = _claim_or_interrupt(stack, config, task_relpath, args.interrupt)
+        refusal, stopped = _claim_or_interrupt(stack, config, task_relpath, args.interrupt)
         if refusal:
             _emit(args, {"slug": args.slug, "error": refusal}, refusal)
             return 2
+        _stamp_run_request(paths, brief, stopped)
         result = run_task(
             slug=args.slug,
             config=config,
@@ -364,35 +365,59 @@ def _cmd_run(args) -> int:
             first_prompt=args.prompt,
             owner_brief=brief,
         )
+        if result.status in {TaskStatus.COMPLETE, TaskStatus.BLOCKED}:
+            storage.clear_run_request(paths)
     _emit(args, result.to_dict(), _result_line(result))
     return 0 if result.status.value in {"complete", "blocked"} else 1
 
 
+def _stamp_run_request(paths: TaskPaths, brief: str | None, stopped: bool) -> None:
+    """Journal the run that now holds the claim, replacing any journal a prior run left.
+
+    A journal still on disk when a new claim lands belongs to a run that never
+    cleared it: it died or was killed. An ``--interrupt`` that stopped the live
+    holder is a deliberate handover, so it replaces silently; any other overwrite
+    warns, which lands in the lane's ``daemon.log``.
+    """
+    if paths.run_request.exists() and not stopped:
+        prior = storage.load_run_request(paths)
+        started = prior.get("started_at") if prior else None
+        print(
+            "[warn] task: prior run ended uncleanly; run-request.json replaced "
+            f"(started_at={started or 'unknown'})",
+            file=sys.stderr,
+            flush=True,
+        )
+    storage.save_run_request(paths, brief, time.time())
+
+
 def _claim_or_interrupt(
     stack: contextlib.ExitStack, config: Config, task_relpath: str, interrupt: bool
-) -> str | None:
+) -> tuple[str | None, bool]:
     """Enter this lane's claim on ``stack``; with ``interrupt``, stop a live holder first.
 
-    Returns None once the claim is held, else the refusal to print. A live
-    claim without ``interrupt`` refuses at once and stops nothing. With it, the
-    holder is stopped through :func:`_stop_lane` and the claim is taken again, so
-    a second conflict (someone else claimed in the gap) is still a refusal.
+    Returns ``(refusal, stopped)``: ``refusal`` is None once the claim is held,
+    else the refusal to print; ``stopped`` is True when the claim was taken after
+    :func:`_stop_lane` stopped the holder. A live claim without ``interrupt``
+    refuses at once and stops nothing. With it, the holder is stopped and the
+    claim is taken again, so a second conflict (someone else claimed in the gap)
+    is still a refusal.
     """
     try:
         stack.enter_context(_lane_claim(config, task_relpath))
-        return None
+        return None, False
     except db.ClaimConflict as exc:
         if not interrupt:
-            return str(exc)
+            return str(exc), False
     with db.open_db() as conn:
         refusal = _stop_lane(conn, config.workspace_root, task_relpath)
     if refusal:
-        return refusal
+        return refusal, False
     try:
         stack.enter_context(_lane_claim(config, task_relpath))
     except db.ClaimConflict as exc:
-        return str(exc)
-    return None
+        return str(exc), False
+    return None, True
 
 
 @contextmanager
@@ -628,6 +653,9 @@ def _cmd_takeover(args) -> int:
             msg = "lane was restarted; retry"
             _emit(args, {"slug": args.slug, "error": msg}, msg)
             return 2
+        # A deliberate handover supersedes whatever run journal a crash left;
+        # the resumed run is not journaled.
+        storage.clear_run_request(paths)
 
         binding = storage.load_binding(paths)
         provider = _managed_provider(config, binding)

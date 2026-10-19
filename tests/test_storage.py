@@ -228,3 +228,25 @@ def test_atomic_write_leaves_no_temp_file_behind(config, monkeypatch):
 
     assert not Path(seen[0]).exists()
     assert list(paths.root.glob("*.tmp")) == []
+
+
+def test_run_request_roundtrip(config):
+    paths = config.task_paths("t1")
+    storage.save_run_request(paths, "fix x", 123.5)
+    assert storage.load_run_request(paths) == {"v": 1, "started_at": 123.5, "brief": "fix x"}
+    storage.clear_run_request(paths)
+    assert storage.load_run_request(paths) is None
+    assert not paths.run_request.exists()
+
+
+def test_unreadable_run_request_loads_as_none(config):
+    paths = config.task_paths("t1")
+    paths.root.mkdir(parents=True)
+    paths.run_request.write_text("{not json", encoding="utf-8")
+    assert storage.load_run_request(paths) is None
+    paths.run_request.write_text("[1, 2]", encoding="utf-8")
+    assert storage.load_run_request(paths) is None
+
+
+def test_clear_run_request_without_a_journal_is_a_no_op(config):
+    storage.clear_run_request(config.task_paths("t1"))

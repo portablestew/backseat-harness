@@ -2672,17 +2672,15 @@ def test_task_viewer_run_button_invokes_cli_with_brief(monkeypatch, workspace: P
         assert kw["stdout"].name == str(log)
 
 
-def test_run_that_cannot_take_the_lane_redirects_with_its_log_as_an_escaped_notice(
-    monkeypatch, workspace: Path
-):
+def test_run_refusal_redirects_plainly_with_no_notice(monkeypatch, workspace: Path):
     ws_id = _register_workspace(workspace)
     assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
     slug = "viewer-task"
-    reason = "lane viewer-task still running after 5s; <b>not</b> taking over"
+    reason = "lane viewer-task still running after 5s; not taking over"
 
     def _refusing_popen(cmd, **kwargs):  # noqa: ANN001
-        # The child's own refusal lands in the log the route reads from.
-        kwargs["stdout"].write(f"noise\n{reason}\n".encode())
+        # The child's own refusal lands in daemon.log, not in the page.
+        kwargs["stdout"].write(f"{reason}\n".encode())
         return _FakeChild(rc=2)
 
     monkeypatch.setattr(subprocess, "Popen", _refusing_popen)
@@ -2693,16 +2691,11 @@ def test_run_that_cannot_take_the_lane_redirects_with_its_log_as_an_escaped_noti
             follow_redirects=False,
         )
         assert resp.status_code == 303
-        location = resp.headers["location"]
-        assert location.startswith(f"/ws/{ws_id}/tasks/{slug}?notice=")
-        page = client.get(location)
+        assert resp.headers["location"] == f"/ws/{ws_id}/tasks/{slug}"
+        page = client.get(resp.headers["location"])
 
     assert page.status_code == 200
-    assert 'class="run-notice"' in page.text
-    assert "lane viewer-task still running after 5s;" in page.text
-    # Escaped, so the markup in the log shows as text and does not render.
-    assert "&lt;b&gt;not&lt;/b&gt;" in page.text
-    assert "<b>not</b>" not in page.text
+    assert reason not in page.text
 
 
 def test_run_that_takes_the_lane_redirects_plainly(monkeypatch, workspace: Path):
@@ -2725,28 +2718,35 @@ def test_run_that_takes_the_lane_redirects_plainly(monkeypatch, workspace: Path)
         )
     assert resp.status_code == 303
     assert resp.headers["location"] == f"/ws/{ws_id}/tasks/{slug}"
+    assert "notice" not in resp.headers["location"]
 
 
-def test_run_slow_to_take_the_lane_says_still_starting(monkeypatch, workspace: Path):
-    from backseat_harness.web.routes import task as task_route
-
+def test_run_redirects_immediately_without_polling(monkeypatch, workspace: Path):
     ws_id = _register_workspace(workspace)
     assert _post_task(ws_id, "Viewer Task", "ship the thing").status_code == 303
     slug = "viewer-task"
-    monkeypatch.setattr(task_route, "_START_WAIT_S", 0.2)
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeChild(rc=None))
+    spawned: list[_FakeChild] = []
 
+    def _never_claiming_popen(cmd, **kwargs):  # noqa: ANN001
+        # Still running and never claiming: the route must not wait for it.
+        child = _FakeChild(rc=None)
+        spawned.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", _never_claiming_popen)
     with _client() as client:
+        started = time.monotonic()
         resp = client.post(
             f"/ws/{ws_id}/tasks/{slug}/run",
             data={"brief": "redirect"},
             follow_redirects=False,
         )
-        assert resp.status_code == 303
-        assert resp.headers["location"].endswith("?notice=still+starting%3B+see+daemon.log")
-        page = client.get(resp.headers["location"])
+        elapsed = time.monotonic() - started
 
-    assert "still starting; see daemon.log" in page.text
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/ws/{ws_id}/tasks/{slug}"
+    assert len(spawned) == 1
+    assert elapsed < 2.0
 
 
 def test_task_viewer_takeover_starts_shell_running_takeover_cli(
@@ -4461,6 +4461,218 @@ def test_status_other_states_keep_their_own_label(workspace: Path, status, badge
     assert f'<span class="badge" data-status="{status}">{badge}</span>' in task_page.text
     assert '">in progress</span>' not in task_page.text
 
+
+
+# --- Status table: Uptime and User Brief ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (-5, "up 0 min"),
+        (0, "up 0 min"),
+        (59, "up 0 min"),
+        (60, "up 1 min"),
+        (3599, "up 59 min"),
+        (3600, "up 1:00"),
+        (3847, "up 1:04"),
+        (86399, "up 23:59"),
+        (86400, "up 1 day, 0:00"),
+        (100020, "up 1 day, 3:47"),
+        (272820, "up 3 days, 3:47"),
+    ],
+)
+def test_format_uptime_thresholds(seconds, text):
+    assert task_service.format_uptime(seconds) == text
+
+
+def _claim_as_live_harness(workspace: Path, slug: str, *, start: float) -> None:
+    """Record this test process as the lane's harness, started at ``start``."""
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, f".backseat/tasks/{slug}", os.getpid(), start)
+
+
+def _lane_snapshot(lane: Path) -> dict[str, tuple[bytes, int]]:
+    """Every file under a lane, with its bytes and mtime, for a before/after compare."""
+    return {
+        str(p.relative_to(lane)): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in sorted(lane.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_uptime_is_up_while_the_recorded_harness_is_live(monkeypatch, workspace: Path):
+    _write_lane(workspace, "live-lane", status="continue", updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+    start = db.process_start(os.getpid())
+    _claim_as_live_harness(workspace, "live-lane", start=start)
+    # Two hours and five minutes after the harness started.
+    monkeypatch.setattr(task_service, "time", SimpleNamespace(time=lambda: start + 7500))
+
+    detail = task_service.load_task(workspace, "live-lane")
+    assert detail is not None
+    assert (detail.uptime, detail.uptime_tone) == ("up 2:05", "up")
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/live-lane")
+    assert '<span class="badge" data-status="up">up 2:05</span>' in page.text
+
+
+def test_uptime_reads_not_running_for_a_continue_lane_with_no_harness(workspace: Path):
+    _write_lane(workspace, "stopped-lane", status="continue", updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+
+    detail = task_service.load_task(workspace, "stopped-lane")
+    assert detail is not None
+    assert (detail.uptime, detail.uptime_tone) == ("not running", "stalled")
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/stopped-lane")
+    assert '<span class="badge" data-status="stalled">not running</span>' in page.text
+
+
+def test_uptime_reads_not_running_when_the_pid_no_longer_matches_its_start(workspace: Path):
+    """A recycled pid with a different start time is a different process: not live."""
+    _write_lane(workspace, "recycled-lane", status="continue", updated_at=1_700_000_000.0)
+    _claim_as_live_harness(workspace, "recycled-lane", start=1000.0)
+
+    detail = task_service.load_task(workspace, "recycled-lane")
+    assert detail is not None
+    assert (detail.uptime, detail.uptime_tone) == ("not running", "stalled")
+
+
+@pytest.mark.parametrize("status", ["blocked", "complete", None])
+def test_uptime_is_na_for_a_lane_that_is_not_continue(workspace: Path, status):
+    slug = f"idle-{status or 'pending'}"
+    _write_lane(workspace, slug, status=status, updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+
+    detail = task_service.load_task(workspace, slug)
+    assert detail is not None
+    assert (detail.uptime, detail.uptime_tone) == ("N/A", "neutral")
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/{slug}")
+    assert '<span class="badge" data-status="neutral">N/A</span>' in page.text
+
+
+def test_status_table_lists_uptime_first_and_user_brief_last(workspace: Path):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    _write_lane(
+        workspace,
+        "ordered-lane",
+        status="continue",
+        reason="waiting on a decision",
+        updated_at=1_700_000_000.0,
+    )
+    lane = workspace / ".backseat" / "tasks" / "ordered-lane"
+    storage.save_run_request(TaskPaths(lane), "also fix the flaky test", 1_700_000_100.0)
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        text = client.get(f"/ws/{ws_id}/tasks/ordered-lane").text
+    positions = [
+        text.index(f"<td>{label}</td>")
+        for label in ("Uptime", "Provider", "Iteration", "Generation", "Reason", "User Brief")
+    ]
+    assert positions == sorted(positions)
+
+
+def test_user_brief_row_shows_the_journaled_brief(workspace: Path):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    _write_lane(workspace, "brief-lane", status="continue", updated_at=1_700_000_000.0)
+    lane = workspace / ".backseat" / "tasks" / "brief-lane"
+    storage.save_run_request(TaskPaths(lane), "also fix the flaky test", 1_700_000_100.0)
+    ws_id = _register_workspace(workspace)
+
+    detail = task_service.load_task(workspace, "brief-lane")
+    assert detail is not None
+    assert detail.user_brief == "also fix the flaky test"
+    # No harness is live: the brief survives a dead run, and Uptime says so.
+    assert (detail.uptime, detail.uptime_tone) == ("not running", "stalled")
+    with _client() as client:
+        text = client.get(f"/ws/{ws_id}/tasks/brief-lane").text
+    assert "<td>User Brief</td>" in text
+    assert "<td>also fix the flaky test</td>" in text
+
+
+def test_user_brief_is_escaped(workspace: Path):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    _write_lane(workspace, "escape-brief", status="continue", updated_at=1_700_000_000.0)
+    lane = workspace / ".backseat" / "tasks" / "escape-brief"
+    storage.save_run_request(TaskPaths(lane), "<b>x</b>", 1_700_000_100.0)
+    ws_id = _register_workspace(workspace)
+
+    with _client() as client:
+        text = client.get(f"/ws/{ws_id}/tasks/escape-brief").text
+    assert "&lt;b&gt;x&lt;/b&gt;" in text
+    assert "<b>x</b>" not in text
+
+
+def test_uptime_hides_pid_and_date(monkeypatch, workspace: Path):
+    _write_lane(workspace, "pid-lane", status="continue", updated_at=1_700_000_000.0)
+    ws_id = _register_workspace(workspace)
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, ".backseat/tasks/pid-lane", 987654, time.time() - 3847)
+    monkeypatch.setattr(db, "pid_live", lambda pid, start=None: True)
+
+    with _client() as client:
+        text = client.get(f"/ws/{ws_id}/tasks/pid-lane").text
+    idx = text.index("<td>Uptime</td>")
+    uptime_row = text[text.rindex("<tr", 0, idx) : text.index("</tr>", idx)]
+    assert "up 1:04" in uptime_row
+    assert "987654" not in text
+    assert not re.search(r"\d{4}-\d{2}-\d{2}", uptime_row)
+
+
+def test_uptime_is_up_for_a_live_harness_with_no_state_json(monkeypatch, workspace: Path):
+    _write_lane(workspace, "fresh-lane", status=None, updated_at=1_700_000_000.0)
+    start = db.process_start(os.getpid())
+    _claim_as_live_harness(workspace, "fresh-lane", start=start)
+    monkeypatch.setattr(task_service, "time", SimpleNamespace(time=lambda: start + 65))
+
+    detail = task_service.load_task(workspace, "fresh-lane")
+    assert detail is not None
+    assert (detail.uptime, detail.uptime_tone) == ("up 1 min", "up")
+
+
+@pytest.mark.parametrize("journal", ["no_journal", "bare_run"])
+def test_user_brief_row_is_omitted_without_a_brief(workspace: Path, journal):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    slug = f"no-brief-{journal}"
+    _write_lane(workspace, slug, status="continue", updated_at=1_700_000_000.0)
+    lane = workspace / ".backseat" / "tasks" / slug
+    if journal == "bare_run":
+        storage.save_run_request(TaskPaths(lane), None, 1_700_000_100.0)
+    ws_id = _register_workspace(workspace)
+
+    detail = task_service.load_task(workspace, slug)
+    assert detail is not None
+    assert detail.user_brief is None
+    with _client() as client:
+        text = client.get(f"/ws/{ws_id}/tasks/{slug}").text
+    assert "User Brief" not in text
+
+
+def test_get_leaves_lane_files_untouched(workspace: Path):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    _write_lane(workspace, "quiet-lane", status="continue", updated_at=1_700_000_000.0)
+    lane = workspace / ".backseat" / "tasks" / "quiet-lane"
+    storage.save_run_request(TaskPaths(lane), "keep this", 1_700_000_100.0)
+    ws_id = _register_workspace(workspace)
+    before = _lane_snapshot(lane)
+
+    with _client() as client:
+        page = client.get(f"/ws/{ws_id}/tasks/quiet-lane")
+    assert page.status_code == 200
+    assert _lane_snapshot(lane) == before
 
 
 # --- shell heading: title line over the session id ----------------------------

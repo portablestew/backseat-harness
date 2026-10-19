@@ -1715,3 +1715,29 @@ def test_web_caddy_death_exits_nonzero(fake_caddy, monkeypatch, tmp_path, capsys
     assert rc == 1
     assert "caddy exited rc=3" in err
     assert events == ["uvicorn-start", "uvicorn-stop"]
+
+
+def test_takeover_clears_a_prior_run_journal(tmp_path, monkeypatch):
+    from backseat_harness import storage
+    from backseat_harness.config import TaskPaths
+
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    paths = TaskPaths(root=tmp_path / LANE_A)
+    storage.save_run_request(paths, "old", 1.0)
+    _seat(monkeypatch, {os.getpid(): 5000.0}, [])
+    monkeypatch.setattr(spawn, "run_interactive", lambda provider, native_id, cwd: 0)
+
+    assert main(["-C", str(tmp_path), "takeover", "a", "--no-resume"]) == 0
+    assert not paths.run_request.exists()
+
+
+def test_takeover_writes_no_run_journal(tmp_path, monkeypatch):
+    from backseat_harness.config import TaskPaths
+
+    assert main(["-C", str(tmp_path), "init", "a", "Goal"]) == 0
+    paths = TaskPaths(root=tmp_path / LANE_A)
+    _seat(monkeypatch, {os.getpid(): 5000.0}, [])
+    monkeypatch.setattr(spawn, "run_interactive", lambda provider, native_id, cwd: 0)
+
+    assert main(["-C", str(tmp_path), "takeover", "a", "--no-resume"]) == 0
+    assert not paths.run_request.exists()

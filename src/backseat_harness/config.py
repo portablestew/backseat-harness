@@ -292,6 +292,11 @@ class TaskPaths:
     def state(self) -> Path:
         return self.root / "state.json"
 
+    @property
+    def run_request(self) -> Path:
+        """Journal of the run in flight: its input, written at claim, cleared on a clean end."""
+        return self.root / "run-request.json"
+
 
 #: Prefix of a generate-task staging dir under ``tasks/`` (the protocol is in manager.py).
 STAGING_PREFIX = "_gen-"

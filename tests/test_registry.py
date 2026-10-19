@@ -880,3 +880,197 @@ def test_register_workspace_emits_json(workspace: Path, capsys):
         "registered": True,
         "workspaces_version": 1,
     }
+
+
+# --- run journal (run-request.json) ------------------------------------------
+#
+# The journal is stamped once the claim is held and cleared only on a clean
+# COMPLETE or BLOCKED. A refused run never reaches the stamp.
+
+
+def _journal_run(workspace, monkeypatch, argv, finish):
+    """Run ``main(argv)`` with ``run_task`` faked: it reads the journal, then ``finish()``."""
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.cli import main
+    from backseat_harness.config import TaskPaths
+
+    # Our own claim reads our start; stub it so the run never asks the real OS.
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
+    paths = TaskPaths(root=workspace / REL)
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen["journal"] = storage.load_run_request(paths)
+        return finish()
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    return main(argv), seen, paths
+
+
+def _init_live_lane(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    alive = {100: 1000.0}
+    cli = _live_lane_fakes(monkeypatch, alive)
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    with db.open_db() as conn:
+        db.claim_task(conn, workspace, REL, 100, 1000.0)
+    return cli, alive
+
+
+def test_run_stamps_journal_at_claim_with_brief(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    rc, seen, _ = _journal_run(
+        workspace, monkeypatch, ["-C", str(workspace), "run", "t", "fix x"], _complete
+    )
+    assert rc == 0
+    assert seen["journal"]["brief"] == "fix x"
+    assert isinstance(seen["journal"]["started_at"], float)
+
+
+def test_run_stamps_journal_with_null_brief_for_bare_run(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    rc, seen, _ = _journal_run(
+        workspace, monkeypatch, ["-C", str(workspace), "run", "t", "--prompt", "go"], _complete
+    )
+    assert rc == 0
+    assert seen["journal"]["brief"] is None
+
+
+def test_refused_run_writes_no_journal(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    cli, _alive = _init_live_lane(workspace, monkeypatch)
+
+    def _no_run(**kwargs):
+        raise AssertionError("run_task must not start after a ClaimConflict")
+
+    monkeypatch.setattr(cli, "run_task", _no_run)
+    assert main(["-C", str(workspace), "run", "t", "brief"]) == 2
+    assert not (workspace / REL / "run-request.json").exists()
+
+
+def test_refused_interrupt_leaves_existing_journal_bytes(workspace, monkeypatch):
+    from backseat_harness import storage
+    from backseat_harness.cli import main
+    from backseat_harness.config import TaskPaths
+
+    cli, _alive = _init_live_lane(workspace, monkeypatch)
+    paths = TaskPaths(root=workspace / REL)
+    storage.save_run_request(paths, "old", 1.0)
+    before = paths.run_request.read_bytes()
+    monkeypatch.setattr(cli, "_stop_lane", lambda *a, **kw: "still running; not taking over")
+
+    def _no_run(**kwargs):
+        raise AssertionError("run_task must not start after a refused stop")
+
+    monkeypatch.setattr(cli, "run_task", _no_run)
+    assert main(["-C", str(workspace), "run", "t", "brief", "--interrupt"]) == 2
+    assert paths.run_request.read_bytes() == before
+
+
+def test_complete_clears_journal(workspace, monkeypatch):
+    from backseat_harness.cli import main
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    rc, _seen, paths = _journal_run(
+        workspace, monkeypatch, ["-C", str(workspace), "run", "t", "b"], _complete
+    )
+    assert rc == 0
+    assert not paths.run_request.exists()
+
+
+def test_blocked_clears_journal(workspace, monkeypatch):
+    from backseat_harness.cli import main
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+
+    def _blocked(**kwargs):
+        return TaskResult(slug="t", status=TaskStatus.BLOCKED, iterations=1)
+
+    argv = ["-C", str(workspace), "run", "t", "b"]
+    rc, _seen, paths = _journal_run(workspace, monkeypatch, argv, _blocked)
+    assert rc == 0
+    assert not paths.run_request.exists()
+
+
+def test_exception_leaves_journal(workspace, monkeypatch):
+    import backseat_harness.cli as cli
+    from backseat_harness import storage
+    from backseat_harness.cli import main
+    from backseat_harness.config import TaskPaths
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+
+    def _boom(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(db, "process_start", lambda pid: 5000.0)
+    monkeypatch.setattr(cli, "run_task", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        main(["-C", str(workspace), "run", "t", "b"])
+    assert storage.load_run_request(TaskPaths(root=workspace / REL))["brief"] == "b"
+
+
+def test_max_iterations_keeps_journal(workspace, monkeypatch):
+    from backseat_harness.cli import main
+    from backseat_harness.models import TaskResult, TaskStatus
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+
+    def _continue(**kwargs):
+        return TaskResult(slug="t", status=TaskStatus.CONTINUE, iterations=1)
+
+    argv = ["-C", str(workspace), "run", "t", "b"]
+    rc, _seen, paths = _journal_run(workspace, monkeypatch, argv, _continue)
+    assert rc == 1
+    assert paths.run_request.exists()
+
+
+def test_unclean_prior_warns_and_replaces(workspace, monkeypatch, capsys):
+    from backseat_harness import storage
+    from backseat_harness.cli import main
+    from backseat_harness.config import TaskPaths
+
+    assert main(["-C", str(workspace), "init", "t", "Goal"]) == 0
+    storage.save_run_request(TaskPaths(root=workspace / REL), "old", 1234.5)
+    rc, seen, _ = _journal_run(
+        workspace, monkeypatch, ["-C", str(workspace), "run", "t", "new"], _complete
+    )
+    assert rc == 0
+    assert seen["journal"]["brief"] == "new"
+    err = capsys.readouterr().err
+    assert "[warn] task: prior run ended uncleanly" in err
+    assert "started_at=1234.5" in err
+
+
+def test_interrupt_stop_replaces_journal_silently(workspace, monkeypatch, capsys):
+    from backseat_harness import storage
+    from backseat_harness.cli import main
+    from backseat_harness.config import TaskPaths
+
+    cli, alive = _init_live_lane(workspace, monkeypatch)
+    paths = TaskPaths(root=workspace / REL)
+    storage.save_run_request(paths, "old", 1.0)
+
+    def fake_stop(conn, workspace_path, relpath, **kwargs):
+        alive.pop(100)  # the stop took the holder down
+        return None
+
+    monkeypatch.setattr(cli, "_stop_lane", fake_stop)
+    seen = {}
+
+    def fake_run_task(**kwargs):
+        seen["journal"] = storage.load_run_request(paths)
+        return _complete()
+
+    monkeypatch.setattr(cli, "run_task", fake_run_task)
+    assert main(["-C", str(workspace), "run", "t", "brief", "--interrupt"]) == 0
+    assert seen["journal"]["brief"] == "brief"
+    assert "ended uncleanly" not in capsys.readouterr().err

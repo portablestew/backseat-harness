@@ -88,6 +88,24 @@ def badge_for(status: TaskStatus | str) -> str:
     return value
 
 
+def format_uptime(seconds: float) -> str:
+    """How long the harness has been up, in procps ``uptime`` style.
+
+    ``up 0 min`` under an hour, ``up H:MM`` under a day, then ``up N day(s), H:MM``.
+    Negative input (clock skew) reads as zero.
+    """
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"up {seconds // 60} min"
+    if seconds < 86400:
+        hours, rest = divmod(seconds, 3600)
+        return f"up {hours}:{rest // 60:02d}"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    unit = "" if days == 1 else "s"
+    return f"up {days} day{unit}, {hours}:{rest // 60:02d}"
+
+
 def run_action_for(task_dir: Path, status: str) -> str:
     """Verb for the Run block, from the lane's state (goal.md:35).
 
@@ -406,6 +424,14 @@ class TaskDetail:
     updated_at: float
     checklist: dict
     remarks: list[str]
+    #: Uptime of the harness holding the lane, or the reason it is not running.
+    uptime: str
+    #: Status colour for ``uptime``: ``up`` (live), ``stalled`` (continue, not
+    #: running), or ``neutral`` (anything else).
+    uptime_tone: str
+    #: The brief of the run in flight, from its run-request.json; None when the
+    #: run was bare or there is no journal.
+    user_brief: str | None
     #: Chat-viewer URL for the managed session itself (the live one), when the
     #: lane's binding records a native session id.
     managed_href: str | None = None
@@ -436,6 +462,25 @@ def _task_provider(ws_path: Path, task_dir: Path) -> str:
         return load_config(ws_path).provider or DEFAULT_MANAGER_PROVIDER
     except Exception:
         return DEFAULT_MANAGER_PROVIDER
+
+
+def _lane_uptime(ws_path: Path, slug: str, status: str) -> tuple[str, str]:
+    """``(text, tone)`` for the Status table's Uptime row.
+
+    A live harness reads its uptime (``up``). Otherwise a lane still marked
+    ``continue`` has stopped without finishing (``stalled``, "not running"), and
+    any other lane has nothing running to report (``neutral``, "N/A"). The start
+    is the one recorded at claim, so a recycled pid reads as not running.
+    """
+    with db.open_db() as conn:
+        row = db.get_task(conn, ws_path, f".backseat/tasks/{slug}")
+    if row is not None and row["harness_start"] is not None and db.pid_live(
+        row["harness_pid"], row["harness_start"]
+    ):
+        return format_uptime(time.time() - row["harness_start"]), "up"
+    if status == TaskStatus.CONTINUE.value:
+        return "not running", "stalled"
+    return "N/A", "neutral"
 
 
 def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
@@ -484,6 +529,10 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
     except Exception:
         checklist_data = {"steps": {}, "remarks": []}
 
+    uptime, uptime_tone = _lane_uptime(ws_path, slug, status)
+    journal = storage.load_run_request(TaskPaths(task_dir))
+    user_brief = (journal or {}).get("brief") or None
+
     return TaskDetail(
         slug=slug,
         goal=goal,
@@ -497,6 +546,9 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
         updated_at=updated_at,
         checklist=checklist_data.get("steps", {}),
         remarks=checklist_data.get("remarks", []),
+        uptime=uptime,
+        uptime_tone=uptime_tone,
+        user_brief=user_brief,
         managed_href=_managed_transcript_href(task_dir),
         operator_href=_operator_transcript_href(ws_path, slug, task_dir),
         manager_href=_manager_transcript_href(task_dir),
@@ -505,16 +557,13 @@ def load_task(workspace: Path | str, slug: str) -> TaskDetail | None:
 
 def run_task_detached(
     workspace: Path | str, slug: str, brief: str | None = None, *, interrupt: bool = False
-) -> tuple[subprocess.Popen, Path, int]:
+) -> None:
     """Launch ``backseat-harness run <slug> [brief]`` as a detached subprocess.
 
     The child's stdout and stderr are appended to the lane's ``daemon.log``, the
     same file the daemon's spawns write to, so a refusal or a crash is readable
     afterwards. ``interrupt`` adds ``--interrupt``, so a live lane is stopped
     before the run claims it. The call does not wait for the run.
-
-    Returns ``(proc, log_path, offset)``: the child, its log, and the log size
-    before the launch, so the caller can read only what this run wrote.
 
     Args:
         workspace: Workspace root path (containing .backseat/)
@@ -536,7 +585,6 @@ def run_task_detached(
 
     log_path = ws_path / ".backseat" / "tasks" / slug / "daemon.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    offset = log_path.stat().st_size if log_path.exists() else 0
 
     # Start detached - on Windows use CREATE_NEW_PROCESS_GROUP, on Unix use start_new_session
     detach = (
@@ -546,7 +594,7 @@ def run_task_detached(
     )
     log = log_path.open("ab")
     try:
-        proc = subprocess.Popen(
+        subprocess.Popen(
             cmd,
             cwd=str(ws_path),
             stdin=subprocess.DEVNULL,
@@ -557,45 +605,6 @@ def run_task_detached(
     finally:
         # The child holds its own inherited copy; ours closes either way.
         log.close()
-    return proc, log_path, offset
-
-
-def run_start_notice(
-    workspace: Path | str,
-    slug: str,
-    proc: subprocess.Popen,
-    log_path: Path,
-    offset: int,
-    *,
-    timeout_s: float,
-) -> str | None:
-    """Wait for a detached run to take the lane, and return what to tell the owner.
-
-    Returns None when the run holds the lane (its harness is ``proc``), or when
-    it exits 0. A nonzero exit returns its log text since ``offset``, trimmed to
-    the last 500 characters, or ``run exited <rc>`` when that is empty. A run
-    still neither claiming nor exiting after ``timeout_s`` returns a
-    "still starting" notice.
-    """
-    ws_path = Path(workspace).expanduser().resolve()
-    relpath = f".backseat/tasks/{slug}"
-    deadline = time.monotonic() + timeout_s
-    while True:
-        with db.open_db() as conn:
-            row = db.get_task(conn, ws_path, relpath)
-        if row is not None and row["harness_pid"] == proc.pid:
-            return None
-        rc = proc.poll()
-        if rc is not None:
-            if rc == 0:
-                return None
-            with log_path.open("rb") as fh:
-                fh.seek(offset)
-                text = fh.read().decode("utf-8", errors="replace").strip()
-            return text[-500:] if text else f"run exited {rc}"
-        if time.monotonic() >= deadline:
-            return "still starting; see daemon.log"
-        time.sleep(0.1)
 
 
 def generate_task_detached(workspace: Path | str, source_key: str, staging_name: str):

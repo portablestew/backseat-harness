@@ -79,15 +79,6 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-  .run-notice {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.5rem 0.7rem;
-    margin: 0 0 0.6rem;
-    font-size: 0.85rem;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
   /* Transcript links: a quiet debug footer on a hairline rule. Muted at rest,
      accent only under the pointer, so they stay visually below the content
      sections -- these are diagnostic artifacts, not page content. */
@@ -178,6 +169,10 @@
     <h4>Status <span class="badge" data-status="{{ task.status }}">{{ task.badge }}</span></h4>
     <table class="task-meta">
       <tr>
+        <td>Uptime</td>
+        <td><span class="badge" data-status="{{ task.uptime_tone }}">{{ task.uptime }}</span></td>
+      </tr>
+      <tr>
         <td>Provider</td>
         <td>{{ task.provider }}</td>
       </tr>
@@ -195,14 +190,17 @@
         <td><em>{{ task.reason }}</em></td>
       </tr>
       {% endif %}
+      {% if task.user_brief is not none %}
+      <tr>
+        <td>User Brief</td>
+        <td>{{ task.user_brief }}</td>
+      </tr>
+      {% endif %}
     </table>
   </section>
 
   <section>
     <h4>Run</h4>
-    {% if notice %}
-    <p class="run-notice" role="status">{{ notice }}</p>
-    {% endif %}
     <form class="run-form" method="post" action="/ws/{{ ws_id }}/tasks/{{ task.slug }}/run">
       <label for="brief">
         {{ task.run_action }} this task with an added instruction

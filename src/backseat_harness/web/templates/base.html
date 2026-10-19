@@ -482,10 +482,17 @@
       border-color: rgba(227, 179, 65, 0.55);
       background: rgba(227, 179, 65, 0.12);
     }
-    .badge[data-status="blocked"] {
+    .badge[data-status="blocked"],
+    .badge[data-status="stalled"] {
       color: #f85149;
       border-color: rgba(248, 81, 73, 0.55);
       background: rgba(248, 81, 73, 0.12);
+    }
+    /* Uptime row (task Status table): a live harness reads green. */
+    .badge[data-status="up"] {
+      color: #3fb950;
+      border-color: rgba(63, 185, 80, 0.55);
+      background: rgba(63, 185, 80, 0.12);
     }
 
     /* Toasts */

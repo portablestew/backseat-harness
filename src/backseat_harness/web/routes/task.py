@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -37,11 +36,6 @@ def _resolve_or_404(ws_id: int) -> Path | None:
     return task_service.resolve_workspace(ws_id)
 
 
-#: How long the Run route waits for the detached run to take the lane: the CLI's
-#: stop grace (cli._KILL_GRACE_S, 5 s) plus 5 s for the claim after it.
-_START_WAIT_S = 10.0
-
-
 def _build_takeover_command(ws_path: Path, slug: str) -> list[str]:
     """Build the takeover command: python -m backseat_harness.cli -C <ws> takeover <slug>."""
     return [sys.executable, "-m", "backseat_harness.cli", "-C", str(ws_path), "takeover", slug]
@@ -51,8 +45,7 @@ def _build_takeover_command(ws_path: Path, slug: str) -> list[str]:
 def task_page(request: Request, ws_id: int, slug: str):
     """Read-only task viewer: goal, status, iteration, generation, checklist.
 
-    A ``notice`` query parameter (set by a failed Run) is shown as a banner above
-    the Run form. The template escapes it, so the text is shown as written.
+    Reads only; the page writes nothing.
     """
     ws_path = _resolve_or_404(ws_id)
     if ws_path is None:
@@ -73,19 +66,18 @@ def task_page(request: Request, ws_id: int, slug: str):
             "ws_name": ws_path.name,
             "task": task,
             "takeover_cmd": takeover_cmd,
-            "notice": request.query_params.get("notice"),
         },
     )
 
 
 @router.post("/ws/{ws_id}/tasks/{slug}/run", response_class=HTMLResponse)
 def task_run(request: Request, ws_id: int, slug: str, brief: str = Form(default="")):
-    """Launch a detached run for this task, then wait briefly for it to take the lane.
+    """Launch a detached run for this task and redirect straight back to the page.
 
     A brief means the owner is redirecting the lane, so the run passes
-    ``--interrupt`` and stops a live harness first. The redirect goes back to the
-    task page. A run that fails to start, or is slow to, adds a ``notice`` with
-    the reason, so the page says why instead of showing nothing.
+    ``--interrupt`` and stops a live harness first. The run is not awaited: a
+    refusal or crash is written to the lane's daemon.log, and the Status table's
+    Uptime row shows whether a harness took the lane.
     """
     ws_path = _resolve_or_404(ws_id)
     if ws_path is None:
@@ -96,15 +88,5 @@ def task_run(request: Request, ws_id: int, slug: str, brief: str = Form(default=
         return HTMLResponse("Task not found", status_code=404)
 
     brief = brief.strip()
-    proc, log_path, offset = task_service.run_task_detached(
-        ws_path, slug, brief or None, interrupt=bool(brief)
-    )
-    notice = task_service.run_start_notice(
-        ws_path, slug, proc, log_path, offset, timeout_s=_START_WAIT_S
-    )
-
-    # Redirect back to the task page, with the reason when the run did not start
-    url = f"/ws/{ws_id}/tasks/{slug}"
-    if notice:
-        url += "?" + urlencode({"notice": notice})
-    return RedirectResponse(url=url, status_code=303)
+    task_service.run_task_detached(ws_path, slug, brief or None, interrupt=bool(brief))
+    return RedirectResponse(url=f"/ws/{ws_id}/tasks/{slug}", status_code=303)

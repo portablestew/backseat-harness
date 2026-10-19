@@ -81,6 +81,29 @@ def save_state(paths: TaskPaths, state: TaskState) -> None:
     atomic_write(paths.state, json.dumps(state.touch().to_dict(), indent=2) + "\n")
 
 
+def load_run_request(paths: TaskPaths) -> dict | None:
+    """The run journal, or None when it is absent or unreadable.
+
+    An unreadable journal counts as absent: the next run replaces it anyway.
+    """
+    try:
+        data = json.loads(paths.run_request.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_run_request(paths: TaskPaths, brief: str | None, started_at: float) -> None:
+    atomic_write(
+        paths.run_request,
+        json.dumps({"v": 1, "started_at": started_at, "brief": brief}, indent=2) + "\n",
+    )
+
+
+def clear_run_request(paths: TaskPaths) -> None:
+    paths.run_request.unlink(missing_ok=True)
+
+
 def load_binding(paths: TaskPaths) -> Binding | None:
     if not paths.binding.exists():
         return None
