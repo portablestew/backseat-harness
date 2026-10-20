@@ -488,11 +488,16 @@
       border-color: rgba(248, 81, 73, 0.55);
       background: rgba(248, 81, 73, 0.12);
     }
-    /* Uptime row (task Status table): a live harness reads green. */
-    .badge[data-status="up"] {
+    /* Uptime row (task Status table): plain colored text, unlike the status
+       badge beside it -- a second capsule in the same table reads as a status. */
+    .uptime[data-status="up"] {
       color: #3fb950;
-      border-color: rgba(63, 185, 80, 0.55);
-      background: rgba(63, 185, 80, 0.12);
+    }
+    .uptime[data-status="stalled"] {
+      color: #f85149;
+    }
+    .uptime[data-status="neutral"] {
+      color: var(--muted);
     }
 
     /* Toasts */

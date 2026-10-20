@@ -3448,7 +3448,7 @@ def test_task_checklist_shows_default_model_and_formatted_update(workspace: Path
     stamp = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
     assert f"<small>{stamp}</small>" in rows[0]
     # A step written before timestamps existed reads as unknown, not 1970.
-    assert "<small>â€”</small>" in rows[3]
+    assert "<small>—</small>" in rows[3]
 
 
 # --- step 4-test: edge coverage named in the QA plan ---------------------------
@@ -4522,17 +4522,17 @@ def test_status_other_states_keep_their_own_label(workspace: Path, status, badge
 @pytest.mark.parametrize(
     ("seconds", "text"),
     [
-        (-5, "up 0 min"),
-        (0, "up 0 min"),
-        (59, "up 0 min"),
-        (60, "up 1 min"),
-        (3599, "up 59 min"),
-        (3600, "up 1:00"),
-        (3847, "up 1:04"),
-        (86399, "up 23:59"),
-        (86400, "up 1 day, 0:00"),
-        (100020, "up 1 day, 3:47"),
-        (272820, "up 3 days, 3:47"),
+        (-5, "0 min"),
+        (0, "0 min"),
+        (59, "0 min"),
+        (60, "1 min"),
+        (3599, "59 min"),
+        (3600, "1:00"),
+        (3847, "1:04"),
+        (86399, "23:59"),
+        (86400, "1 day, 0:00"),
+        (100020, "1 day, 3:47"),
+        (272820, "3 days, 3:47"),
     ],
 )
 def test_format_uptime_thresholds(seconds, text):
@@ -4564,10 +4564,10 @@ def test_uptime_is_up_while_the_recorded_harness_is_live(monkeypatch, workspace:
 
     detail = task_service.load_task(workspace, "live-lane")
     assert detail is not None
-    assert (detail.uptime, detail.uptime_tone) == ("up 2:05", "up")
+    assert (detail.uptime, detail.uptime_tone) == ("2:05", "up")
     with _client() as client:
         page = client.get(f"/ws/{ws_id}/tasks/live-lane")
-    assert '<span class="badge" data-status="up">up 2:05</span>' in page.text
+    assert '<span class="uptime" data-status="up">2:05</span>' in page.text
 
 
 def test_uptime_reads_not_running_for_a_continue_lane_with_no_harness(workspace: Path):
@@ -4579,7 +4579,7 @@ def test_uptime_reads_not_running_for_a_continue_lane_with_no_harness(workspace:
     assert (detail.uptime, detail.uptime_tone) == ("not running", "stalled")
     with _client() as client:
         page = client.get(f"/ws/{ws_id}/tasks/stopped-lane")
-    assert '<span class="badge" data-status="stalled">not running</span>' in page.text
+    assert '<span class="uptime" data-status="stalled">not running</span>' in page.text
 
 
 def test_uptime_reads_not_running_when_the_pid_no_longer_matches_its_start(workspace: Path):
@@ -4603,7 +4603,7 @@ def test_uptime_is_na_for_a_lane_that_is_not_continue(workspace: Path, status):
     assert (detail.uptime, detail.uptime_tone) == ("N/A", "neutral")
     with _client() as client:
         page = client.get(f"/ws/{ws_id}/tasks/{slug}")
-    assert '<span class="badge" data-status="neutral">N/A</span>' in page.text
+    assert '<span class="uptime" data-status="neutral">N/A</span>' in page.text
 
 
 def test_status_table_lists_uptime_first_and_user_brief_last(workspace: Path):
@@ -4676,7 +4676,7 @@ def test_uptime_hides_pid_and_date(monkeypatch, workspace: Path):
         text = client.get(f"/ws/{ws_id}/tasks/pid-lane").text
     idx = text.index("<td>Uptime</td>")
     uptime_row = text[text.rindex("<tr", 0, idx) : text.index("</tr>", idx)]
-    assert "up 1:04" in uptime_row
+    assert "1:04" in uptime_row
     assert "987654" not in text
     assert not re.search(r"\d{4}-\d{2}-\d{2}", uptime_row)
 
@@ -4689,7 +4689,7 @@ def test_uptime_is_up_for_a_live_harness_with_no_state_json(monkeypatch, workspa
 
     detail = task_service.load_task(workspace, "fresh-lane")
     assert detail is not None
-    assert (detail.uptime, detail.uptime_tone) == ("up 1 min", "up")
+    assert (detail.uptime, detail.uptime_tone) == ("1 min", "up")
 
 
 @pytest.mark.parametrize("journal", ["no_journal", "bare_run"])

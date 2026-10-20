@@ -89,21 +89,21 @@ def badge_for(status: TaskStatus | str) -> str:
 
 
 def format_uptime(seconds: float) -> str:
-    """How long the harness has been up, in procps ``uptime`` style.
+    """How long the harness has been up, without a leading word.
 
-    ``up 0 min`` under an hour, ``up H:MM`` under a day, then ``up N day(s), H:MM``.
+    ``0 min`` under an hour, ``H:MM`` under a day, then ``N day(s), H:MM``.
     Negative input (clock skew) reads as zero.
     """
     seconds = max(0, int(seconds))
     if seconds < 3600:
-        return f"up {seconds // 60} min"
+        return f"{seconds // 60} min"
     if seconds < 86400:
         hours, rest = divmod(seconds, 3600)
-        return f"up {hours}:{rest // 60:02d}"
+        return f"{hours}:{rest // 60:02d}"
     days, rest = divmod(seconds, 86400)
     hours, rest = divmod(rest, 3600)
     unit = "" if days == 1 else "s"
-    return f"up {days} day{unit}, {hours}:{rest // 60:02d}"
+    return f"{days} day{unit}, {hours}:{rest // 60:02d}"
 
 
 def run_action_for(task_dir: Path, status: str) -> str:
