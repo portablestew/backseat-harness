@@ -65,6 +65,33 @@ def test_merge_does_not_mutate_input():
     assert base.steps["s1"]["status"] == "active"
 
 
+def test_updated_at_is_stamped_when_a_step_changes():
+    created = merge_update(
+        Checklist(), {"steps": {"s1": {"title": "Probe", "status": "active"}}}, now=100.0
+    )
+    assert created.steps["s1"]["updated_at"] == 100.0
+
+    # A no-op resend is not a change, so the stamp survives.
+    unchanged = merge_update(
+        created, {"steps": {"s1": {"title": "Probe", "status": "active"}}}, now=200.0
+    )
+    assert unchanged.steps["s1"]["updated_at"] == 100.0
+
+    changed = merge_update(unchanged, {"steps": {"s1": {"status": "done"}}}, now=300.0)
+    assert changed.steps["s1"]["updated_at"] == 300.0
+
+
+def test_updated_at_is_harness_owned():
+    created = merge_update(
+        Checklist(), {"steps": {"s1": {"title": "Probe", "updated_at": 1.0}}}, now=100.0
+    )
+    assert created.steps["s1"]["updated_at"] == 100.0
+
+    # A delta that only carries the harness-owned field changes nothing.
+    touched = merge_update(created, {"steps": {"s1": {"updated_at": 999.0}}}, now=200.0)
+    assert touched.steps["s1"]["updated_at"] == 100.0
+
+
 def test_all_done():
     assert not all_done(Checklist())  # empty is not done
     assert not all_done(Checklist(steps={"s1": {"status": "active"}}))

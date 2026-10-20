@@ -253,8 +253,8 @@
         <td><span class="badge" data-status="{{ step.get('status', 'pending') }}">{{ step.get("status", "pending") }}</span></td>
         <td>{{ step.get("notes", "") }}</td>
         <td>{{ step.get("evidence", "") }}</td>
-        <td>{{ step.get("model", "") }}</td>
-        <td><small>{{ step.get("updated_at", "") }}</small></td>
+        <td>{% if step.get("model") %}{{ step.get("model") }}{% else %}(default){% endif %}</td>
+        <td><small>{% if step.get("updated_at") %}{{ step.get("updated_at") | format_datetime }}{% else %}—{% endif %}</small></td>
       </tr>
       {% endfor %}
     </tbody>

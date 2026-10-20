@@ -3398,6 +3398,59 @@ def test_task_checklist_rows_hover_but_status_table_does_not(workspace: Path):
     assert ".data-table tbody tr:not(.empty-row):hover" in html
 
 
+def test_task_checklist_shows_default_model_and_formatted_update(workspace: Path):
+    """An unset model reads as the implicit default, an explicit "default" slot
+    stays distinct, and a harness-stamped updated_at renders as a date."""
+    ws_id = _register_workspace(workspace)
+    lane = workspace / ".backseat" / "tasks" / "model-lane"
+    lane.mkdir(parents=True)
+    (lane / "goal.md").write_text("goal\n", encoding="utf-8")
+    when = 1_700_000_000.0
+    (lane / "checklist.json").write_text(
+        json.dumps(
+            {
+                "steps": {
+                    "1-implicit": {
+                        "title": "Implicit",
+                        "status": "active",
+                        "updated_at": when,
+                    },
+                    "2-explicit": {
+                        "title": "Explicit",
+                        "status": "pending",
+                        "model": "default",
+                        "updated_at": when,
+                    },
+                    "3-slot": {
+                        "title": "Slot",
+                        "status": "pending",
+                        "model": "thinker",
+                        "updated_at": when,
+                    },
+                    "4-legacy": {"title": "Legacy", "status": "pending"},
+                },
+                "remarks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _client() as client:
+        html = client.get(f"/ws/{ws_id}/tasks/model-lane").text
+
+    table_start = html.index('<table class="data-table">')
+    table = html[table_start : html.index("</table>", table_start)]
+    rows = _data_rows(table)
+    assert "<td>(default)</td>" in rows[0]
+    assert "<td>default</td>" in rows[1]
+    assert "<td>thinker</td>" in rows[2]
+    assert "<td>(default)</td>" in rows[3]
+    stamp = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
+    assert f"<small>{stamp}</small>" in rows[0]
+    # A step written before timestamps existed reads as unknown, not 1970.
+    assert "<small>â€”</small>" in rows[3]
+
+
 # --- step 4-test: edge coverage named in the QA plan ---------------------------
 
 

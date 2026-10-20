@@ -1368,7 +1368,12 @@ def test_bad_slot_in_verdict_rejected_and_reasked_once(config, task):
     assert "Output the JSON object only, no prose." in prompts[1]
     # The clean retry was persisted verbatim, slot intact.
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
-    assert data["steps"]["s1"] == {"status": "done", "model": "fast"}
+    step = data["steps"]["s1"]
+    assert {k: v for k, v in step.items() if k != "updated_at"} == {
+        "status": "done",
+        "model": "fast",
+    }
+    assert isinstance(step["updated_at"], float)
 
 
 def test_clean_verdict_is_not_reinvoked(config, task):
@@ -1427,8 +1432,10 @@ def test_reask_still_bad_accepts_strips_and_warns(config, task, capsys):
     assert result.status is TaskStatus.COMPLETE
     assert len(prompts) == 3  # reject + re-ask + the attempt the budget allows
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
-    assert data["steps"]["s1"] == {"status": "done"}  # model key stripped
-    assert "model" not in data["steps"]["s1"]
+    step = data["steps"]["s1"]
+    # model key stripped
+    assert {k: v for k, v in step.items() if k != "updated_at"} == {"status": "done"}
+    assert "model" not in step
     err = capsys.readouterr().err
     assert "still named unknown model slot(s)" in err
     assert "after 3 attempt(s)" in err
@@ -1892,7 +1899,9 @@ def test_non_string_slot_in_verdict_is_bad_and_strips(config, task):
     assert len(prompts) == 3
     assert "7 on step 's1'" in prompts[1]  # a JSON number, rendered as sent
     data = json.loads(paths.checklist.read_text(encoding="utf-8"))
-    assert data["steps"]["s1"] == {"status": "done"}  # the 7 never hit disk
+    step = data["steps"]["s1"]
+    # the 7 never hit disk
+    assert {k: v for k, v in step.items() if k != "updated_at"} == {"status": "done"}
 
 
 def _models(config, models):
@@ -2180,7 +2189,11 @@ def test_new_task_plans_before_first_turn(config, task):
     assert "research the router" in seen_managed[0]
     # The planned checklist was persisted with titles.
     data = json.loads(paths.checklist.read_text())
-    assert data["steps"]["route"] == {"title": "Add the route", "status": "pending"}
+    step = data["steps"]["route"]
+    assert {k: v for k, v in step.items() if k != "updated_at"} == {
+        "title": "Add the route",
+        "status": "pending",
+    }
     phases = [e.phase for e in storage.read_ledger(paths)]
     assert phases == ["plan", "review"]
 

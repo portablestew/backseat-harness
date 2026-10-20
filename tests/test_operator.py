@@ -266,6 +266,20 @@ def test_short_checklist_fields_are_left_alone():
     assert "verified at 48a0da1, 134 passed" in out
 
 
+def test_updated_at_never_reaches_the_operator_prompt():
+    """The harness stamps it; the operator neither reads nor writes it."""
+    from backseat_harness.checklist import Checklist
+    from backseat_harness.operator import render_checklist
+
+    cl = Checklist(
+        steps={"1": {"title": "T", "status": "active", "updated_at": 1_700_000_000.0}},
+        remarks=[],
+    )
+    out = render_checklist(cl, ".backseat/tasks/t")
+    assert "updated_at" not in out
+    assert "1700000000" not in out
+
+
 def test_only_recent_remarks_are_inlined_and_older_ones_point_at_the_file():
     from backseat_harness.checklist import Checklist
     from backseat_harness.operator import CHECKLIST_RECENT_REMARKS, render_checklist

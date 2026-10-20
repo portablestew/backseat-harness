@@ -18,6 +18,7 @@ their status but can *never* erase history:
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,9 @@ from backseat_harness import storage
 # Allowed per-step fields. Anything else in a delta is ignored. ``model`` is a
 # pure pass-through: it names a model *slot* for the harness to resolve against
 # the ``[models]`` config (loop-side, per docs 2-plan §2/§3); this module stores
-# and merges it without any semantics of its own.
+# and merges it without any semantics of its own. ``updated_at`` is
+# harness-owned: ``merge_update`` stamps it from the harness clock whenever a
+# step's content actually changes, and an incoming value is ignored.
 STEP_FIELDS = {"title", "status", "notes", "evidence", "updated_at", "model"}
 
 # Valid per-step statuses. There is no ordering: the operator may move a step
@@ -68,13 +71,21 @@ def _strip_nulls(obj: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in obj.items() if v is not None}
 
 
-def merge_update(current: Checklist, update: dict[str, Any]) -> Checklist:
+def merge_update(
+    current: Checklist, update: dict[str, Any], *, now: float | None = None
+) -> Checklist:
     """Merge a validated ``checklist_update`` delta into ``current``.
 
     Returns a new Checklist; never mutates ``current`` in place. Rejects nothing
     hard here (the loop treats a bad verdict as a 'problem'); instead it applies
     only the safe subset so a malformed delta cannot corrupt the file.
+
+    ``updated_at`` belongs to the harness, not the operator: every step whose
+    content this delta actually changes gets the current harness time, while a
+    no-op resend (or a delta that only carries ``updated_at``) keeps the old
+    stamp. ``now`` is injectable so tests can pin the clock.
     """
+    stamp = time.time() if now is None else now
     steps = {k: dict(v) for k, v in current.steps.items()}
     remarks = list(current.remarks)
 
@@ -83,7 +94,13 @@ def merge_update(current: Checklist, update: dict[str, Any]) -> Checklist:
         for step_id, raw in delta_steps.items():
             if not isinstance(raw, dict):
                 continue
-            incoming = _strip_nulls({k: v for k, v in raw.items() if k in STEP_FIELDS})
+            incoming = _strip_nulls(
+                {
+                    k: v
+                    for k, v in raw.items()
+                    if k in STEP_FIELDS and k != "updated_at"
+                }
+            )
             existing = steps.get(step_id, {})
             merged = dict(existing)
             merged.update(incoming)
@@ -92,6 +109,8 @@ def merge_update(current: Checklist, update: dict[str, Any]) -> Checklist:
                 merged["status"] = new_status
             else:
                 merged["status"] = existing.get("status", DEFAULT_STATUS)
+            if merged != existing:
+                merged["updated_at"] = stamp
             steps[step_id] = merged
 
     delta_remarks = update.get("remarks")

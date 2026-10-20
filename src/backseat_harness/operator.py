@@ -119,7 +119,8 @@ def render_checklist(checklist: Checklist, task_dir: str) -> str:
     ``done`` steps collapse to ``DONE_STEP_FIELDS``. Their evidence was checked
     when the step closed; re-inlining it every call is what turns a long run's
     checklist into the largest thing in the prompt, and a finished step is the one
-    thing the operator has no reason to re-read.
+    thing the operator has no reason to re-read. ``updated_at`` is harness
+    bookkeeping the operator neither reads nor writes, so it is dropped too.
     """
     steps = {}
     for step_id, step in checklist.steps.items():
@@ -129,6 +130,7 @@ def render_checklist(checklist: Checklist, task_dir: str) -> str:
         steps[step_id] = {
             key: (_clip(value) if isinstance(value, str) else value)
             for key, value in step.items()
+            if key != "updated_at"
         }
     remarks = [_clip(r) for r in checklist.remarks[-CHECKLIST_RECENT_REMARKS:]]
     hidden = len(checklist.remarks) - len(remarks)
