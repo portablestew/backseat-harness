@@ -26,6 +26,7 @@ from backseat_harness.spawn import resolve_argv
 from backseat_harness.web.routes.shell import get_manager
 from backseat_harness.web.services import chat_search as chat_search_service
 from backseat_harness.web.services import task as task_service
+from backseat_harness.web.shell.detect import default_shell
 
 router = APIRouter()
 
@@ -67,6 +68,7 @@ def workspace_page(request: Request, ws_id: int):
     new_chat_providers = [
         {"name": p, "label": binary_for(p)} for p in on_path_providers()
     ]
+    shell = default_shell()
 
     return templates.TemplateResponse(
         request,
@@ -80,6 +82,7 @@ def workspace_page(request: Request, ws_id: int):
             "complete": complete,
             "chats": chats,
             "new_chat_providers": new_chat_providers,
+            "shell_label": shell[0] if shell else None,
         },
     )
 
@@ -107,11 +110,30 @@ def new_chat(ws_id: int, provider: str = Form(...)):
 
     The argv is the provider's own fresh-chat command, resolved through PATH
     (``resolve_argv``) so npm ``.cmd`` shims launch on Windows. Unknown or
-    absent providers are rejected before any PTY is spawned.
+    absent providers are rejected before any PTY is spawned. ``provider="shell"``
+    is a sentinel for the plain shell (``default_shell``), not a registry entry.
     """
     ws_path = _resolve_or_404(ws_id)
     if ws_path is None:
         return HTMLResponse("Workspace not found", status_code=404)
+
+    if provider == "shell":
+        shell = default_shell()
+        if shell is None:
+            return HTMLResponse(
+                "<p><strong>error:</strong> no shell found on this host</p>",
+                status_code=400,
+            )
+        label, shell_argv = shell
+        try:
+            argv = resolve_argv(shell_argv)
+        except ProviderError as e:
+            return HTMLResponse(f"<p><strong>error:</strong> {e}</p>", status_code=400)
+
+        session_id = get_manager().create_session(argv, ws_path)
+        title = f"New {ws_path.name} {label}"
+        params = urlencode({"from": f"/ws/{ws_id}", "label": ws_path.name, "title": title})
+        return RedirectResponse(url=f"/shell/{session_id}?{params}", status_code=303)
 
     if provider not in available_providers():
         return HTMLResponse(

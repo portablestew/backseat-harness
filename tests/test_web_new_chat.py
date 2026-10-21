@@ -286,6 +286,7 @@ def test_new_chat_expander_none_on_path_shows_note_and_no_form(
     assert "No supported CLI found on PATH." in panel
     assert f'action="/ws/{ws_id}/chats"' not in panel
     assert 'name="provider"' not in panel
+    assert 'value="shell"' not in panel
 
 
 # --- shell heading: "New <ws> <provider>" from the + New chat opener ----------
@@ -318,3 +319,89 @@ def test_new_chat_shell_heading_reads_new_workspace_provider(
     assert page.status_code == 200
     assert _shell_heading(page.text) == f"New {workspace.name} kiro-cli"
     assert "<small>abc123def456</small>" in page.text
+
+
+# --- Step 4: plain-shell button (provider="shell" sentinel) --------------------
+
+
+@pytest.fixture
+def shell_found(monkeypatch):
+    """Pin the route's detected shell so the tests do not depend on the host OS."""
+    monkeypatch.setattr(
+        "backseat_harness.web.routes.workspace.default_shell",
+        lambda: ("pwsh", ["pwsh"]),
+    )
+
+
+def test_new_chat_shell_spawns_resolved_shell_and_redirects(
+    monkeypatch, workspace: Path, spawned, shell_found
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_paths({"pwsh": "C:/pwsh.exe"}))
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "shell"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 303
+    title = f"New {workspace.name} pwsh"
+    assert resp.headers["location"] == (
+        "/shell/abc123def456?"
+        + urlencode({"from": f"/ws/{ws_id}", "label": workspace.name, "title": title})
+    )
+    assert len(spawned) == 1
+    assert spawned[0]["cmd"] == ["C:/pwsh.exe"]
+    assert Path(spawned[0]["cwd"]).resolve() == workspace.resolve()
+
+
+def test_new_chat_shell_is_400_and_spawns_nothing_when_no_shell(
+    monkeypatch, workspace: Path, spawned
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("backseat_harness.web.routes.workspace.default_shell", lambda: None)
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "shell"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 400
+    assert "no shell found" in resp.text
+    assert spawned == []
+
+
+def test_new_chat_shell_is_400_and_spawns_nothing_when_resolve_fails(
+    monkeypatch, workspace: Path, spawned, shell_found
+):
+    ws_id = _register_workspace(workspace)
+
+    def _unresolvable(cmd):
+        raise ProviderError("'pwsh' not found on PATH; is the CLI installed?")
+
+    monkeypatch.setattr("backseat_harness.web.routes.workspace.resolve_argv", _unresolvable)
+
+    with _client() as client:
+        resp = client.post(
+            f"/ws/{ws_id}/chats", data={"provider": "shell"}, follow_redirects=False
+        )
+
+    assert resp.status_code == 400
+    assert "'pwsh' not found on PATH" in resp.text
+    assert spawned == []
+
+
+def test_new_chat_expander_shell_button_is_last_and_labeled(
+    monkeypatch, workspace: Path, shell_found
+):
+    ws_id = _register_workspace(workspace)
+    monkeypatch.setattr("shutil.which", _which_only("claude", "opencode"))
+
+    with _client() as client:
+        panel = _new_chat_panel(client.get(f"/ws/{ws_id}").text)
+
+    assert 'class="shell-btn" name="provider" value="shell"' in panel
+    assert ">pwsh</button>" in panel
+    # Last in the list: after every provider button.
+    assert panel.index('value="shell"') > panel.index('value="opencode"')
+    assert panel.index('value="shell"') > panel.index('value="claude"')

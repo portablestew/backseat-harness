@@ -9,7 +9,7 @@ reads it from here (via tool.hatch.version), so this is the only place to edit
 before a release.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 from backseat_harness.models import (
     Binding,

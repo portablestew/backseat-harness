@@ -141,5 +141,10 @@
   {% else %}
   <p><small>No supported CLI found on PATH.</small></p>
   {% endfor %}
+  {% if shell_label %}
+  <form method="post" action="/ws/{{ ws_id }}/chats">
+    <button type="submit" class="shell-btn" name="provider" value="shell">{{ shell_label }}</button>
+  </form>
+  {% endif %}
 </details>
 {% endblock %}

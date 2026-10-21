@@ -23,6 +23,7 @@ venv/
 .kilo/
 .opencode/
 .pyddock/
+.commandcode/
 
 # Throwaway live-run scratch workspace (disposable, not a project artifact)
 test_workspace/
