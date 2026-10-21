@@ -22,6 +22,7 @@ from backseat_harness.providers import (
 )
 from backseat_harness.providers.base import ProviderError
 from backseat_harness.web.main import create_app
+from backseat_harness.web.shell.detect import _posix_shell, _windows_shell
 from backseat_harness.web.shell.manager import PTYSessionManager
 
 _PORT = 8080
@@ -30,6 +31,11 @@ _PORT = 8080
 def _which_only(*present: str):
     """``shutil.which`` stand-in that resolves only the named executables."""
     return lambda exe: f"/usr/bin/{exe}" if exe in present else None
+
+
+def _which_paths(resolved: dict[str, str]):
+    """``shutil.which`` stand-in: each listed name (bare or absolute) maps to its path."""
+    return lambda exe: resolved.get(exe)
 
 
 def _client() -> TestClient:
@@ -87,6 +93,57 @@ def test_binary_matches_adapter_interactive_argv0(name):
     # Drift guard: the shared map must name the executable each adapter
     # actually launches for a fresh chat (no native session id).
     assert binary_for(name) == get_provider(name).interactive_command(None)[0]
+
+
+# --- Shell detection: the plain-shell button's (label, argv) -------------------
+
+
+def test_windows_shell_prefers_pwsh_over_powershell(monkeypatch):
+    monkeypatch.setattr(
+        "shutil.which",
+        _which_paths({"pwsh": "C:/pwsh.exe", "powershell": "C:/powershell.exe"}),
+    )
+    assert _windows_shell() == ("pwsh", ["pwsh"])
+
+
+def test_windows_shell_falls_back_to_powershell(monkeypatch):
+    monkeypatch.setattr("shutil.which", _which_paths({"powershell": "C:/powershell.exe"}))
+    assert _windows_shell() == ("powershell", ["powershell"])
+
+
+def test_windows_shell_none_when_neither_resolves(monkeypatch):
+    monkeypatch.setattr("shutil.which", _which_paths({}))
+    assert _windows_shell() is None
+
+
+def test_posix_shell_labels_shell_env_by_basename(monkeypatch):
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr("shutil.which", _which_paths({"/bin/zsh": "/bin/zsh"}))
+    assert _posix_shell() == ("zsh", ["/bin/zsh"])
+
+
+def test_posix_shell_falls_back_to_bash_when_shell_unset(monkeypatch):
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setattr("shutil.which", _which_paths({"bash": "/usr/bin/bash", "sh": "/bin/sh"}))
+    assert _posix_shell() == ("bash", ["bash"])
+
+
+def test_posix_shell_falls_back_to_bash_when_shell_rejected(monkeypatch):
+    monkeypatch.setenv("SHELL", "/opt/missing/fish")
+    monkeypatch.setattr("shutil.which", _which_paths({"bash": "/usr/bin/bash", "sh": "/bin/sh"}))
+    assert _posix_shell() == ("bash", ["bash"])
+
+
+def test_posix_shell_falls_back_to_sh_when_bash_absent(monkeypatch):
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setattr("shutil.which", _which_paths({"sh": "/bin/sh"}))
+    assert _posix_shell() == ("sh", ["sh"])
+
+
+def test_posix_shell_none_when_nothing_resolves(monkeypatch):
+    monkeypatch.setenv("SHELL", "/opt/missing/fish")
+    monkeypatch.setattr("shutil.which", _which_paths({}))
+    assert _posix_shell() is None
 
 
 # --- Step 3: POST /ws/{id}/chats -----------------------------------------------
