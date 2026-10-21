@@ -43,7 +43,7 @@ from backseat_harness.models import (
     next_generation,
 )
 from backseat_harness.providers import Provider, ProviderError, get_provider
-from backseat_harness.providers.base import SpawnSpec, TurnResult
+from backseat_harness.providers.base import SpawnSpec, TurnResult, agent_args
 
 # Runs one managed turn and returns its outcome. Injected (real subprocess/fake).
 ManagedRunner = Callable[[Provider, SpawnSpec], TurnResult]
@@ -224,7 +224,7 @@ def run_task(
     task_dir = paths.root.relative_to(config.workspace_root).as_posix()
     paths.docs.mkdir(parents=True, exist_ok=True)
     # The managed turn's flags are composed per spawn below (docs 2-plan §3):
-    # extra_args and --agent are fixed, but --model is resolved from the active
+    # extra_args and the agent flag are fixed, but --model is resolved from the active
     # step's slot on every turn, so nothing --model-related is baked in here.
 
     # §5a: a stripped bad slot rides the slot_warning channel of the NEXT
@@ -504,6 +504,17 @@ def run_task(
             state.generation = 1
             prompt = marker_mod.prepend_marker(binding.root_uuid, 1, pending_prompt)
 
+        # A provider that drops dead ids (see _record_native) can reach here with
+        # no id to resume. Nothing above marked this prompt, so mark it now, or
+        # the marker search can never bind the session the CLI starts.
+        if (
+            provider.drops_unpersisted_native_id
+            and gen is not None
+            and resume_id is None
+            and prompt == pending_prompt
+        ):
+            prompt = marker_mod.prepend_marker(binding.root_uuid, gen.n, pending_prompt)
+
         # --- Provider switch notice (D6): on any turn whose new chat runs under a
         # different CLI than its owner's. Logged now, merged into this turn's review.
         switch_notice = (
@@ -529,11 +540,12 @@ def run_task(
             timeout_s=config.turn_timeout_s,
             # Order is a documented contract (docs 2-plan E8): the owner's
             # extra_args first, then the turn's --model (its own extra_args
-            # --model is the baseline the slot appends after), then --agent.
+            # --model is the baseline the slot appends after), then the agent
+            # flag, when the provider has one (see agent_args).
             extra_args=(
                 config.extra_args
                 + (("--model", turn_model) if turn_model else ())
-                + (("--agent", config.agent) if config.agent else ())
+                + agent_args(provider, config.agent)
             ),
             log_path=turn_log,
         )
@@ -1002,6 +1014,13 @@ def _record_native(binding: Binding, result: TurnResult, provider: Provider) -> 
     if info is not None:
         native = native or info.native_id
         size = info.size_bytes
+    elif provider.drops_unpersisted_native_id and (result.timed_out or result.exit_code != 0):
+        # History holds no session for this task, and the turn failed or was
+        # killed, so the id may name nothing that persisted (L9: a turn killed
+        # after run_start). Resuming it fails every later turn; clear it and let
+        # the next prompt's marker rebind. A turn that completed keeps its id: the
+        # CLI may simply not have reached history yet.
+        native = None
 
     gens[-1] = replace(cur, native_id=native, transcript_bytes=size, mtime=time.time())
     return replace(binding, generations=gens)

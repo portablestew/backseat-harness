@@ -207,6 +207,29 @@ def _dir_from_claude_jsonl(locator: str) -> str | None:
     return None
 
 
+def _dir_from_command_code_jsonl(locator: str) -> str | None:
+    """``cwd`` from a Command Code session's header, the first line of ``<uuid>.jsonl``.
+
+    Only that line is read: the header is the one record that names the
+    workspace, and message bodies are never scanned. A first record that is not
+    a ``session`` header ends the search with ``None``.
+    """
+    with open(locator, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(event, dict) or event.get("type") != "session":
+                return None
+            cwd = event.get("cwd")
+            return cwd if isinstance(cwd, str) and cwd else None
+    return None
+
+
 def _dir_from_kiro_cli(locator: str) -> str | None:
     """``cwd`` from the Kiro CLI sidecar ``<uuid>.json`` (kiro_cli.py:119-132)."""
     meta_path = Path(locator).with_suffix(".json")
@@ -285,6 +308,7 @@ def _workspace_dir_for(ref: object) -> str | None:
             return None
         recover = {
             "claude_code": _dir_from_claude_jsonl,
+            "command_code": _dir_from_command_code_jsonl,
             "kiro_cli": _dir_from_kiro_cli,
             "cline": _dir_from_cline,
             "kiro_ide_v2": _dir_from_kiro_v2,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from backseat_harness.providers import available_providers, get_provider
+from backseat_harness.providers import available_providers, binary_for, get_provider
 from backseat_harness.providers.base import ProviderError, SpawnSpec
 from backseat_harness.providers.claude import ClaudeProvider
 from backseat_harness.providers.kiro import KiroProvider
@@ -104,7 +104,8 @@ def test_registry_serves_all_three_providers():
     assert isinstance(get_provider("opencode"), OpencodeProvider)
     assert isinstance(get_provider("claude"), ClaudeProvider)
     assert isinstance(get_provider("kiro"), KiroProvider)
-    assert available_providers() == ["claude", "kiro", "opencode"]
+    assert available_providers() == ["claude", "commandcode", "kiro", "opencode"]
+    assert binary_for("commandcode") == "cmdc"
     with pytest.raises(ProviderError, match="unknown provider"):
         get_provider("nope")
 
@@ -139,6 +140,7 @@ def test_every_provider_defaults_to_auto_approve():
     grants = {
         "opencode": "--auto",
         "claude": "--permission-mode",
+        "commandcode": "--yolo",
         "kiro": "--trust-all-tools",
     }
     for name in available_providers():

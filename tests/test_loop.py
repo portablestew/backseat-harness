@@ -18,6 +18,7 @@ from backseat_harness.models import (
     VerdictKind,
 )
 from backseat_harness.providers.base import SpawnSpec, TurnResult
+from backseat_harness.providers.commandcode import CommandCodeProvider
 from backseat_harness.providers.kiro import KiroProvider
 
 #: A kiro 2.26.1 refusal, verbatim: fresh and ``--resume-id`` turns both end
@@ -371,6 +372,145 @@ def test_first_turn_applies_marker(config, task):
     assert "hello" in seen["prompt"]
 
 
+def _killed_then_resumed(
+    config, slug, provider, reported="dead-1", *, exit_code=124, timed_out=True
+):
+    """Run two turns: a turn reporting ``reported``, then the next turn.
+
+    Every turn ends with ``exit_code`` and ``timed_out`` (killed by default). History
+    holds no session for the task, so ``reported`` names nothing that persisted.
+    Returns the two spawn specs the runner saw.
+    """
+    seen: list[SpawnSpec] = []
+
+    def runner(prov, spec):
+        seen.append(spec)
+        return TurnResult(
+            exit_code=exit_code, timed_out=timed_out, duration_s=2.0,
+            native_session_id=reported if len(seen) == 1 else None,
+        )
+
+    verdicts = iter([
+        '{"verdict":"continue","next_prompt":"step 2"}',
+        '{"verdict":"done"}',
+    ])
+    run_task(slug, config, provider, runner, lambda p: next(verdicts), first_prompt="step 1")
+    return seen
+
+
+def test_dead_native_id_is_dropped_and_next_turn_is_marked(config, task):
+    """L9: a run_start id that history lacks must not poison the next turn.
+
+    The second turn gets no resume id, so cmdc gets no ``--session``, and its
+    prompt carries the generation marker so the marker search can bind it.
+    """
+    slug, paths = task
+    from dataclasses import replace
+
+    config = replace(config, provider="commandcode")
+    provider = CommandCodeProvider()
+
+    first, second = _killed_then_resumed(config, slug, provider)
+
+    assert first.resume_native_id is None
+    assert second.resume_native_id is None
+    assert "--session" not in provider.build_command(second)
+    assert second.prompt.startswith("<meta>START SESSION")
+    assert "step 2" in second.prompt
+    assert storage.load_binding(paths).current.native_id is None
+
+
+def test_failed_turn_with_no_history_session_drops_its_id(config, task):
+    """L9, the non-timeout case: a nonzero exit with no history session clears the id."""
+    slug, paths = task
+    from dataclasses import replace
+
+    config = replace(config, provider="commandcode")
+    provider = CommandCodeProvider()
+
+    first, second = _killed_then_resumed(
+        config, slug, provider, exit_code=1, timed_out=False
+    )
+
+    assert second.resume_native_id is None
+    assert second.prompt.startswith("<meta>START SESSION")
+    assert storage.load_binding(paths).current.native_id is None
+
+
+def test_successful_turn_with_no_history_session_keeps_its_id(config, task):
+    """A completed turn whose transcript has not reached history keeps its id.
+
+    The CLI may simply not have flushed the session yet, so the next turn resumes
+    the reported id and carries no marker.
+    """
+    slug, paths = task
+    from dataclasses import replace
+
+    config = replace(config, provider="commandcode")
+    provider = CommandCodeProvider()
+
+    first, second = _killed_then_resumed(
+        config, slug, provider, exit_code=0, timed_out=False
+    )
+
+    assert second.resume_native_id == "dead-1"
+    assert not second.prompt.startswith("<meta>START SESSION")
+    assert storage.load_binding(paths).current.native_id == "dead-1"
+
+
+def test_provider_without_the_capability_keeps_the_dead_id(config, task):
+    """Paired control: with the capability off, the same sequence resumes ``dead-1``.
+
+    Claude, kiro and opencode keep today's behaviour: the reported id stands and
+    the next turn resumes it, with no marker added.
+    """
+    slug, paths = task
+    provider = FakeProvider()
+    assert provider.drops_unpersisted_native_id is False
+
+    first, second = _killed_then_resumed(config, slug, provider)
+
+    assert first.resume_native_id is None
+    assert second.resume_native_id == "dead-1"
+    assert not second.prompt.startswith("<meta>START SESSION")
+    assert storage.load_binding(paths).current.native_id == "dead-1"
+
+
+def test_provider_without_the_capability_keeps_the_id_after_a_success(config, task):
+    """Paired control for the success case: without the capability the id stands."""
+    slug, paths = task
+    provider = FakeProvider()
+    assert provider.drops_unpersisted_native_id is False
+
+    first, second = _killed_then_resumed(
+        config, slug, provider, exit_code=0, timed_out=False
+    )
+
+    assert second.resume_native_id == "dead-1"
+    assert not second.prompt.startswith("<meta>START SESSION")
+    assert storage.load_binding(paths).current.native_id == "dead-1"
+
+
+def test_provider_without_the_capability_gets_no_marker_on_an_id_less_turn(config, task):
+    """Paired control for the marker gate (loop.py, the drops_unpersisted check).
+
+    The first turn reports no session id and history holds none, so the next
+    turn has no resume id and reaches the gate. With the capability off the
+    gate must stay shut: the prompt is not marked. Removing the capability
+    check from that gate makes this fail.
+    """
+    slug, paths = task
+    provider = FakeProvider()
+    assert provider.drops_unpersisted_native_id is False
+
+    first, second = _killed_then_resumed(config, slug, provider, reported=None)
+
+    assert first.resume_native_id is None
+    assert second.resume_native_id is None
+    assert second.prompt == "step 2"
+    assert storage.load_binding(paths).current.native_id is None
+
+
 def test_oversized_session_starts_a_new_generation(config, task, _history):
     """Size comes from history (opencode has no transcript file to stat).
 
@@ -504,6 +644,68 @@ def test_managed_flags_are_forwarded_in_declared_order(config, task, overrides, 
         lambda p: '{"verdict":"done"}', first_prompt="go",
     )
     assert seen["extra_args"] == expected
+
+
+class _NoAgentFlagProvider(FakeProvider):
+    """A managed provider whose CLI has no main-session agent flag."""
+
+    agent_flag = None
+
+
+def test_managed_agent_dropped_for_provider_without_agent_flag(
+    config, task, monkeypatch, capsys
+):
+    """An agent on a provider with no agent flag is dropped with one warning
+    per run, across every turn, and never fails the lane."""
+    from dataclasses import replace
+
+    from backseat_harness.providers import base
+
+    monkeypatch.setattr(base, "_AGENT_WARNED", set())
+    slug, _ = task
+    config = replace(config, agent="a", model="m", extra_args=("--flag", "x"))
+    seen = []
+    verdicts = iter([
+        json.dumps({"verdict": "continue", "next_prompt": "step 2"}),
+        json.dumps({"verdict": "done"}),
+    ])
+
+    result = run_task(
+        slug, config, _NoAgentFlagProvider(), _spec_logger(seen),
+        lambda p: next(verdicts), first_prompt="go",
+    )
+
+    assert result.status is TaskStatus.COMPLETE
+    assert seen == [("--flag", "x", "--model", "m")] * 2
+    assert capsys.readouterr().err.count("no agent flag") == 1
+
+
+def test_managed_agent_warning_is_keyed_per_provider_and_agent(config, monkeypatch, capsys):
+    """Warn-once is per (provider, agent) for the process: a repeat agent on a
+    later lane stays silent, a different agent warns again."""
+    from dataclasses import replace
+
+    from backseat_harness.providers import base
+
+    monkeypatch.setattr(base, "_AGENT_WARNED", set())
+    seen = []
+    done = json.dumps({"verdict": "done"})
+    for slug, agent in [("lane-1", "a"), ("lane-2", "a"), ("lane-3", "b")]:
+        paths = config.task_paths(slug)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.goal.write_text("Build a thing.\n", encoding="utf-8")
+        paths.checklist.write_text(json.dumps({"steps": {}, "remarks": []}), encoding="utf-8")
+
+        result = run_task(
+            slug, replace(config, agent=agent), _NoAgentFlagProvider(), _spec_logger(seen),
+            lambda p: done, first_prompt="go",
+        )
+        assert result.status is TaskStatus.COMPLETE
+
+    err = capsys.readouterr().err
+    assert err.count('ignoring agent "a"') == 1
+    assert err.count('ignoring agent "b"') == 1
+    assert all("--agent" not in extra for extra in seen)
 
 
 # --- Per-turn model-slot resolution (docs 2-plan §3) ---

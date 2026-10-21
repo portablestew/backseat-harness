@@ -67,6 +67,7 @@ def test_binary_for_maps_every_registered_provider():
     assert binary_for("claude") == "claude"
     assert binary_for("kiro") == "kiro-cli"
     assert binary_for("opencode") == "opencode"
+    assert binary_for("commandcode") == "cmdc"
 
 
 def test_binary_for_unknown_provider_raises():
@@ -79,9 +80,10 @@ def test_binary_for_unknown_provider_raises():
     [
         (("opencode", "claude", "kiro-cli"), ["claude", "kiro", "opencode"]),  # registry order
         (("claude", "opencode"), ["claude", "opencode"]),  # missing binaries are skipped
+        (("cmdc",), ["commandcode"]),  # the registry key is commandcode, its binary cmdc
         ((), []),  # nothing installed
     ],
-    ids=["registry-order", "skips-missing", "nothing-installed"],
+    ids=["registry-order", "skips-missing", "commandcode-binary", "nothing-installed"],
 )
 def test_on_path_providers_keeps_registry_order_and_skips_missing(monkeypatch, installed, expected):
     monkeypatch.setattr("shutil.which", _which_only(*installed))
@@ -155,13 +157,16 @@ def test_posix_shell_none_when_nothing_resolves(monkeypatch):
         ("opencode", ["/usr/bin/opencode"]),
         ("kiro", ["/usr/bin/kiro-cli", "chat"]),
         ("claude", ["/usr/bin/claude"]),
+        ("commandcode", ["/usr/bin/cmdc"]),
     ],
 )
 def test_new_chat_spawns_fresh_provider_argv_and_redirects(
     monkeypatch, workspace: Path, spawned, provider, argv
 ):
     ws_id = _register_workspace(workspace)
-    monkeypatch.setattr("shutil.which", _which_only("opencode", "kiro-cli", "claude"))
+    monkeypatch.setattr(
+        "shutil.which", _which_only("opencode", "kiro-cli", "claude", "cmdc")
+    )
 
     with _client() as client:
         resp = client.post(

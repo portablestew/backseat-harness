@@ -41,7 +41,7 @@ from backseat_harness.loop import OperatorReply, run_task
 from backseat_harness.models import Binding, TaskStatus
 from backseat_harness.operator import load_persona
 from backseat_harness.providers import get_provider
-from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec
+from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, agent_args
 from backseat_harness.spawn import run_turn
 
 
@@ -1417,7 +1417,7 @@ def _make_oneshot_invoker(
     read a moment later rather than off a pipe. See logs.py.
     """
     provider: Provider = get_provider(profile.provider)
-    base_extra: tuple[str, ...] = ("--agent", profile.agent) if profile.agent else ()
+    base_extra: tuple[str, ...] = agent_args(provider, profile.agent)
 
     def invoke(prompt: str) -> str:
         prompt = f"{persona}\n\n{prompt}"

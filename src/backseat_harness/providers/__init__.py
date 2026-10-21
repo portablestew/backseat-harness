@@ -6,26 +6,36 @@ It does *not* know where transcripts live: sizing and forking go through
 chat-mother-forker, scoped by the adapter's ``history_provider`` (see
 history.py).
 
-Supported providers: **opencode**, **claude** (Claude Code), and **kiro**
-(kiro-cli). All three are registered and were validated live end to end:
-one-shot and resume on a real install. Every turn runs auto-approved (a
-non-interactive process cannot answer a prompt), and the operator runs each
-CLI's default agent with the persona prepended to its prompt. The harness writes
-no operator profile.
+Supported providers: **opencode**, **claude** (Claude Code), **kiro**
+(kiro-cli), and **commandcode** (Command Code ``cmdc``). All four are
+registered. opencode, claude and kiro were validated live end to end: one-shot
+and resume on a real install. commandcode was validated live for one-shot,
+resume and the dead-session recovery only; takeover, fork and ``--model`` were
+not run live. Every turn runs auto-approved (a non-interactive process cannot answer
+a prompt), and the operator runs each CLI's default agent with the persona
+prepended to its prompt. The harness writes no operator profile.
 """
 
 from __future__ import annotations
 
 import shutil
 
-from backseat_harness.providers.base import Provider, ProviderError, SpawnSpec, TurnResult
+from backseat_harness.providers.base import (
+    Provider,
+    ProviderError,
+    SpawnSpec,
+    TurnResult,
+    agent_args,
+)
 from backseat_harness.providers.claude import ClaudeProvider
+from backseat_harness.providers.commandcode import CommandCodeProvider
 from backseat_harness.providers.kiro import KiroProvider
 from backseat_harness.providers.opencode import OpencodeProvider
 
 # Registry keyed by the short name used in config (harness.provider).
 _REGISTRY: dict[str, type[Provider]] = {
     "claude": ClaudeProvider,
+    "commandcode": CommandCodeProvider,
     "kiro": KiroProvider,
     "opencode": OpencodeProvider,
 }
@@ -35,6 +45,7 @@ _REGISTRY: dict[str, type[Provider]] = {
 # buttons both go through on_path_providers().
 _BINARY: dict[str, str] = {
     "claude": "claude",
+    "commandcode": "cmdc",
     "kiro": "kiro-cli",
     "opencode": "opencode",
 }
@@ -72,7 +83,9 @@ __all__ = [
     "ProviderError",
     "SpawnSpec",
     "TurnResult",
+    "agent_args",
     "ClaudeProvider",
+    "CommandCodeProvider",
     "KiroProvider",
     "OpencodeProvider",
     "get_provider",

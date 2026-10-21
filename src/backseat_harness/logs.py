@@ -1,7 +1,8 @@
 """Per-call provider logs, one file per provider invocation.
 
 Every provider CLI already runs in a machine-readable mode (opencode
-``--format json``, claude and kiro ``--output-format stream-json``), and none of
+``--format json``, claude and kiro ``--output-format stream-json``, Command Code
+``--output-format json``), and none of
 them has a TTY here, so a call's output is newline-delimited JSON with no spinner
 or box-drawing to strip. That makes the log worth keeping verbatim: it is the raw
 event stream, re-parseable later, rather than a rendering of one.

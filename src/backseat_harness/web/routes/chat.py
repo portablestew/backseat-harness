@@ -9,7 +9,8 @@ conversation, where the search path parses every candidate of that provider
 (32 parses against this machine's stores) to find the same row.
 
 The provider parameter is the chat-mother-forker history provider name
-(e.g., opencode, kiro_cli, kiro_ide, kiro_ide_v2, claude_code, kilo, cline),
+(e.g., opencode, kiro_cli, kiro_ide, kiro_ide_v2, claude_code, kilo, cline,
+command_code),
 which is what load_sessions expects in a key.
 """
 
@@ -60,6 +61,7 @@ _VALID_HISTORY_PROVIDERS = {
     "claude_code",
     "kilo",
     "cline",
+    "command_code",
 }
 
 # Map chat-mother-forker history provider -> resume_command_template (interactive TUI commands)
@@ -68,6 +70,7 @@ _RESUME_COMMANDS = {
     "opencode": ["opencode", "--session", "{conversation_id}"],
     "kiro_cli": ["kiro-cli", "chat", "--resume-id", "{conversation_id}"],
     "claude_code": ["claude", "--resume", "{conversation_id}"],
+    "command_code": ["cmdc", "--session", "{conversation_id}"],
 }
 
 

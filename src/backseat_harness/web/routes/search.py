@@ -108,7 +108,8 @@ def _build_fork_command(fork_provider: str, prompt: str) -> list[str]:
     fork CLI accepts an initial prompt on the command line (kiro-cli's
     positional ``[INPUT]``, opencode's ``--prompt``, claude's positional
     prompt). Writing it after a fixed delay raced the TUI startup, so kiro-cli
-    opened without the prompt.
+    opened without the prompt. commandcode's ``cmdc`` takes the prompt as a
+    positional argument too.
     """
     if fork_provider == "opencode":
         return ["opencode", "--prompt", prompt]
@@ -116,6 +117,8 @@ def _build_fork_command(fork_provider: str, prompt: str) -> list[str]:
         return ["kiro-cli", "chat", prompt]
     elif fork_provider == "claude":
         return ["claude", prompt]
+    elif fork_provider == "commandcode":
+        return ["cmdc", prompt]
     else:
         # Fallback - shouldn't happen as pick_fork_provider only returns supported
         raise ValueError(f"Unknown fork provider: {fork_provider}")

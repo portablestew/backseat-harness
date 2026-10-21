@@ -787,6 +787,70 @@ def test_both_agent_settings_reach_the_provider_argv(config, monkeypatch):
     assert seen["argv"][-2:] == ["--agent", "my-reviewer"]
 
 
+@pytest.mark.parametrize(
+    "provider_name", ["claude", "kiro", "opencode"],
+)
+def test_operator_agent_flag_survives_for_agent_flag_providers(
+    config, monkeypatch, provider_name
+):
+    """claude, kiro and opencode still get ``--agent <name>`` through the
+    operator invoker, now that the flag comes from agent_args."""
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+    from backseat_harness.providers import get_provider
+
+    seen = _capture_operator_spawn(monkeypatch, provider=get_provider(provider_name))
+    op_config = replace(config.operator, agent="my-reviewer")
+    cli._make_operator_invoker(config, op_config)("Do the review.")
+
+    argv = seen["argv"]
+    assert argv[argv.index("--agent") + 1] == "my-reviewer"
+
+
+def test_operator_agent_dropped_for_provider_without_agent_flag(config, monkeypatch, capsys):
+    """commandcode has no agent flag: the operator runs its default agent, the
+    argv carries no --agent, and one warning covers every call on the invoker."""
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+    from backseat_harness.providers import base
+    from backseat_harness.providers.commandcode import CommandCodeProvider
+
+    monkeypatch.setattr(base, "_AGENT_WARNED", set())
+    seen = _capture_operator_spawn(monkeypatch, provider=CommandCodeProvider())
+    op_config = replace(config.operator, agent="r")
+    invoke = cli._make_operator_invoker(config, op_config)
+    invoke("Do the review.")
+    invoke("Do the review again.")
+
+    assert "--agent" not in seen["argv"]
+    assert seen["argv"][:6] == [
+        "cmdc", "-p", "--output-format", "json", "--yolo", "--skip-onboarding",
+    ]
+    assert capsys.readouterr().err.count("no agent flag") == 1
+
+
+def test_operator_warning_is_keyed_per_agent(config, monkeypatch, capsys):
+    """The operator guard keys on (provider, agent): the same agent on a new
+    invoker stays silent, a different agent on the same provider warns again."""
+    from dataclasses import replace
+
+    import backseat_harness.cli as cli
+    from backseat_harness.providers import base
+    from backseat_harness.providers.commandcode import CommandCodeProvider
+
+    monkeypatch.setattr(base, "_AGENT_WARNED", set())
+    seen = _capture_operator_spawn(monkeypatch, provider=CommandCodeProvider())
+    for agent in ("r", "r", "s"):
+        cli._make_operator_invoker(config, replace(config.operator, agent=agent))("Review.")
+
+    assert "--agent" not in seen["argv"]
+    err = capsys.readouterr().err
+    assert err.count('ignoring agent "r"') == 1
+    assert err.count('ignoring agent "s"') == 1
+
+
 def test_run_sees_task_layer(tmp_path, monkeypatch):
     """`run` resolves provider from the task-level config.toml, not the workspace's."""
     from conftest import FakeProvider

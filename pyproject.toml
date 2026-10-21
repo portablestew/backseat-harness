@@ -14,8 +14,9 @@ dependencies = [
     # Compaction-by-fork and operator review both depend on it, so it is core.
     # 0.2.0 first shipped the public library API (fork_chat / find_chats /
     # ChatRef.size_bytes); 0.2.1 adds the public load_chat that turn capture uses
-    # for a full, untruncated transcript.
-    "chat-mother-forker>=0.2.1",
+    # for a full, untruncated transcript; 0.2.4 adds command_code history for the
+    # commandcode provider, which raised this floor from 0.2.1.
+    "chat-mother-forker>=0.2.4",
     # Pid liveliness for the process registry (~/.backseat/db.sqlite): a stored
     # pid is only trustworthy alongside psutil's create_time() to catch pid
     # reuse, which is what the task-row claim and orphan sweep check against.

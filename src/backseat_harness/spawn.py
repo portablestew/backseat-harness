@@ -393,9 +393,9 @@ def run_turn(provider: Provider, spec: SpawnSpec) -> TurnResult:
     """Run one managed-agent turn to completion or timeout.
 
     On timeout the tree is terminated and ``timed_out`` is set. The
-    non-interactive permission flags in ``spec.extra_args`` are what let a turn
-    actually finish instead of blocking on an approval prompt; the watchdog is
-    the backstop.
+    non-interactive auto-approve grant in the adapter's ``build_command`` (plus
+    any ``spec.extra_args``) is what lets a turn actually finish instead of
+    blocking on an approval prompt; the watchdog is the backstop.
 
     With ``spec.log_path`` the CLI's output goes straight to that file and is
     read back here, so the turn's event stream is on disk for as long as the

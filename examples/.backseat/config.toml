@@ -9,15 +9,16 @@
 # config.toml at any layer.
 
 [harness]
-# Managed-agent CLI: "opencode" | "claude" | "kiro". Unset, it is the operator's,
-# and a model is inherited only along with it.
+# Managed-agent CLI: "opencode" | "claude" | "kiro" | "commandcode". Unset, it is the
+# operator's, and a model is inherited only along with it.
 provider = "kiro"
 # model = "anthropic/claude-opus-4"   # optional, the managed agent's model; unset, the operator's
-# agent = "my-builder"                # optional named agent (--agent)
+# [models].default, when set, overrides this model (see [models] below).
+# agent = "my-builder"                # optional named agent (--agent); ignored with a warning for commandcode
 
 # Extra flags for every managed turn, on top of the auto-approve grant each
 # adapter already passes (opencode --auto, claude --permission-mode auto, kiro
-# --trust-all-tools). This is for per-workspace adjustments, not for the grant
+# --trust-all-tools, commandcode --yolo). This is for per-workspace adjustments, not for the grant
 # itself: to restrict what an agent may do, write a repo-level agent definition
 # and point [harness].agent at it.
 extra_args = []
@@ -69,7 +70,9 @@ operator_retry_budget = 3
 provider = "opencode"
 # model = "anthropic/claude-opus-4"  # optional; unset, [manager].model
 # agent = "my-operator"              # optional named agent, and the supported
-#                                    # way to narrow what the operator may do
+#                                    # way to narrow what the operator may do.
+#                                    # commandcode has no agent flag: the agent is
+#                                    # ignored there, with a one-time warning.
 # extra_args = []                    # optional, as above
 
 # Exact commands the operator may run itself, e.g. a fast test run. Everything

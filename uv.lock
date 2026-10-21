@@ -74,7 +74,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "chat-mother-forker", specifier = ">=0.2.1" },
+    { name = "chat-mother-forker", specifier = ">=0.2.4" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -213,14 +213,14 @@ wheels = [
 
 [[package]]
 name = "chat-mother-forker"
-version = "0.2.3"
+version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mcp" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/8c/0775bc3079eca863a5a6a447273f6817bae749a68954a97a6aec10521be6/chat_mother_forker-0.2.3.tar.gz", hash = "sha256:2714149efe7c8697db82d6c729e3311ef99ee394df8d305a29fb7d5aad3075ad", size = 18333718, upload-time = "2026-10-17T20:55:37.294Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/98/7bbcd4ffa04f7932c5ed2ac67288a9ab07614fc24b779fd25d4826a737d9/chat_mother_forker-0.2.4.tar.gz", hash = "sha256:8f5f001919bc38baaab69bd91eb0074b3e9756c045ba628a823ef4be80dfd0fe", size = 9113278, upload-time = "2026-10-21T07:20:49.332Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/68/d9c5e8d9fef1ae4f2019f8226f36b450b7734d5c0fc66d300d8744507201/chat_mother_forker-0.2.3-py3-none-any.whl", hash = "sha256:fe5e42b08f981d6f1b67feb91ef4161e91aefa9241e86279f98643797cba3b16", size = 61035, upload-time = "2026-10-17T20:55:35.653Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/09/e70afd3c487e03bdc079b741046fdddb668a7987a030f8b6486498420dae/chat_mother_forker-0.2.4-py3-none-any.whl", hash = "sha256:6ffe589eb40f70f66bdb6442994cfa538535baaf46182132c080352384a3f861", size = 64051, upload-time = "2026-10-21T07:20:47.896Z" },
 ]
 
 [[package]]

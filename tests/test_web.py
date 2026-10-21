@@ -646,7 +646,12 @@ def test_pick_fork_provider_guard_rejects_unsupported_configured(monkeypatch, co
 
 @pytest.mark.parametrize(
     ("configured", "binary"),
-    [("claude", "claude"), ("kiro", "kiro-cli"), ("opencode", "opencode")],
+    [
+        ("claude", "claude"),
+        ("kiro", "kiro-cli"),
+        ("opencode", "opencode"),
+        ("commandcode", "cmdc"),
+    ],
 )
 def test_pick_fork_provider_guard_rejects_configured_cli_not_on_path(
     monkeypatch, configured, binary
@@ -655,6 +660,20 @@ def test_pick_fork_provider_guard_rejects_configured_cli_not_on_path(
 
     with pytest.raises(RuntimeError, match=f"no CLI on PATH \\(looked for {binary}\\)"):
         chat_search_service.pick_fork_provider("kilo:sess_1", configured)
+
+
+def test_pick_fork_provider_command_code_source_keeps_commandcode(monkeypatch):
+    # Rule 1 maps the source before any PATH check, so cmdc need not be installed.
+    monkeypatch.setattr("shutil.which", lambda exe: None)
+    assert chat_search_service.pick_fork_provider("command_code:9daf", "claude") == "commandcode"
+
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+    assert chat_search_service.pick_fork_provider("command_code:9daf", "claude") == "commandcode"
+
+
+def test_pick_fork_provider_configured_commandcode_needs_cmdc_on_path(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
+    assert chat_search_service.pick_fork_provider("kilo:sess_1", "commandcode") == "commandcode"
 
 
 # --- shell routes (step 8.3-8.4, 9.4) ------------------------------------------
@@ -862,6 +881,58 @@ def test_homepage_suggest_offers_only_unregistered_chat_dirs(
     # Filtered out: already-registered workspaces and dirs that don't exist.
     assert str(registered) not in body
     assert str(vanished) not in body
+
+
+def test_resume_command_command_code():
+    """U21: the resume argv names the session through cmdc's --session flag."""
+    from backseat_harness.web.routes import chat as chat_routes
+
+    sid = "9daf97ff-1b2c-4d3e-8f90-123456789abc"
+    assert "command_code" in chat_routes._VALID_HISTORY_PROVIDERS
+    assert chat_routes._build_resume_command("command_code", sid) == ["cmdc", "--session", sid]
+
+
+def test_workspace_dir_for_command_code_header(tmp_path: Path):
+    """The header's cwd is the workspace. A later record's cwd is never read."""
+    ws = tmp_path / "scratch"
+    ws.mkdir()
+    stem = "9daf97ff-1b2c-4d3e-8f90-123456789abc"
+    jsonl = tmp_path / f"{stem}.jsonl"
+    jsonl.write_text(
+        json.dumps({"type": "session", "version": 3, "id": stem, "cwd": str(ws)})
+        + "\n"
+        + json.dumps({"type": "message", "cwd": str(tmp_path / "elsewhere")})
+        + "\n",
+        encoding="utf-8",
+    )
+    ref = _Ref(f"command_code:{stem}", 1.0, ws.name, locator=str(jsonl))
+    assert workspace_service._workspace_dir_for(ref) == str(ws)
+
+
+def test_workspace_dir_for_command_code_unrecoverable_is_none(tmp_path: Path):
+    """U25: only a session header on line 1 yields a path. Everything else is None."""
+    later_cwd = tmp_path / "later"
+    later_cwd.mkdir()
+
+    def _ref(name: str, text: str | None):
+        path = tmp_path / name
+        if text is not None:
+            path.write_text(text, encoding="utf-8")
+        return _Ref(f"command_code:{name}", 1.0, "x", locator=str(path))
+
+    # First record is not a session header, though a later line has a cwd.
+    not_header = _ref(
+        "a.jsonl",
+        json.dumps({"type": "message"}) + "\n"
+        + json.dumps({"type": "session", "cwd": str(later_cwd)}) + "\n",
+    )
+    empty = _ref("empty.jsonl", "")
+    bad_json = _ref("bad.jsonl", "{not json\n")
+    header_no_cwd = _ref("nocwd.jsonl", json.dumps({"type": "session", "id": "x"}) + "\n")
+    missing = _ref("missing.jsonl", None)
+
+    for ref in (not_header, empty, bad_json, header_no_cwd, missing):
+        assert workspace_service._workspace_dir_for(ref) is None, ref.key
 
 
 def test_workspace_dir_for_dispatches_kiro_ide_and_v2(tmp_path: Path):
@@ -3030,6 +3101,7 @@ def test_build_fork_command_passes_initial_prompt_to_each_provider():
         prompt,
     ]
     assert search_routes._build_fork_command("claude", prompt) == ["claude", prompt]
+    assert search_routes._build_fork_command("commandcode", prompt) == ["cmdc", prompt]
     with pytest.raises(ValueError, match="Unknown fork provider"):
         search_routes._build_fork_command("bogus", prompt)
 

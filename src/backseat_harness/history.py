@@ -5,8 +5,8 @@ through this module: its byte size (the compaction trigger) and a rendered fork
 of it (the compaction preamble and the operator's review context).
 
 Centralizing it here is what lets the harness stay ignorant of provider storage
-internals. opencode keeps transcripts in SQLite; Claude Code and kiro keep
-JSONL files. chat-mother-forker's ``ChatRef.size_bytes`` normalizes these to a
+internals. opencode keeps transcripts in SQLite; Claude Code, kiro and Command
+Code keep JSONL files. chat-mother-forker's ``ChatRef.size_bytes`` normalizes these to a
 byte count, so the harness never stats a transcript file itself -- which
 matters because opencode has no transcript file to stat at all.
 

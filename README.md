@@ -4,14 +4,14 @@ Simple, single-task agent loops. _Buckle up, you're not at the wheel anymore._
 
 ## What it does
 
-backseat-harness automates vibecoding toward a goal. You write the goal once, as the requirements for finishing a task. The harness drives an off-the-shelf CLI coding agent (opencode, claude, or kiro-cli) one small step at a time toward it. This is the "managed" agent session. After each step, a separate operator agent reviews the whole change, code, tests, and transcript, and writes the next prompt. That is the ordinary vibecoding loop (prompt, work, review, next prompt) that coding models are already trained to follow.
+backseat-harness automates vibecoding toward a goal. You write the goal once, as the requirements for finishing a task. The harness drives an off-the-shelf CLI coding agent (opencode, claude, kiro-cli, or Command Code `cmdc`) one small step at a time toward it. This is the "managed" agent session. After each step, a separate operator agent reviews the whole change, code, tests, and transcript, and writes the next prompt. That is the ordinary vibecoding loop (prompt, work, review, next prompt) that coding models are already trained to follow.
 
 The managed agent keeps the long-horizon context across the whole task, instead of passing lossy summaries between agents. The operator is a fresh, adversarial reviewer: it starts each review cold and reads the full diff itself, along with a transcript of the managed agent session. Rather than a fixed pipeline of stages, it is a continuous, unstructured adversary. Each managed turn is a plain session of the provider's own CLI, so you can intervene and `takeover` a lane and drive it yourself at any time.
 
 ## Requirements
 
 - Python 3.11 or newer.
-- At least one provider CLI on your PATH, installed and signed in: `claude`, `kiro-cli`, or `opencode`. Each CLI uses its own login.
+- At least one provider CLI on your PATH, installed and signed in: `claude`, `kiro-cli`, `opencode`, or `cmdc`. Each CLI uses its own login.
 - Managed runs are auto-approved, since a non-interactive run has nobody to answer a prompt.
 
 ## Quick start

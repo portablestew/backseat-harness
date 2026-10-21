@@ -429,7 +429,8 @@ def search_all_sessions(query: str = "", limit: int = 200) -> list[SessionSearch
 
 # Map from chat-mother-forker provider key to backseat-harness fork provider name.
 # Harness provider names match the registry keys in providers/__init__.py:
-# 'opencode', 'kiro', 'claude'. Kiro IDE variants map to 'kiro' (kiro-cli tool).
+# 'opencode', 'kiro', 'claude', 'commandcode'. Kiro IDE variants map to 'kiro'
+# (kiro-cli tool).
 # opencode -> 'opencode', claude_code -> 'claude'.
 _CHAT_PROVIDER_TO_FORK_PROVIDER = {
     "opencode": "opencode",
@@ -437,10 +438,11 @@ _CHAT_PROVIDER_TO_FORK_PROVIDER = {
     "kiro_ide": "kiro",          # Kiro IDE -> kiro (harness provider)
     "kiro_ide_v2": "kiro",       # Kiro IDE v2 -> kiro
     "claude_code": "claude",
+    "command_code": "commandcode",
 }
 
 # Harness provider names a fork can launch as; the guard in pick_fork_provider checks this.
-_SUPPORTED_FORK_PROVIDERS = ("opencode", "kiro", "claude")
+_SUPPORTED_FORK_PROVIDERS = ("opencode", "kiro", "claude", "commandcode")
 
 
 def _extract_provider_from_key(key: str) -> str | None:
@@ -455,7 +457,8 @@ def pick_fork_provider(current_session_key: str, configured_provider: str) -> st
 
     Rules (goal.md, "Provider selection"):
     1. Source chat is already a supported fork provider (opencode, kiro_cli,
-       claude_code) -> its own fork provider via ``_CHAT_PROVIDER_TO_FORK_PROVIDER``.
+       claude_code, command_code) -> its own fork provider via
+       ``_CHAT_PROVIDER_TO_FORK_PROVIDER``.
     2. Source is Kiro IDE (kiro_ide or kiro_ide_v2) -> kiro (kiro-cli).
     3. Otherwise -> ``configured_provider``, the effective ``[harness]`` provider
        from ``load_config``.

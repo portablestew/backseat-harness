@@ -10,13 +10,14 @@ prompt and ``spawn.run_turn`` pipes it in.
 
 **Size lives in history, not on disk.** Adapters deliberately do not locate
 transcript files: opencode stores sessions in SQLite (no file exists to
-stat), and claude and kiro keep JSONL files that adapters still never
+stat), and claude, kiro and Command Code keep JSONL files that adapters still never
 touch. ``history_provider`` names the chat-mother-forker provider that can
 size and fork each CLI's sessions instead.
 """
 
 from __future__ import annotations
 
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,9 +69,10 @@ class Provider(ABC):
     There is no operator-profile method: the operator runs the CLI's own default
     agent (or ``[operator].agent``), with the persona prepended to its prompt and
     permissions left to the workspace owner. Because that makes ``build_command``
-    shared by the managed turn and the operator turn alike, it must carry no
-    permission or trust flags -- a workspace grants those through
-    ``[harness] extra_args`` (managed) or ``[operator].extra_args`` (operator).
+    shared by the managed turn and the operator turn alike, it carries the CLI's
+    non-interactive auto-approve grant (e.g. ``--auto``, ``--yolo``). Anything
+    beyond that comes from ``[harness] extra_args`` (managed) or
+    ``[operator].extra_args`` (operator).
     """
 
     #: Short name used in config (e.g. "opencode").
@@ -86,6 +88,18 @@ class Provider(ABC):
     #: as the failure rather than a separate lookup the operator has to think
     #: up. None means no known command, and no hint is printed.
     list_models_command: str | None = None
+
+    #: Flag that selects a named agent/profile for the main session, or None
+    #: when the CLI has none (its "agents" are subagents, not session profiles).
+    #: The loop and the operator invoker compose it through ``agent_args``.
+    agent_flag: str | None = "--agent"
+
+    #: Whether the loop clears a native session id that history cannot find
+    #: after a turn. Off by default, so the id is kept as the CLI reported it.
+    #: On, a turn killed before the CLI persisted anything leaves a dead id; it
+    #: is cleared, and the next prompt carries the generation marker so the
+    #: marker search can bind whatever session the CLI does persist.
+    drops_unpersisted_native_id: bool = False
 
     @abstractmethod
     def build_command(self, spec: SpawnSpec) -> list[str]:
@@ -132,3 +146,30 @@ class Provider(ABC):
         when no session exists yet (e.g. paused during planning); the CLI should
         then open a fresh interactive session in the workspace.
         """
+
+
+#: (provider name, agent) pairs already warned about in this process. A run is
+#: its own process (web and daemon both launch ``backseat-harness run``), so this
+#: warns once per run per pair; each turn and each operator call then stays quiet.
+_AGENT_WARNED: set[tuple[str, str]] = set()
+
+
+def agent_args(provider: Provider, agent: str | None) -> tuple[str, ...]:
+    """The ``(agent_flag, agent)`` argv pair, or ``()`` when there is none to pass.
+
+    A provider with no agent flag gets no argv and a one-time stderr warning
+    naming the agent it dropped, so a configured agent never fails the lane.
+    """
+    if not agent:
+        return ()
+    if provider.agent_flag is not None:
+        return (provider.agent_flag, agent)
+    key = (provider.name, agent)
+    if key not in _AGENT_WARNED:
+        _AGENT_WARNED.add(key)
+        print(
+            f'[warn] agent: provider {provider.name} has no agent flag; '
+            f'ignoring agent "{agent}"',
+            file=sys.stderr,
+        )
+    return ()

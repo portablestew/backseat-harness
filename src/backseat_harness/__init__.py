@@ -1,6 +1,7 @@
 """backseat-harness: drive an off-the-shelf CLI agent one small step at a time.
 
-A meta-harness that spawns a managed CLI agent (Claude Code, opencode, kiro-cli),
+A meta-harness that spawns a managed CLI agent (Claude Code, opencode, kiro-cli,
+Command Code),
 lets it take a single turn, then hands a fresh adversarial *operator* the
 transcript plus a durable checklist to review progress and decide the next prompt.
 
@@ -9,7 +10,7 @@ reads it from here (via tool.hatch.version), so this is the only place to edit
 before a release.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from backseat_harness.models import (
     Binding,

@@ -132,10 +132,11 @@ class Config:
     workspace_root: Path
     provider: str | None = None
     model: str | None = None
-    # Named provider agent for the managed side (e.g. opencode ``--agent``).
-    # Unlike the operator, the harness writes no managed profile: this simply
-    # forwards the flag so the workspace owner can run a task under their own
-    # agent definition instead of the CLI default.
+    # Named provider agent for the managed side, passed with the provider's agent
+    # flag (e.g. opencode ``--agent``). Where the provider has no agent flag it is
+    # ignored, with a one-time warning. Unlike the operator, the harness writes no
+    # managed profile: this simply forwards the flag so the workspace owner can run
+    # a task under their own agent definition instead of the CLI default.
     agent: str | None = None
     turn_timeout_s: int = DEFAULT_TURN_TIMEOUT_S
     compact_threshold_bytes: int = DEFAULT_COMPACT_THRESHOLD_BYTES
@@ -156,10 +157,10 @@ class Config:
     operator_retry_budget: int = DEFAULT_OPERATOR_RETRY_BUDGET
     # Provider-specific flags passed through to every managed turn, on top of
     # the auto-approve grant each adapter applies by default (opencode --auto,
-    # claude --permission-mode auto, kiro --trust-all-tools). This is how the
-    # workspace owner narrows the grant or passes per-workspace adjustments,
-    # since the safe-vs-usable tradeoff is the owner's to make: the harness does
-    # not narrow it itself. A turn that blocks on an approval prompt just burns
+    # claude --permission-mode auto, kiro --trust-all-tools, commandcode --yolo).
+    # This is how the workspace owner narrows the grant or passes per-workspace
+    # adjustments, since the safe-vs-usable tradeoff is the owner's to make: the
+    # harness does not narrow it itself. A turn that blocks on an approval prompt just burns
     # the timeout.
     extra_args: tuple[str, ...] = ()
     # Per-step model slots: names the operator may set on a checklist step to
