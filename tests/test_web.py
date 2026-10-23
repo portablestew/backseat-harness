@@ -959,8 +959,10 @@ def test_workspace_dir_for_dispatches_kiro_ide_and_v2(tmp_path: Path):
                                 {
                                     "type": "document",
                                     "document": {
+                                        # Host-native separators, as the IDE
+                                        # writes them on each OS.
                                         "staticDirectoryView": (
-                                            f"<folder name='{legacy_ws}\\.git' closed />"
+                                            f"<folder name='{legacy_ws / '.git'}' closed />"
                                         )
                                     },
                                 }
@@ -3402,6 +3404,8 @@ def test_search_fork_store_read_runs_off_the_event_loop(monkeypatch, tmp_path):
 
     _stub_chat_history(monkeypatch, [], {})
     monkeypatch.setattr(history, "fork_session", _fake_fork)
+    # Pin PATH so the provider guard does not depend on the host's installed CLIs.
+    monkeypatch.setattr("shutil.which", lambda exe: "/usr/bin/" + exe)
     _capture_fork_command(monkeypatch, tmp_path)
 
     resp = _post_fork("sess_k", "kilo:sess_k")

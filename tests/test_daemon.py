@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -1149,6 +1150,10 @@ def test_a_spawned_run_gets_its_own_session_or_process_group(
     # Both branches run on any host: the Windows flag is faked, since
     # subprocess only defines it on win32, and sys.platform picks the branch.
     monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    # Pin the exe lookup before faking the platform: shutil.which branches on
+    # sys.platform itself and, faked to win32 on a POSIX host, calls into the
+    # Windows-only _winapi.
+    monkeypatch.setattr(shutil, "which", lambda exe: None)
     monkeypatch.setattr(sys, "platform", platform)
     ws = _register(workspace)
 
