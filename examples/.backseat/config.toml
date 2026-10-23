@@ -101,3 +101,8 @@ review_rounds = 3
 [web]
 # Port for the web UI (default: 8090)
 port = 8090
+
+# Extra Host/Origin values the web UI accepts, for an authenticating proxy or
+# tunnel in front of it. host[:port] or a full origin; no wildcards. Read only
+# from ~/.backseat/config.toml: this workspace file ignores it with a warning.
+# allowed_origins = ["https://me-backseat.example.dev"]

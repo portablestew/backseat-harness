@@ -758,6 +758,7 @@ def _cmd_daemon(args) -> int:
             mode = caddy.resolve_mode(requested, caddyfile)
             if mode == "caddy":
                 exe, extra_hosts = _caddy_checks(caddyfile)
+            extra_hosts = (*extra_hosts, *config.web.allowed_origins)
             web_handle = start_web_in_thread(
                 host=config.web.host, port=config.web.port, extra_hosts=extra_hosts
             )
@@ -1232,6 +1233,7 @@ def _cmd_web(args) -> int:
 
                 return caddy.start(exe, caddyfile, log_path=None, on_exit=report)
 
+        extra_hosts = (*extra_hosts, *config.web.allowed_origins)
         return run_web(
             host=host, port=port, workspace=workspace, extra_hosts=extra_hosts, sidecar=sidecar
         )

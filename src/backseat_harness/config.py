@@ -20,6 +20,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import tomllib
 
@@ -85,6 +86,31 @@ class WebConfig:
 
     host: str = DEFAULT_WEB_HOST
     port: int = DEFAULT_WEB_PORT
+    #: Extra ``host[:port]`` values the Host/Origin allowlist admits, e.g. a
+    #: reverse proxy or tunnel that does its own auth. Read from the user
+    #: layer only (``~/.backseat/config.toml``): a workspace or task config is
+    #: repo content and must not be able to widen who reaches the web app.
+    allowed_origins: tuple[str, ...] = ()
+
+
+def _normalize_origin(value: object) -> str | None:
+    """``host[:port]`` for an allowlist entry, or None when unusable.
+
+    Accepts a bare ``host[:port]`` or a full origin (``https://host``) and
+    keeps only the netloc, lowercased, which is what the middleware compares.
+    Wildcards, paths, userinfo, and whitespace are refused.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if "://" in text:
+        parsed = urlparse(text)
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            return None
+        text = parsed.netloc
+    if not text or any(c in text for c in "*/@ \t"):
+        return None
+    return text
 
 
 @dataclass(frozen=True)
@@ -361,10 +387,10 @@ def load_config(
         cfg.config_path,
         cfg.task_paths(slug).config if slug is not None else None,
     )
-    for path in layers:
+    for index, path in enumerate(layers):
         if path is not None and path.exists():
             data: dict[str, Any] = _tomllib().loads(path.read_text(encoding="utf-8"))
-            cfg = _apply_overrides(cfg, data)
+            cfg = _apply_overrides(cfg, data, user_layer=index == 0)
     cfg = _resolve_defaults(cfg)
     # Warn once, here, on the value that actually resolved -- not per layer in
     # _apply_overrides, which would name a value a higher layer may immediately
@@ -432,8 +458,14 @@ def _merge_models(cfg: Config, data: dict[str, Any]) -> dict[str, str]:
     return merged
 
 
-def _merge_web(current: WebConfig, data: dict[str, Any]) -> WebConfig:
-    """Resolve one layer's ``[web]`` table (warn + fall back on malformed)."""
+def _merge_web(
+    current: WebConfig, data: dict[str, Any], *, user_layer: bool = False
+) -> WebConfig:
+    """Resolve one layer's ``[web]`` table (warn + fall back on malformed).
+
+    ``allowed_origins`` is honored only when ``user_layer`` is set; any other
+    layer setting it is warned about and ignored.
+    """
     raw = data.get("web", None)
     if raw is None:
         return current
@@ -470,7 +502,35 @@ def _merge_web(current: WebConfig, data: dict[str, Any]) -> WebConfig:
                 "must be an int 1-65535",
                 file=sys.stderr,
             )
-    return replace(current, host=host, port=port)
+    allowed = current.allowed_origins
+    if "allowed_origins" in raw:
+        candidate = raw["allowed_origins"]
+        if not user_layer:
+            print(
+                "[warn] config: ignored [web] allowed_origins: only "
+                "~/.backseat/config.toml may set it",
+                file=sys.stderr,
+            )
+        elif not isinstance(candidate, list):
+            print(
+                f"[warn] config: dropped [web] allowed_origins {candidate!r}: "
+                "must be a list of host[:port] strings",
+                file=sys.stderr,
+            )
+        else:
+            kept: list[str] = []
+            for entry in candidate:
+                normalized = _normalize_origin(entry)
+                if normalized is None:
+                    print(
+                        f"[warn] config: dropped [web] allowed_origins entry {entry!r}: "
+                        "must be host[:port] or scheme://host[:port], no wildcards",
+                        file=sys.stderr,
+                    )
+                elif normalized not in kept:
+                    kept.append(normalized)
+            allowed = tuple(kept)
+    return replace(current, host=host, port=port, allowed_origins=allowed)
 
 
 def _resolve_defaults(cfg: Config) -> Config:
@@ -503,7 +563,7 @@ def _resolve_defaults(cfg: Config) -> Config:
     )
 
 
-def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
+def _apply_overrides(cfg: Config, data: dict[str, Any], *, user_layer: bool = False) -> Config:
     harness = data.get("harness", {})
     op_data = data.get("operator", {})
     operator = replace(
@@ -546,5 +606,5 @@ def _apply_overrides(cfg: Config, data: dict[str, Any]) -> Config:
         models=_merge_models(cfg, data),
         operator=operator,
         manager=manager,
-        web=_merge_web(cfg.web, data),
+        web=_merge_web(cfg.web, data, user_layer=user_layer),
     )

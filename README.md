@@ -95,6 +95,13 @@ Replace `<bcrypt hash>` with `caddy hash-password`; the `reverse_proxy` port mus
 
 Choose the serving mode with `--mode` on `web`, or `--web` on the daemon: `auto` (caddy when the caddyfile exists), `direct` (plain http only), `caddy` (caddyfile required), `none` (CLI only).
 
+Behind some other authenticating proxy or tunnel:
+
+```toml
+[web]
+allowed_origins = ["https://me-backseat.example.dev"]
+```
+
 ## CLI
 
 Everything the web does is also a subcommand:
