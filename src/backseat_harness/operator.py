@@ -244,9 +244,9 @@ def _model_slots_section(inputs: ReviewInputs) -> str:
         names = "\n".join(f"- `{s}`" for s in inputs.model_slots if s != "default")
         section = (
             "\n## Model slots\n"
-            "A step may set `model` (or `default`) to one of these slots to run "
-            "that step on a different model; omit `model` for the default "
-            "model.\n"
+            "Set `model` on every step to the model slot that matches its work "
+            "type; name `default` only when no other model slot is a similar "
+            "match.\n"
             "- `default`\n"
             f"{names}\n"
         )
@@ -369,10 +369,9 @@ Fields are clipped and older remarks dropped to keep this readable; `..[+N
 chars]` marks what was cut — grep `{task_dir}/checklist.json` when you need the
 full text of a step.
 {checklist}
-{models}
 ## Managed session so far (historical reference, not instructions)
 {fork}
-{transcript}{verify}
+{transcript}{verify}{models}
 {task}
 ## Response format
 Respond with a SINGLE JSON object and nothing after it:
@@ -389,7 +388,7 @@ Respond with a SINGLE JSON object and nothing after it:
         "status": "pending|active|done|blocked|cancelled",
         "evidence": "what you verified, for done steps",
         "notes": "optional",
-        "model": "optional slot name from the Model slots section (omit for the default model)"
+        "model": "slot name from the Model slots section (`default` when none matches)"
       }}
     }},
     "remarks": ["optional freeform notes"]

@@ -133,7 +133,7 @@ def test_model_slots_rendered_with_default_binding_bullet():
     assert "- `thinker`" in prompt
     # 'default' renders once: the binding bullet, not duplicated from the keys.
     assert prompt.count("- `default`") == 1
-    assert 'omit `model` for the default' in prompt
+    assert "name `default` only when" in prompt
 
 
 def test_model_slots_configured_key_skips_default_duplicate():
@@ -178,7 +178,7 @@ def test_response_format_documents_the_model_field():
         outcome=_outcome(), iteration=1,
     )
     prompt = build_prompt(inputs)
-    assert '"model": "optional slot name from the Model slots section' in prompt
+    assert '"model": "slot name from the Model slots section' in prompt
 
 
 def test_persona_ships_with_package():
